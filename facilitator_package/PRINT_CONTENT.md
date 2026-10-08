@@ -206,49 +206,28 @@ physical card is the player's private reference.)
 
 ## 5. Secret Mission Deck (18 cards)
 
-Every player draws one, independent of allegiance. Missions reward intentional
-behavior. Claim privately on the device during a Private Player Check, only when
-the card says you may and you have met the condition. Completion is a small
-secondary recognition and does not decide the winner.
+Every player draws one, independent of allegiance. Missions reward intentional behavior. Claim privately on the device during a Mission Check (the private checks at CP1, CP3, and CP5), only when the card says you may and you have met the condition. Completion is a small secondary recognition and does not decide the winner.
 
-Each card header lists **when it may be claimed**.
+Role-specific missions (03, 06, 10, 14, 17): deal missions after Role Cards are drawn, remove any mission that names a Role nobody drew, and a player whose mission names their own Role trades it before play begins.
 
-1. **(Claim at CP3 or later)** Get another player to support **proactive outreach**
-   to a student who has not asked for help.
-2. **(Claim at CP3 or later)** Get the team to explicitly discuss the difference
-   between a **student problem and a course problem** before deciding.
-3. **(Claim at CP5 / endgame)** Get the **Efficiency Gremlin** to back a reusable,
-   scalable solution at least once.
-4. **(Claim at CP3 or later)** Get the team to look at **course-activity or
-   practice data** (not just grades) before choosing an action.
-5. **(Claim at CP5 / endgame)** Convince the team to **decline** adding at least
-   one new thing in the Final Stretch.
-6. **(Claim at CP3 or later)** Get the **Receipts Department** to state out loud
-   what the evidence does and does not show.
-7. **(Claim at CP5 / endgame)** Shift another player off a position they argued
-   for earlier - change at least one mind during the game.
-8. **(Claim at CP3 or later)** Get the team to choose a **whole-class** response
-   over an individual one at least once.
-9. **(Claim at CP5 / endgame)** Keep **Faculty Capacity** out of Critical for the
-   entire game.
-10. **(Claim at CP3 or later)** Get the **Burnout Bouncer** to raise sustainability
-    before the team finalizes a decision.
-11. **(Claim at CP5 / endgame)** Get the team to fix **gradebook accuracy**
-    (zeros / blank cells) at some point in the semester.
-12. **(Claim at CP3 or later)** Name a specific **Course Reality** from your Course
-    Card and get the team to factor it into a decision.
-13. **(Claim at CP5 / endgame)** Get the team to **intentionally defer** a
-    lower-priority issue rather than address everything.
-14. **(Claim at CP3 or later)** Get the **Student Whisperer** to speak up for a
-    student who has gone quiet.
-15. **(Claim at CP5 / endgame)** End the game with **Course Quality** in the Normal
-    band (60+).
-16. **(Claim at CP3 or later)** Get the team to connect a performance gap to a
-    **practice-to-assessment alignment** issue, not just effort.
-17. **(Claim at CP5 / endgame)** Get the **Professional Buzzkill** to talk the team
-    out of a decision by naming its later cost.
-18. **(Claim at CP5 / endgame)** Be the player who proposes the option the team
-    ultimately adopts at **three or more** checkpoints.
+1. **(Claim at any Mission Check: CP1, CP3, or CP5)** Get another player to support proactive outreach to a student who has not asked for help.
+2. **(Claim at any Mission Check: CP1, CP3, or CP5)** Get the team to explicitly discuss the difference between a student problem and a course problem before deciding.
+3. **(Claim at CP5 / endgame only)** Get the Efficiency Gremlin to back a reusable, scalable solution at least once.
+4. **(Claim at any Mission Check: CP1, CP3, or CP5)** Get the team to look at course-activity or practice data (not just grades) before choosing an action.
+5. **(Claim at CP5 / endgame only)** Convince the team to decline adding at least one new thing in the Final Stretch.
+6. **(Claim at CP3 or CP5)** Get the Receipts Department to state out loud what the evidence does and does not show.
+7. **(Claim at CP5 / endgame only)** Shift another player off a position they argued for earlier. Change at least one mind during the game.
+8. **(Claim at any Mission Check: CP1, CP3, or CP5)** Get the team to choose a whole-class response over an individual one at least once.
+9. **(Claim at CP5 / endgame only)** Persuade the team to choose an option because it protects Faculty Capacity, and keep Faculty Capacity out of Critical for the entire game.
+10. **(Claim at CP3 or CP5)** Get the Burnout Bouncer to raise sustainability before the team finalizes a decision.
+11. **(Claim at CP5 / endgame only)** Get the team to fix gradebook accuracy (zeros / blank cells) at some point in the semester.
+12. **(Claim at any Mission Check: CP1, CP3, or CP5)** Name a specific Course Reality from your Course Card and get the team to factor it into a decision.
+13. **(Claim at CP5 / endgame only)** Get the team to intentionally defer a lower-priority issue rather than address everything.
+14. **(Claim at any Mission Check: CP1, CP3, or CP5)** Get the Student Whisperer to speak up for a student who has gone quiet.
+15. **(Claim at CP5 / endgame only)** Persuade the team to choose a fix that improves Course Quality over a quicker option, and end the game with Course Quality in the Normal band (60+).
+16. **(Claim at CP3 or CP5)** Get the team to connect a performance gap to a practice-to-assessment alignment issue, not just effort.
+17. **(Claim at CP5 / endgame only)** Get the Professional Buzzkill to talk the team out of a decision by naming its later cost.
+18. **(Claim at CP5 / endgame only)** Be the player who proposes the option the team ultimately adopts at three or more checkpoints.
 
 ---
 
@@ -493,52 +472,52 @@ Print all 30. Each has six visible stats (1-5). There is no visible total.
 
 **#01 Captain Calendar**
 
-- Readiness 3 | Motivation 4 | Communication 3 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Full-time student juggling several courses at once.
-- Strengths: Engaged and active; Responds well to clear reminders
-- Challenges: Loses track of due dates; Confuses where the real deadline lives
+- Readiness 3 | Motivation 5 | Communication 3 | Self-Mgmt 1 | Adaptability 3 | Help-Seeking 3
+- Context: Recent high-school graduate. Works weekend shifts.
+- Strengths: Enthusiastic; Notices upcoming work; Wants to do well
+- Challenges: Plans more than executes; Underestimates task time
 
 **#02 Deadline Dodge**
 
-- Readiness 3 | Motivation 2 | Communication 3 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Works significant hours outside of class.
-- Strengths: Capable when present; Honest about being behind
-- Challenges: Sporadic, late activity; Misses work when life gets busy
+- Readiness 2 | Motivation 5 | Communication 4 | Self-Mgmt 1 | Adaptability 4 | Help-Seeking 2
+- Context: Lives with roommates and works variable evening shifts.
+- Strengths: Energetic; Personable; Rebounds quickly
+- Challenges: Starts late; Relies on urgency; Inconsistent routines
 
-**#03 Human Question Mark**
+**#03 Professor Already-Knows-It**
 
-- Readiness 2 | Motivation 4 | Communication 3 | Self-Mgmt 3 | Adaptability 2 | Help-Seeking 3
-- Context: Early in the program and still learning expectations.
-- Strengths: Tries and submits; Willing to redo work
-- Challenges: Misreads what an assignment is asking; Struggles when expectations shift
+- Readiness 5 | Motivation 3 | Communication 2 | Self-Mgmt 4 | Adaptability 1 | Help-Seeking 3
+- Context: Returning student with significant prior experience related to the subject.
+- Strengths: Strong background knowledge; Independent; Efficient
+- Challenges: Dislikes changing established methods; May disengage from material that feels familiar
 
-**#04 Steady Eddie**
+**#04 Human Question Mark**
 
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 3
-- Context: Reliable, middle-of-the-road student.
-- Strengths: Consistent; Predictable follow-through
-- Challenges: Rarely stands out; Can be overlooked
+- Readiness 3 | Motivation 2 | Communication 5 | Self-Mgmt 4 | Adaptability 3 | Help-Seeking 1
+- Context: First semester at college and still learning how college courses operate.
+- Strengths: Communicative; Careful; Follows established routines
+- Challenges: Hesitates to admit confusion directly; Can overthink ambiguous directions
 
-**#05 Overcommitted Olivia**
+**#05 Checklist Chad**
 
-- Readiness 3 | Motivation 5 | Communication 3 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 2
-- Context: Involved in many activities and commitments.
-- Strengths: High drive; Enthusiastic participant
-- Challenges: Overextended; Weak time management
+- Readiness 2 | Motivation 4 | Communication 1 | Self-Mgmt 5 | Adaptability 3 | Help-Seeking 3
+- Context: Balances school with a predictable part-time job.
+- Strengths: Organized; Dependable; Follows processes
+- Challenges: Rarely speaks up spontaneously; Can focus on completion over purpose
 
-**#06 Ghost Protocol**
+**#06 Pivot McGee**
 
-- Readiness 3 | Motivation 2 | Communication 2 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 3
-- Context: Enrolled but hard to reach.
-- Strengths: Does solid work when present
-- Challenges: Disengages for stretches; Quiet in the course
+- Readiness 4 | Motivation 1 | Communication 3 | Self-Mgmt 2 | Adaptability 5 | Help-Seeking 3
+- Context: Career changer returning after several years.
+- Strengths: Learns quickly; Flexible; Comfortable changing approach
+- Challenges: Motivation fluctuates; Routines are still developing
 
 **#07 Late Bloomer Supreme**
 
-- Readiness 2 | Motivation 4 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 3
-- Context: Starts slowly, finishes strong.
-- Strengths: Resilient over a full term; Improves with time
-- Challenges: Slow, shaky start; Early grades understate ability
+- Readiness 1 | Motivation 4 | Communication 3 | Self-Mgmt 2 | Adaptability 4 | Help-Seeking 3
+- Context: Entered college after time away.
+- Strengths: Persistent; Receptive to support; Willing to adjust
+- Challenges: Foundations are rebuilding; Takes time to establish routines
 
 **#08 Silent SOS**
 
@@ -547,156 +526,156 @@ Print all 30. Each has six visible stats (1-5). There is no visible total.
 - Strengths: Communicates well when approached; Uses support effectively once connected
 - Challenges: May struggle to initiate when stuck; Can wait too long for someone else to notice
 
-**#09 Rubric Lawyer**
+**#09 AP Everything**
 
-- Readiness 4 | Motivation 4 | Communication 4 | Self-Mgmt 3 | Adaptability 2 | Help-Seeking 3
-- Context: Detail-oriented and grade-focused.
-- Strengths: Reads instructions closely; Produces precise work
-- Challenges: Rigid when plans change; Can argue the specification
+- Readiness 5 | Motivation 2 | Communication 1 | Self-Mgmt 3 | Adaptability 4 | Help-Seeking 3
+- Context: Has substantial previous academic credit.
+- Strengths: Academically prepared; Learns quickly; Handles change
+- Challenges: Very quiet; Participation can be difficult to read
 
-**#10 Comeback Kid**
+**#10 Group Chat Mayor**
 
-- Readiness 3 | Motivation 4 | Communication 3 | Self-Mgmt 3 | Adaptability 4 | Help-Seeking 3
-- Context: Has overcome a rough prior term.
-- Strengths: Bounces back; Adapts to setbacks
-- Challenges: Can still backslide under stress
+- Readiness 2 | Motivation 3 | Communication 5 | Self-Mgmt 2 | Adaptability 1 | Help-Seeking 5
+- Context: Highly connected with classmates and active in several campus activities.
+- Strengths: Builds relationships; Asks for help; Keeps peers connected
+- Challenges: Change frustrates them; Competing commitments can disrupt routines
 
-**#11 Quiet Achiever**
+**#11 Locked-In Larry**
 
-- Readiness 4 | Motivation 4 | Communication 2 | Self-Mgmt 4 | Adaptability 3 | Help-Seeking 2
-- Context: Strong student who says little.
-- Strengths: High-quality work; Well organized
-- Challenges: Rarely communicates; Will not ask for help
+- Readiness 3 | Motivation 4 | Communication 2 | Self-Mgmt 4 | Adaptability 1 | Help-Seeking 4
+- Context: Adult learner with a carefully structured weekly routine.
+- Strengths: Persistent; Organized; Seeks assistance when needed
+- Challenges: Reserved communicator; Unexpected changes are difficult
 
-**#12 Spark Plug**
+**#12 Reinvention Rita**
 
-- Readiness 3 | Motivation 5 | Communication 4 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Energetic and vocal in the course.
-- Strengths: Motivated; Communicates readily
-- Challenges: Disorganized; Starts more than finishes
+- Readiness 1 | Motivation 3 | Communication 4 | Self-Mgmt 5 | Adaptability 2 | Help-Seeking 3
+- Context: Returning student starting a new career after years in the workforce.
+- Strengths: Highly organized; Communicates clearly; Reliable
+- Challenges: Academic foundations are rusty; Needs time with unfamiliar approaches
 
-**#13 The Overthinker**
+**#13 Chaos With a Planner**
 
-- Readiness 4 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 2 | Help-Seeking 2
-- Context: Capable but anxious about getting it right.
-- Strengths: Thorough; Cares about quality
-- Challenges: Freezes when uncertain; Reluctant to reach out
+- Readiness 3 | Motivation 3 | Communication 2 | Self-Mgmt 2 | Adaptability 4 | Help-Seeking 4
+- Context: Full course load with an extremely detailed planner.
+- Strengths: Flexible; Willing to ask; Motivated by visible progress
+- Challenges: Planner is not always execution; Loses track when tasks overlap
 
-**#14 Multitask Master**
+**#14 Natural Talent Nancy**
+
+- Readiness 5 | Motivation 1 | Communication 3 | Self-Mgmt 4 | Adaptability 2 | Help-Seeking 3
+- Context: Has prior informal experience related to the subject.
+- Strengths: Strong initial skill base; Independent; Dependable
+- Challenges: Motivation drops when work feels repetitive; May resist unfamiliar approaches
+
+**#15 Office Hours Celebrity**
+
+- Readiness 2 | Motivation 3 | Communication 5 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 4
+- Context: Lives close to campus and spends a lot of time there.
+- Strengths: Talks through ideas; Engaged; Comfortable connecting
+- Challenges: May seek reassurance without identifying the help actually needed
+
+**#16 Rubric Enthusiast**
+
+- Readiness 4 | Motivation 3 | Communication 1 | Self-Mgmt 5 | Adaptability 2 | Help-Seeking 2
+- Context: Has succeeded in structured settings and prefers clear expectations.
+- Strengths: Prepared; Exceptionally organized; Consistent
+- Challenges: Reluctant to speak; Ambiguity slows progress
+
+**#17 Fresh Start Freddie**
+
+- Readiness 1 | Motivation 5 | Communication 3 | Self-Mgmt 4 | Adaptability 3 | Help-Seeking 2
+- Context: Beginning college after a previous path did not work out.
+- Strengths: Highly motivated; Dependable; Willing to work
+- Challenges: Skills need development; Reluctant to request assistance
+
+**#18 Improvisation Station**
+
+- Readiness 3 | Motivation 2 | Communication 4 | Self-Mgmt 1 | Adaptability 5 | Help-Seeking 3
+- Context: Works irregular hours and adjusts plans quickly.
+- Strengths: Flexible; Communicative; Resourceful
+- Challenges: Routine maintenance is difficult; Long-range planning is inconsistent
+
+**#19 Quietly Crushing It**
+
+- Readiness 5 | Motivation 3 | Communication 3 | Self-Mgmt 2 | Adaptability 4 | Help-Seeking 1
+- Context: Has previous coursework and a small, predictable outside workload.
+- Strengths: Academically strong; Adaptable; Independent
+- Challenges: Procrastinates when confident; Rarely signals problems
+
+**#20 Talk-It-Out Taylor**
+
+- Readiness 2 | Motivation 1 | Communication 5 | Self-Mgmt 4 | Adaptability 3 | Help-Seeking 3
+- Context: Returning student who learns best through conversation.
+- Strengths: Expressive; Dependable; Collaborative
+- Challenges: Motivation is uneven; May process aloud before attempting independently
+
+**#21 Backup Plan Bailey**
+
+- Readiness 3 | Motivation 5 | Communication 3 | Self-Mgmt 1 | Adaptability 3 | Help-Seeking 3
+- Context: Parent with a coordinated household and school schedule.
+- Strengths: Determined; Anticipates obstacles; Thinks ahead
+- Challenges: Plans collapse when priorities collide; May revise the plan instead of starting
+
+**#22 Plot Twist Pat**
+
+- Readiness 4 | Motivation 1 | Communication 3 | Self-Mgmt 2 | Adaptability 5 | Help-Seeking 3
+- Context: Recent graduate exploring a very different field.
+- Strengths: Adaptable; Academically capable; Curious
+- Challenges: Motivation depends on relevance; Routines are inconsistent
+
+**#23 Steady-ish Eddie**
+
+- Readiness 3 | Motivation 4 | Communication 2 | Self-Mgmt 4 | Adaptability 1 | Help-Seeking 4
+- Context: Works full-time on a consistent schedule.
+- Strengths: Reliable; Persistent; Comfortable seeking support
+- Challenges: Prefers predictability; Communicates selectively
+
+**#24 Middle-of-the-Road Morgan**
 
 - Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 4 | Help-Seeking 3
-- Context: Balances work, family, and school.
-- Strengths: Flexible; Keeps many plates spinning
-- Challenges: Occasionally drops a plate
+- Context: Traditional-age student with a moderate outside schedule.
+- Strengths: Flexible; Reasonably consistent; Works well with others
+- Challenges: Few extreme strengths; Can blend in
 
-**#15 First-Gen Trailblazer**
+**#25 Surprisingly Prepared Sam**
 
-- Readiness 2 | Motivation 5 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
-- Context: First in their family to attend college.
-- Strengths: Highly motivated; Determined
-- Challenges: Still learning how college works; Hesitant to use support
+- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 4
+- Context: Expected college to be overwhelming and built a support routine before classes.
+- Strengths: Uses help; Steady; Reflective
+- Challenges: Confidence lags performance; May seek confirmation
 
-**#16 Night Owl**
+**#26 Low-Drama Logan**
 
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Does coursework late at night.
-- Strengths: Puts in the hours
-- Challenges: Communicates at odd times; Loose scheduling
+- Readiness 4 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
+- Context: Returning student with prior college experience and a predictable schedule.
+- Strengths: Prepared; Steady; Self-directed
+- Challenges: Can become invisible; May wait too long to communicate
 
-**#17 The Sampler**
+**#27 Selectively Organized**
 
-- Readiness 3 | Motivation 3 | Communication 2 | Self-Mgmt 2 | Adaptability 4 | Help-Seeking 3
-- Context: Curious and tries everything.
-- Strengths: Adaptable; Willing to experiment
-- Challenges: Finishes little; Scattered effort
+- Readiness 4 | Motivation 4 | Communication 2 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
+- Context: Has several recurring outside responsibilities.
+- Strengths: Prepared; Motivated; Has systems for priorities
+- Challenges: Lower-priority tasks disappear; Reluctant to ask
 
-**#18 The Anchor**
+**#28 Ask-Me-Anything Avery**
 
-- Readiness 4 | Motivation 3 | Communication 4 | Self-Mgmt 4 | Adaptability 3 | Help-Seeking 2
-- Context: Dependable presence in the class.
-- Strengths: Steady; Clear communicator; Organized
-- Challenges: Will not ask for help when overloaded
+- Readiness 2 | Motivation 3 | Communication 4 | Self-Mgmt 4 | Adaptability 2 | Help-Seeking 3
+- Context: Newer student who is comfortable talking with faculty and peers.
+- Strengths: Communicative; Organized; Willing to engage
+- Challenges: Preparation varies; Unexpected changes take time
 
-**#19 Curveball**
+**#29 Plan B Parker**
 
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 2 | Adaptability 4 | Help-Seeking 2
-- Context: Performance is hard to predict.
-- Strengths: Handles surprises
-- Challenges: Inconsistent output; Slow to seek help
+- Readiness 3 | Motivation 2 | Communication 3 | Self-Mgmt 4 | Adaptability 4 | Help-Seeking 2
+- Context: Adult learner managing work projects and changing schedules.
+- Strengths: Organized; Adaptable; Calm under change
+- Challenges: Motivation is selective; Tends to solve problems alone
 
-**#20 The Reactor**
+**#30 Motivated-ish Micah**
 
-- Readiness 3 | Motivation 3 | Communication 4 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
-- Context: Responds well to prompts, passive otherwise.
-- Strengths: Engages clearly when contacted
-- Challenges: Waits to be prompted; Low self-starting
-
-**#21 Slow and Steady**
-
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 4 | Adaptability 2 | Help-Seeking 3
-- Context: Methodical worker who needs lead time.
-- Strengths: Organized; Follows routines
-- Challenges: Struggles with sudden change
-
-**#22 The Juggernaut**
-
-- Readiness 5 | Motivation 2 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
-- Context: Very well prepared academically.
-- Strengths: High readiness; Strong foundation
-- Challenges: Coasts; Low drive to push further
-
-**#23 Help-Desk Hero**
-
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 5
-- Context: Comfortable asking questions early.
-- Strengths: Proactive help-seeker; Catches problems early
-- Challenges: Can lean on support rather than try first
-
-**#24 The Phantom Submitter**
-
-- Readiness 3 | Motivation 3 | Communication 2 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Turns work in at the last possible moment.
-- Strengths: Usually does submit
-- Challenges: No buffer for problems; Quiet until the deadline
-
-**#25 Bright Spot**
-
-- Readiness 4 | Motivation 4 | Communication 4 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
-- Context: Positive, engaged, and well liked.
-- Strengths: Engaged; Clear communicator; Capable
-- Challenges: Reluctant to admit when stuck
-
-**#26 The Wanderer**
-
-- Readiness 3 | Motivation 3 | Communication 2 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 3
-- Context: Loses the thread of the course structure.
-- Strengths: Willing to re-engage when guided
-- Challenges: Gets lost in navigation; Loose organization
-
-**#27 Perfectionist Pat**
-
-- Readiness 4 | Motivation 4 | Communication 3 | Self-Mgmt 3 | Adaptability 2 | Help-Seeking 1
-- Context: Holds very high standards for their own work.
-- Strengths: Excellent quality; Diligent
-- Challenges: Slow to submit; Avoids asking for help; Rigid
-
-**#28 The Connector**
-
-- Readiness 3 | Motivation 3 | Communication 5 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 3
-- Context: Natural communicator who organizes classmates.
-- Strengths: Outstanding communication; Builds peer support
-- Challenges: Can prioritize others over own work
-
-**#29 Resilient Riley**
-
-- Readiness 3 | Motivation 4 | Communication 3 | Self-Mgmt 3 | Adaptability 4 | Help-Seeking 3
-- Context: Recovers quickly from setbacks.
-- Strengths: Adaptable; Persistent
-- Challenges: Sometimes moves on before mastering
-
-**#30 The Minimalist**
-
-- Readiness 3 | Motivation 3 | Communication 3 | Self-Mgmt 3 | Adaptability 3 | Help-Seeking 2
-- Context: Does exactly as much as required.
-- Strengths: Efficient; Meets the bar
-- Challenges: Rarely goes beyond; Slow to seek extension help
+- Readiness 3 | Motivation 4 | Communication 2 | Self-Mgmt 2 | Adaptability 3 | Help-Seeking 4
+- Context: Has a clear career goal and a busy but manageable outside schedule.
+- Strengths: Goal-oriented; Seeks support; Keeps moving after setbacks
+- Challenges: Daily execution is inconsistent; Communication can be brief or delayed
