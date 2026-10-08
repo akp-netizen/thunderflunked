@@ -1,0 +1,4009 @@
+"""
+Northwest Iowa Community College - Faculty Development Game
+Release Candidate 1.
+
+A one-hour tabletop/computer hybrid game. Faculty teams guide a fictional
+college course through one semester (five checkpoints), practicing good course
+design process. A hidden-role layer (Thunderstruck vs. one Thunderflunked per
+table) reinforces that a reasonable-sounding idea can still be a poor course
+decision, and that good process - not spotting the villain - is what catches it.
+
+Architecture (intentionally simple and reliable):
+  * Flask, in-memory state (resets on restart). No database, no auth, no JS.
+  * Three public screens: Game Master (/gm), Team (/team), Projector (/projector).
+  * Short game codes; multiple teams; 4-6 players each; safe re-entry by
+    Game Code + Team Name.
+
+State lives in `games[code]` (game-wide: teams, checkpoint, trading, final flag)
+and each team dict (players, roles, course, roster, resources, checkpoint
+decisions, private checks, allegiance, sabotage, accusation).
+"""
+
+import os
+import random
+import threading
+import time
+
+from flask import Flask, request, redirect, url_for, session
+from markupsafe import escape
+
+import storage
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Deployment configuration (environment-driven; no secrets in source).
+# ---------------------------------------------------------------------------
+# PRODUCTION is on whenever a database is configured (i.e. on Render). It
+# tightens cookie security and requires a real SECRET_KEY.
+_DATABASE_URL = os.environ.get("DATABASE_URL")
+app.config["PRODUCTION"] = bool(_DATABASE_URL) or os.environ.get("FACULTY_GAME_PRODUCTION") == "1"
+
+# Session signing key. Required in production (set SECRET_KEY on Render). For
+# local development we fall back to a random per-process key so the app still
+# runs; the only consequence is that GM logins do not survive a local restart.
+_secret = os.environ.get("SECRET_KEY")
+if not _secret:
+    if app.config["PRODUCTION"]:
+        raise RuntimeError(
+            "SECRET_KEY environment variable is required in production. "
+            "Set it on your Render service (see DEPLOY_RENDER.md).")
+    _secret = os.urandom(32).hex()
+app.config["SECRET_KEY"] = _secret
+
+# GM password gate. When set, the Game Master screens require login. When unset
+# (local development and the automated test suite), GM screens stay open exactly
+# as in the original prototype, so nothing about local play or testing changes.
+app.config["GM_PASSWORD"] = os.environ.get("GM_PASSWORD")
+
+# Secure session cookies. Only mark cookies Secure in production, otherwise the
+# browser would refuse to send them over plain http during local development.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(app.config["PRODUCTION"]),
+)
+
+# A single lock serializes request handling. The original game logic mutates
+# deeply nested in-memory dicts and was never written to be thread-safe; with a
+# threaded server we must not let two requests interleave mid-mutation. The game
+# is low-throughput (one room, a handful of teams) so this has no practical cost.
+_state_lock = threading.RLock()
+
+# ---------------------------------------------------------------------------
+# Live game state. Still the same in-memory dicts the game was built and tested
+# against; persistence (below) snapshots them to a database so a server restart
+# on Render does not lose an in-progress game.
+# ---------------------------------------------------------------------------
+games = {}
+active_code = None
+
+
+# ---------------------------------------------------------------------------
+# Persistence: snapshot the whole in-memory state to the database after each
+# change, and restore it on boot. See storage.py for the rationale.
+# ---------------------------------------------------------------------------
+def _persistence_active():
+    """Persistence runs only when a database is configured and we are not in the
+    in-memory test harness (the test suite manipulates globals directly)."""
+    return storage.is_enabled() and not app.config.get("TESTING")
+
+
+def _normalize_loaded_state(loaded_games):
+    """JSON turns every object key into a string, but a few of the game's
+    dictionaries are keyed by integer checkpoint index. Convert just those keys
+    back to ints so restored games behave identically to live ones. All other
+    dictionaries (votes/decisions keyed by player-index strings, etc.) are left
+    exactly as stored."""
+    for game in loaded_games.values():
+        for team in game.get("teams", []):
+            if isinstance(team.get("private"), dict):
+                team["private"] = {int(k): v for k, v in team["private"].items()}
+            if isinstance(team.get("cp"), dict):
+                team["cp"] = {int(k): v for k, v in team["cp"].items()}
+            sab = team.get("sabotage")
+            if isinstance(sab, dict) and isinstance(sab.get("prompted"), dict):
+                sab["prompted"] = {int(k): v for k, v in sab["prompted"].items()}
+    return loaded_games
+
+
+def save_state():
+    """Persist the current in-memory state. Safe to call unconditionally."""
+    if _persistence_active():
+        storage.save_state(games, active_code)
+
+
+def restore_state():
+    """Load any previously saved game back into memory on boot."""
+    global games, active_code
+    if not _persistence_active():
+        return
+    loaded_games, loaded_code = storage.load_state()
+    games = _normalize_loaded_state(loaded_games)
+    active_code = loaded_code
+
+
+# ---------------------------------------------------------------------------
+# Request lifecycle: serialize handling with the state lock, then persist any
+# changes made by mutating (POST) requests.
+# ---------------------------------------------------------------------------
+@app.before_request
+def _acquire_state_lock():
+    _state_lock.acquire()
+
+
+@app.teardown_request
+def _release_state_lock(exc):
+    try:
+        if exc is None and request.method not in ("GET", "HEAD", "OPTIONS"):
+            save_state()
+    finally:
+        try:
+            _state_lock.release()
+        except RuntimeError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Game Master access control. When GM_PASSWORD is set, every /gm* screen except
+# the login page requires an authenticated session. When it is unset (local dev
+# and tests) the screens stay open, preserving the original workflow.
+# ---------------------------------------------------------------------------
+@app.before_request
+def _require_gm_login():
+    path = request.path
+    if not (path == "/gm" or path.startswith("/gm/")):
+        return None
+    if path in ("/gm/login", "/gm/logout"):
+        return None
+    if not app.config.get("GM_PASSWORD"):
+        return None  # GM protection not configured (local/dev/test): open.
+    if session.get("is_gm"):
+        return None
+    return redirect(url_for("gm_login"))
+
+
+@app.route("/gm/login", methods=["GET", "POST"])
+def gm_login():
+    configured = app.config.get("GM_PASSWORD")
+    if not configured:
+        # Nothing to protect; send the GM straight to the dashboard.
+        return redirect(url_for("gm"))
+    error = ""
+    if request.method == "POST":
+        supplied = request.form.get("password", "")
+        if supplied == configured:
+            session["is_gm"] = True
+            session.permanent = False
+            return redirect(url_for("gm"))
+        error = "<p class='err'>Incorrect password.</p>"
+    body = (
+        "<div class='card'><h2>Game Master Login</h2>" + error +
+        "<form method='post' action='/gm/login'>"
+        "<p><label>Password<br><input type='password' name='password' autocomplete='off'></label></p>"
+        "<p><button type='submit'>Log In</button></p></form></div>"
+        "<p class='footer'><a href='/'>Home</a></p>")
+    return page("Game Master Login", body, "gm")
+
+
+@app.route("/gm/logout", methods=["POST", "GET"])
+def gm_logout():
+    session.pop("is_gm", None)
+    return redirect(url_for("gm_login"))
+
+
+# ---------------------------------------------------------------------------
+# Health check (used by Render and for manual verification). No auth, no state.
+# ---------------------------------------------------------------------------
+@app.route("/healthz")
+def healthz():
+    try:
+        storage.ping()
+    except Exception:
+        return "database unavailable", 503
+    return "ok", 200
+
+
+# Characters used for game codes. Ambiguous ones (0, O, 1, I) are left out.
+CODE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+# Teams are only allowed these player counts.
+ALLOWED_PLAYER_COUNTS = [4, 5, 6]
+
+# How many cards a team is dealt, how many make the starting roster.
+DEALT_COUNT = 15
+ROSTER_COUNT = 10
+
+
+def e(value):
+    """Escape user-provided text for safe HTML display."""
+    return str(escape(value))
+
+
+# ---------------------------------------------------------------------------
+# Public Roles - perspectives, not powers.
+# ---------------------------------------------------------------------------
+PUBLIC_ROLES = [
+    "Student Whisperer",
+    "Learning Police",
+    "Burnout Bouncer",
+    "Receipts Department",
+    "Efficiency Gremlin",
+    "Professional Buzzkill",
+]
+
+ROLE_PERSPECTIVES = {
+    "Student Whisperer": "Watch for the student experience: engagement, belonging, and who may be quietly struggling.",
+    "Learning Police": "Watch for alignment: do the activities, practice, and assessments actually match the stated learning?",
+    "Burnout Bouncer": "Watch faculty capacity: is the plan sustainable for a real human instructor?",
+    "Receipts Department": "Watch the evidence: what does the data actually show before we decide what it means?",
+    "Efficiency Gremlin": "Watch for scale: is there a reusable, lower-effort way to solve this for everyone?",
+    "Professional Buzzkill": "Watch for consequences: what does this decision cost us later that it does not cost us now?",
+}
+
+# ---------------------------------------------------------------------------
+# The 30 Student Cards.
+# Visible stats (1-5 each): Readiness, Motivation, Communication,
+# Self-Management, Adaptability, Help-Seeking. Totals run ~16-20.
+# No visible total is shown to faculty. Stats drive starting conditions and
+# which students the authored checkpoint evidence features.
+# ---------------------------------------------------------------------------
+# Key order used everywhere: readiness, motivation, communication,
+# self_management, adaptability, help_seeking.
+STUDENT_DATA = [
+    {"n": 1, "name": "Captain Calendar",
+     "stats": (3, 4, 3, 2, 3, 3),
+     "context": "Full-time student juggling several courses at once.",
+     "strengths": ["Engaged and active", "Responds well to clear reminders"],
+     "challenges": ["Loses track of due dates", "Confuses where the real deadline lives"]},
+    {"n": 2, "name": "Deadline Dodge",
+     "stats": (3, 2, 3, 2, 3, 3),
+     "context": "Works significant hours outside of class.",
+     "strengths": ["Capable when present", "Honest about being behind"],
+     "challenges": ["Sporadic, late activity", "Misses work when life gets busy"]},
+    {"n": 3, "name": "Human Question Mark",
+     "stats": (2, 4, 3, 3, 2, 3),
+     "context": "Early in the program and still learning expectations.",
+     "strengths": ["Tries and submits", "Willing to redo work"],
+     "challenges": ["Misreads what an assignment is asking", "Struggles when expectations shift"]},
+    {"n": 4, "name": "Steady Eddie",
+     "stats": (3, 3, 3, 3, 3, 3),
+     "context": "Reliable, middle-of-the-road student.",
+     "strengths": ["Consistent", "Predictable follow-through"],
+     "challenges": ["Rarely stands out", "Can be overlooked"]},
+    {"n": 5, "name": "Overcommitted Olivia",
+     "stats": (3, 5, 3, 2, 3, 2),
+     "context": "Involved in many activities and commitments.",
+     "strengths": ["High drive", "Enthusiastic participant"],
+     "challenges": ["Overextended", "Weak time management"]},
+    {"n": 6, "name": "Ghost Protocol",
+     "stats": (3, 2, 2, 3, 3, 3),
+     "context": "Enrolled but hard to reach.",
+     "strengths": ["Does solid work when present"],
+     "challenges": ["Disengages for stretches", "Quiet in the course"]},
+    {"n": 7, "name": "Late Bloomer Supreme",
+     "stats": (2, 4, 3, 3, 3, 3),
+     "context": "Starts slowly, finishes strong.",
+     "strengths": ["Resilient over a full term", "Improves with time"],
+     "challenges": ["Slow, shaky start", "Early grades understate ability"]},
+    {"n": 8, "name": "Silent SOS",
+     "stats": (3, 2, 4, 3, 3, 1),
+     "context": "Commuter with a consistent weekly schedule.",
+     "strengths": ["Communicates well when approached", "Uses support effectively once connected"],
+     "challenges": ["May struggle to initiate when stuck", "Can wait too long for someone else to notice"]},
+    {"n": 9, "name": "Rubric Lawyer",
+     "stats": (4, 4, 4, 3, 2, 3),
+     "context": "Detail-oriented and grade-focused.",
+     "strengths": ["Reads instructions closely", "Produces precise work"],
+     "challenges": ["Rigid when plans change", "Can argue the specification"]},
+    {"n": 10, "name": "Comeback Kid",
+     "stats": (3, 4, 3, 3, 4, 3),
+     "context": "Has overcome a rough prior term.",
+     "strengths": ["Bounces back", "Adapts to setbacks"],
+     "challenges": ["Can still backslide under stress"]},
+    {"n": 11, "name": "Quiet Achiever",
+     "stats": (4, 4, 2, 4, 3, 2),
+     "context": "Strong student who says little.",
+     "strengths": ["High-quality work", "Well organized"],
+     "challenges": ["Rarely communicates", "Will not ask for help"]},
+    {"n": 12, "name": "Spark Plug",
+     "stats": (3, 5, 4, 2, 3, 3),
+     "context": "Energetic and vocal in the course.",
+     "strengths": ["Motivated", "Communicates readily"],
+     "challenges": ["Disorganized", "Starts more than finishes"]},
+    {"n": 13, "name": "The Overthinker",
+     "stats": (4, 3, 3, 3, 2, 2),
+     "context": "Capable but anxious about getting it right.",
+     "strengths": ["Thorough", "Cares about quality"],
+     "challenges": ["Freezes when uncertain", "Reluctant to reach out"]},
+    {"n": 14, "name": "Multitask Master",
+     "stats": (3, 3, 3, 3, 4, 3),
+     "context": "Balances work, family, and school.",
+     "strengths": ["Flexible", "Keeps many plates spinning"],
+     "challenges": ["Occasionally drops a plate"]},
+    {"n": 15, "name": "First-Gen Trailblazer",
+     "stats": (2, 5, 3, 3, 3, 2),
+     "context": "First in their family to attend college.",
+     "strengths": ["Highly motivated", "Determined"],
+     "challenges": ["Still learning how college works", "Hesitant to use support"]},
+    {"n": 16, "name": "Night Owl",
+     "stats": (3, 3, 3, 2, 3, 3),
+     "context": "Does coursework late at night.",
+     "strengths": ["Puts in the hours"],
+     "challenges": ["Communicates at odd times", "Loose scheduling"]},
+    {"n": 17, "name": "The Sampler",
+     "stats": (3, 3, 2, 2, 4, 3),
+     "context": "Curious and tries everything.",
+     "strengths": ["Adaptable", "Willing to experiment"],
+     "challenges": ["Finishes little", "Scattered effort"]},
+    {"n": 18, "name": "The Anchor",
+     "stats": (4, 3, 4, 4, 3, 2),
+     "context": "Dependable presence in the class.",
+     "strengths": ["Steady", "Clear communicator", "Organized"],
+     "challenges": ["Will not ask for help when overloaded"]},
+    {"n": 19, "name": "Curveball",
+     "stats": (3, 3, 3, 2, 4, 2),
+     "context": "Performance is hard to predict.",
+     "strengths": ["Handles surprises"],
+     "challenges": ["Inconsistent output", "Slow to seek help"]},
+    {"n": 20, "name": "The Reactor",
+     "stats": (3, 3, 4, 3, 3, 2),
+     "context": "Responds well to prompts, passive otherwise.",
+     "strengths": ["Engages clearly when contacted"],
+     "challenges": ["Waits to be prompted", "Low self-starting"]},
+    {"n": 21, "name": "Slow and Steady",
+     "stats": (3, 3, 3, 4, 2, 3),
+     "context": "Methodical worker who needs lead time.",
+     "strengths": ["Organized", "Follows routines"],
+     "challenges": ["Struggles with sudden change"]},
+    {"n": 22, "name": "The Juggernaut",
+     "stats": (5, 2, 3, 3, 3, 2),
+     "context": "Very well prepared academically.",
+     "strengths": ["High readiness", "Strong foundation"],
+     "challenges": ["Coasts", "Low drive to push further"]},
+    {"n": 23, "name": "Help-Desk Hero",
+     "stats": (3, 3, 3, 3, 3, 5),
+     "context": "Comfortable asking questions early.",
+     "strengths": ["Proactive help-seeker", "Catches problems early"],
+     "challenges": ["Can lean on support rather than try first"]},
+    {"n": 24, "name": "The Phantom Submitter",
+     "stats": (3, 3, 2, 2, 3, 3),
+     "context": "Turns work in at the last possible moment.",
+     "strengths": ["Usually does submit"],
+     "challenges": ["No buffer for problems", "Quiet until the deadline"]},
+    {"n": 25, "name": "Bright Spot",
+     "stats": (4, 4, 4, 3, 3, 2),
+     "context": "Positive, engaged, and well liked.",
+     "strengths": ["Engaged", "Clear communicator", "Capable"],
+     "challenges": ["Reluctant to admit when stuck"]},
+    {"n": 26, "name": "The Wanderer",
+     "stats": (3, 3, 2, 2, 3, 3),
+     "context": "Loses the thread of the course structure.",
+     "strengths": ["Willing to re-engage when guided"],
+     "challenges": ["Gets lost in navigation", "Loose organization"]},
+    {"n": 27, "name": "Perfectionist Pat",
+     "stats": (4, 4, 3, 3, 2, 1),
+     "context": "Holds very high standards for their own work.",
+     "strengths": ["Excellent quality", "Diligent"],
+     "challenges": ["Slow to submit", "Avoids asking for help", "Rigid"]},
+    {"n": 28, "name": "The Connector",
+     "stats": (3, 3, 5, 3, 3, 3),
+     "context": "Natural communicator who organizes classmates.",
+     "strengths": ["Outstanding communication", "Builds peer support"],
+     "challenges": ["Can prioritize others over own work"]},
+    {"n": 29, "name": "Resilient Riley",
+     "stats": (3, 4, 3, 3, 4, 3),
+     "context": "Recovers quickly from setbacks.",
+     "strengths": ["Adaptable", "Persistent"],
+     "challenges": ["Sometimes moves on before mastering"]},
+    {"n": 30, "name": "The Minimalist",
+     "stats": (3, 3, 3, 3, 3, 2),
+     "context": "Does exactly as much as required.",
+     "strengths": ["Efficient", "Meets the bar"],
+     "challenges": ["Rarely goes beyond", "Slow to seek extension help"]},
+]
+
+STAT_KEYS = ["readiness", "motivation", "communication",
+             "self_management", "adaptability", "help_seeking"]
+STAT_LABELS = {
+    "readiness": "Readiness",
+    "motivation": "Motivation",
+    "communication": "Communication",
+    "self_management": "Self-Management",
+    "adaptability": "Adaptability",
+    "help_seeking": "Help-Seeking",
+}
+
+# Card label format: "#07 Late Bloomer Supreme". These labels are the values
+# used in checkboxes and stored on rosters, so they must stay stable.
+STUDENTS = []
+STUDENT_STATS = {}
+STUDENT_INFO = {}
+for _s in STUDENT_DATA:
+    _label = "#%02d %s" % (_s["n"], _s["name"])
+    STUDENTS.append(_label)
+    STUDENT_STATS[_label] = dict(zip(STAT_KEYS, _s["stats"]))
+    STUDENT_INFO[_label] = _s
+
+# ---------------------------------------------------------------------------
+# Resources (0-100). Status bands. Starting floor is 40.
+# ---------------------------------------------------------------------------
+RESOURCE_NAMES = [
+    "Student Success",
+    "Course Quality",
+    "Faculty Capacity",
+    "Time/Resources",
+]
+
+RESOURCE_BLURB = {
+    "Student Success": "Students' current ability to engage, persist, respond to difficulty, and use support.",
+    "Course Quality": "Health of the learning environment: clarity, alignment, accessibility, meaningful practice, feedback, consistency.",
+    "Faculty Capacity": "Instructor human bandwidth: attention, judgment, communication, follow-up, cognitive and emotional load.",
+    "Time/Resources": "Structural bandwidth: scalable routines, available supports, predictable processes, efficient interventions, time.",
+}
+
+# How each resource reads the roster as a classroom system. Weights are spread
+# so no single visible stat is a dominant drafting strategy.
+RESOURCE_WEIGHTS = {
+    "Student Success": {"readiness": 1.0, "motivation": 1.5, "adaptability": 1.0,
+                        "help_seeking": 1.0, "communication": 0.5},
+    "Course Quality": {"communication": 1.0, "adaptability": 1.0,
+                       "readiness": 1.0, "self_management": 1.0},
+    "Faculty Capacity": {"help_seeking": 1.5, "self_management": 1.0,
+                         "communication": 1.0, "motivation": 0.5},
+    "Time/Resources": {"self_management": 1.5, "help_seeking": 1.0,
+                       "motivation": 1.0, "adaptability": 0.5},
+}
+
+RESOURCE_FLOOR = 40  # starting resources may never begin below this
+
+
+def resource_status(value):
+    if value < 30:
+        return "Critical"
+    if value < 60:
+        return "Strained"
+    return "Normal"
+
+
+def _resource_from_roster(roster, weights):
+    """Score one resource from a 10-student roster as a classroom system.
+
+    Not a simple average: low relevant-stat clusters apply escalating pressure,
+    stacking high stats hits diminishing returns, and complementary strengths
+    give a small coverage bonus. Hidden from faculty. Floored at the start.
+    """
+    per = []
+    wsum = sum(weights.values())
+    for s in roster:
+        st = STUDENT_STATS[s]
+        val = sum(st[k] * w for k, w in weights.items()) / wsum  # 1..5
+        per.append(val)
+    m = sum(per) / len(per)
+    base = 25 + (m - 1) / 4 * 70            # m=1->25, m=3->60, m=5->95
+    if base > 65:                           # diminishing returns on the high side
+        base = 65 + (base - 65) * 0.6
+    lows = sum(1 for v in per if v <= 2.25)  # clustered weakness
+    penalty = (lows - 1) * 6 if lows >= 2 else 0
+    highs = sum(1 for v in per if v >= 4.2)  # complementary strengths (capped)
+    bonus = min(highs, 3) * 2
+    score = base - penalty + bonus
+    return max(RESOURCE_FLOOR, min(100, round(score)))
+
+
+def _geomean(scores):
+    product = 1.0
+    for name in RESOURCE_NAMES:
+        product *= max(1, scores[name])
+    return round(product ** (1.0 / len(RESOURCE_NAMES)))
+
+
+def compute_scores(roster):
+    """Return (scores, statuses, overall) for a 10-student roster."""
+    scores = {name: _resource_from_roster(roster, RESOURCE_WEIGHTS[name])
+              for name in RESOURCE_NAMES}
+    statuses = {name: resource_status(scores[name]) for name in RESOURCE_NAMES}
+    overall = _geomean(scores)
+    return scores, statuses, overall
+
+
+def recompute(team):
+    """Recompute statuses + overall from the team's current resources."""
+    res = team["resources"]
+    team["statuses"] = {name: resource_status(res[name]) for name in RESOURCE_NAMES}
+    team["overall"] = _geomean(res)
+
+
+def apply_deltas(team, deltas):
+    """Apply a {resource: delta} dict to current resources, clamp 0-100."""
+    res = team["resources"]
+    for name, delta in deltas.items():
+        res[name] = max(0, min(100, res[name] + delta))
+    recompute(team)
+
+
+def roster_interpretation(roster):
+    """One short, non-blaming roster-pattern sentence (never a per-student penalty)."""
+    avg = {}
+    for k in STAT_KEYS:
+        avg[k] = sum(STUDENT_STATS[s][k] for s in roster) / len(roster)
+    weakest = min(STAT_KEYS, key=lambda k: avg[k])
+    lines = {
+        "readiness": "This group includes several students whose preparation varies, so early foundational content and worked examples may matter more than usual.",
+        "motivation": "This group includes several students whose drive may dip, so visible progress, encouragement, and early wins may help this particular class.",
+        "communication": "This group includes several students who may not naturally volunteer information, so proactive, structured check-ins may serve this class well.",
+        "self_management": "This group includes several students who may benefit from clear structure, predictable routines, and reminders rather than open-ended deadlines.",
+        "adaptability": "This group includes several students who may need early notice and a little extra support whenever expectations or approaches change.",
+        "help_seeking": "This group contains several students who may benefit from proactive faculty contact rather than initiating support themselves.",
+    }
+    return lines[weakest]
+
+
+STARTING_PREAMBLE = (
+    "Your roster does not determine whether your course succeeds. It does affect "
+    "what kinds of systems, communication, flexibility, and support this particular "
+    "group may need from the course."
+)
+
+# ---------------------------------------------------------------------------
+# Course Cards (10 unique courses, two physical copies each). Straight-faced.
+# Course Realities are neutral structural facts; they do NOT change starting
+# scores, but may change how later actions read. They are not announced as
+# "the one that matters" until consequence or evidence reveals it.
+# ---------------------------------------------------------------------------
+COURSES = [
+    {"name": "Advanced Competitive Napping",
+     "code": "WELL 142", "credits": 3, "modality": "Lecture (on campus)",
+     "desc": "A performance-oriented study of restorative rest as a competitive discipline, covering sleep staging, recovery theory, and timed napping technique.",
+     "pattern": "Two 75-minute meetings per week; weekly lab logs.",
+     "assessment": "Weekly logs, two skills demonstrations, a final timed event.",
+     "prereq": "None.",
+     "realities": [
+         "Attendance-dependent: much of the graded practice happens live in the room.",
+         "Skills demonstrations are scheduled on fixed dates that are difficult to move."]},
+    {"name": "Bigfoot Field Research",
+     "code": "BIOL 215", "credits": 4, "modality": "CTE / hands-on (field + lab)",
+     "desc": "Field methodology for documenting elusive large mammals, including transect design, evidence chain-of-custody, and observational reliability.",
+     "pattern": "One lecture plus one 3-hour field lab per week.",
+     "assessment": "Field notebooks, two lab practicals, a research poster.",
+     "prereq": "Recommended: an introductory lab science.",
+     "realities": [
+         "Field labs run rain or shine on a fixed weekly window.",
+         "Equipment is shared, so late-arriving students need an onboarding slot."]},
+    {"name": "Professional Excuse Engineering",
+     "code": "COMM 108", "credits": 3, "modality": "Lecture (on campus)",
+     "desc": "A rhetoric course examining the structure, credibility, and ethics of explanation and justification in professional settings.",
+     "pattern": "Two 75-minute meetings per week; discussion-based.",
+     "assessment": "Discussion posts, two papers, a final portfolio.",
+     "prereq": "Composition I.",
+     "realities": [
+         "Heavily writing- and feedback-dependent; grading load is front-loaded.",
+         "Participation credit assumes students are present in discussion."]},
+    {"name": "Advanced Drama Management",
+     "code": "THEA 230", "credits": 3, "modality": "Lecture (on campus)",
+     "desc": "Analysis and de-escalation of interpersonal conflict dynamics, with applied scenario work and reflective practice.",
+     "pattern": "Two 75-minute meetings per week; scenario workshops.",
+     "assessment": "Scenario performances, peer feedback, a reflective journal.",
+     "prereq": "None.",
+     "realities": [
+         "Much of the learning is collaborative and peer-dependent.",
+         "Scenario work assumes stable groups formed early in the term."]},
+    {"name": "Internet Rabbit Hole Research",
+     "code": "INFO 120", "credits": 3, "modality": "Asynchronous online",
+     "desc": "Information literacy for deep, self-directed inquiry: source evaluation, search strategy, and avoiding unproductive tangents.",
+     "pattern": "Fully online; weekly modules with no fixed meeting time.",
+     "assessment": "Weekly module quizzes, an annotated source set, a final report.",
+     "prereq": "None.",
+     "realities": [
+         "No fixed meetings, so start-here structure and navigation carry the course.",
+         "Self-paced modules reward students who self-manage and punish those who drift."]},
+    {"name": "Paranormal Evidence Analysis",
+     "code": "FSCI 240", "credits": 4, "modality": "Asynchronous online",
+     "desc": "Applied analytical methods for evaluating ambiguous evidence, emphasizing standards of proof, bias, and justification.",
+     "pattern": "Fully online; modules plus two proctored analytical exams.",
+     "assessment": "Module assignments and two major analytical assessments.",
+     "prereq": "Recommended: a statistics or logic course.",
+     "realities": [
+         "Major assessments reward higher-order justification, not just identification.",
+         "Online delivery means practice activities must carry the alignment work."]},
+    {"name": "Industrial Snack Automation",
+     "code": "MFGT 165", "credits": 4, "modality": "CTE / hands-on (shop)",
+     "desc": "Design, operation, and troubleshooting of automated small-batch food production lines, with a safety and quality emphasis.",
+     "pattern": "One lecture plus one 3-hour shop lab per week.",
+     "assessment": "Shop competencies, safety checkoff, a line-build project.",
+     "prereq": "Shop safety orientation.",
+     "realities": [
+         "Competency checkoffs are sequential; later skills require earlier ones.",
+         "Lab stations are limited, so onboarding a late student takes a scheduled slot."]},
+    {"name": "Cryptid Habitat Construction",
+     "code": "CONS 180", "credits": 4, "modality": "CTE / hands-on (shop)",
+     "desc": "Applied construction techniques for specialized enclosures, covering materials, load, tolerances, and site planning.",
+     "pattern": "One lecture plus one 3-hour build lab per week.",
+     "assessment": "Build competencies, a materials estimate, a capstone enclosure.",
+     "prereq": "None.",
+     "realities": [
+         "The capstone depends on foundational competencies completed in order.",
+         "Build teams are formed early and are disrupted by late changes."]},
+    {"name": "Duct Tape Structural Engineering",
+     "code": "ENGR 155", "credits": 3, "modality": "CTE / hands-on (lab)",
+     "desc": "Rapid-prototyping engineering using adhesive-tensioned structures, emphasizing iteration, testing, and failure analysis.",
+     "pattern": "One lecture plus one 2-hour lab per week.",
+     "assessment": "Iterative build logs, two load tests, a design review.",
+     "prereq": "Recommended: an introductory design or math course.",
+     "realities": [
+         "Grades reward documented iteration, not just a working final build.",
+         "Load tests happen on fixed dates with shared equipment."]},
+    {"name": "Applied Apocalypse Preparation",
+     "code": "EMGT 110", "credits": 3, "modality": "Lecture (on campus)",
+     "desc": "Planning and logistics for large-scale disruption, covering risk assessment, prioritization, and resource allocation under constraint.",
+     "pattern": "Two 75-minute meetings per week; case-based.",
+     "assessment": "Case analyses, a tabletop exercise, a final plan.",
+     "prereq": "None.",
+     "realities": [
+         "The course explicitly rewards prioritization under limited resources.",
+         "The tabletop exercise assumes students have kept up with prior cases."]},
+]
+COURSE_NAMES = [c["name"] for c in COURSES]
+COURSE_BY_NAME = {c["name"]: c for c in COURSES}
+
+
+# ---------------------------------------------------------------------------
+# Resource & tool reference (verified against nwicc.edu, Oct 2026).
+# Two categories faculty must learn to tell apart:
+#   COURSE TOOL    - things faculty do INSIDE the course (Canvas) to manage the
+#                    learning environment, see concerns, communicate, and assess.
+#   STUDENT SUPPORT- real NCC services faculty CONNECT a student with when the
+#                    evidence shows the student would benefit from outside help.
+# Each card carries the need type(s) it addresses so the game can teach faculty to
+# distinguish a support need from a course-design, communication, advising, or
+# accessibility need. NCC-specific facts (e.g. Brainfuse 15 hrs/yr, the Panorama
+# Accessibility tool name) are verified NCC information for this build.
+# ---------------------------------------------------------------------------
+# Need taxonomy (shown to faculty as plain labels).
+NEED_LABELS = {
+    "support": "Student support need",
+    "course_design": "Course design / instruction need",
+    "communication": "Communication need",
+    "advising": "Advising / persistence concern",
+    "accessibility": "Accessibility need",
+}
+
+TOOL = "COURSE TOOL"
+SUPPORT = "STUDENT SUPPORT"
+
+RESOURCES = [
+    # ---- COURSE TOOLS (inside Canvas / the course) ------------------------
+    {"name": "Dropout Detective", "category": TOOL,
+     "needs": ["advising"],
+     "what": "Early-alert system that helps faculty identify and document a student "
+             "persistence concern and route it to the student's advisor.",
+     "when": "A student shows a persistence-risk pattern (disengagement, missed work, "
+             "stopped logging in) that advising should know about. It is NOT tutoring.",
+     "how": "Canvas left navigation → Dropout Detective → select the student → "
+            "Notes → write a note to the advisor → activate the alert. The note is "
+            "instructor-to-advisor communication, not a student-facing message.",
+     "limits": "Flags and documents concern and activates an advisor; it does not itself "
+               "teach, tutor, or fix the course. One alert per genuinely at-risk student — "
+               "not a substitute for a class-wide fix."},
+    {"name": "Canvas Grades / Entering Zeros", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "The gradebook. Entering zeros for missing work (instead of blank cells) so "
+             "grades reflect reality.",
+     "when": "Early, and at end of term, so students see the true impact of missing work and "
+             "the gradebook is accurate.",
+     "how": "Gradebook → enter 0 for missing submissions; record last date of attendance "
+            "where required.",
+     "limits": "Accuracy is not outreach — an accurate zero still needs a message if you "
+               "want the student to act."},
+    {"name": "Message Students Who…", "category": TOOL,
+     "needs": ["communication"],
+     "what": "Send a targeted message from the gradebook to a filtered group (e.g. students "
+             "who have not submitted an item).",
+     "when": "Fast, targeted outreach without emailing the whole class.",
+     "how": "Gradebook → assignment column menu → Message Students Who… → pick "
+            "the condition.",
+     "limits": "Relies on student follow-through; it is a nudge, not a guarantee."},
+    {"name": "Announcements / Scheduled Announcements", "category": TOOL,
+     "needs": ["communication"],
+     "what": "Class announcements, which can be written ahead and set to post on chosen dates.",
+     "when": "Whole-class communication; spreading communication load and keeping timing "
+             "consistent.",
+     "how": "Announcements → compose → (optionally) set a future post date.",
+     "limits": "Whole-class by design — not the tool for one student's individual issue."},
+    {"name": "Canvas Modules / Start Here", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "Content organized into modules, with requirements/prerequisites and a clear "
+             "Start Here path.",
+     "when": "Creating a sensible order through content and onboarding late-adds.",
+     "how": "Modules → build a Start Here module; set requirements/prerequisites.",
+     "limits": "Structure helps students who engage; it does not by itself reach a student who "
+               "has stopped showing up."},
+    {"name": "Rubrics", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "A criteria-based rubric attached to an assignment so expectations and scoring "
+             "are explicit.",
+     "when": "Students are unclear what \"good\" looks like, or grading needs to be consistent "
+             "and defensible.",
+     "how": "Assignment → + Rubric → define criteria and point values.",
+     "limits": "Clarifies expectations; does not close a skill gap on its own."},
+    {"name": "SpeedGrader / Reusable Feedback", "category": TOOL,
+     "needs": ["course_design", "communication"],
+     "what": "Grade in one place and reuse common feedback (comment library) across "
+             "submissions.",
+     "when": "Many students share the same issue; cutting grading time.",
+     "how": "SpeedGrader → comment → save to / reuse from the comment library.",
+     "limits": "Feedback only helps if students can find it — point them to where it lives."},
+    {"name": "Course Analytics / Access Report", "category": TOOL,
+     "needs": ["advising", "course_design"],
+     "what": "Activity and access data showing who is engaging with the course and content.",
+     "when": "Investigating whether a problem is engagement vs. a shared design gap.",
+     "how": "Course Analytics / a student's Access Report in People.",
+     "limits": "Shows what happened, not why — pair it with the student's actual work."},
+    {"name": "Panorama Accessibility", "category": TOOL,
+     "needs": ["accessibility", "course_design"],
+     "what": "Checks course documents, pages, and media for accessibility (headings, alt text, "
+             "contrast, captions) and helps remediate them.",
+     "when": "Making sure all students have equitable access to the materials.",
+     "how": "Open the Panorama accessibility report in the course and work through flagged items.",
+     "limits": "Addresses material access; a documented individual need still routes to "
+               "Accessibility / Accommodation Services (a STUDENT SUPPORT)."},
+    {"name": "Simple Syllabus", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "A consistent, up-to-date syllabus of record.",
+     "when": "Keeping the syllabus and the live course (due dates, schedule) in agreement — "
+             "the CP1 syllabus-vs-Canvas mismatch is exactly this.",
+     "how": "Maintain the syllabus of record; reconcile Canvas due dates to it.",
+     "limits": "Fixes the course inconsistency, not a student who already acted on the wrong date."},
+    {"name": "Grade Publish", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "Posting/publishing final grades through the approved end-of-term process.",
+     "when": "The Final Stretch; confirm accuracy first.",
+     "how": "Follow the approved Grade Publish process at end of term.",
+     "limits": "Final and visible — verify accuracy before publishing."},
+    {"name": "Course Improvement Survey", "category": TOOL,
+     "needs": ["course_design"],
+     "what": "End-of-term student feedback on the course.",
+     "when": "The Final Stretch, as part of finishing accurately and improving next term.",
+     "how": "Deploy the Course Improvement Survey near end of term.",
+     "limits": "Informs future terms, not the current cohort."},
+
+    # ---- STUDENT SUPPORTS (real NCC services) -----------------------------
+    {"name": "Learning Center (Student Success Center)", "category": SUPPORT,
+     "needs": ["support"],
+     "what": "NCC's academic-support center in Building A: free tutoring (drop-in, one-to-one, "
+             "or small group) in most program areas, plus a computer lab, study rooms, and "
+             "testing/proctoring.",
+     "when": "A student needs academic help with course content. A natural first option for "
+             "on-campus students — and online students may use it too.",
+     "how": "Refer the student to the Learning Center in Building A; 712-324-5061 / "
+            "learncenter@nwicc.edu. No appointment required for drop-in tutoring.",
+     "limits": "In-person location (Building A); best fit when a student can get to campus. "
+               "Tutoring supports the student — it does not fix an unclear assignment or a "
+               "course-design gap.",
+     "modality_note": "Especially natural for on-campus courses; still open to online students."},
+    {"name": "Brainfuse Online Tutoring", "category": SUPPORT,
+     "needs": ["support"],
+     "what": "Free online tutoring NCC students can reach any time through the sidebar link in "
+             "any Canvas course.",
+     "when": "A student needs academic help and in-person hours or location are a barrier — "
+             "especially accessible for online students, but available to others as well.",
+     "how": "Click the Brainfuse link in the sidebar of any Canvas course. No appointment needed.",
+     "limits": "NCC students receive 15 hours of Brainfuse tutoring per year — it is not "
+               "unlimited; it supplements, not replaces, course instruction.",
+     "modality_note": "Especially accessible for online students; available to others where "
+                      "appropriate."},
+    {"name": "TRiO Student Support Services", "category": SUPPORT,
+     "needs": ["advising", "support"],
+     "what": "A federally funded program offering eligible students academic advising, career "
+             "and personal counseling, financial-aid advising, professional and peer tutoring by "
+             "appointment, transfer assistance, and Lunch & Learn workshops — all free.",
+     "when": "A student with broader persistence/support needs who is ELIGIBLE would benefit from "
+             "wraparound support, not just one tutoring session.",
+     "how": "Encourage an eligible student to apply (TRiO application on NCC's Academic Support "
+            "page). Services are free to those who qualify.",
+     "limits": "Eligibility required — a student must be a first-generation college student, "
+               "meet federal income guidelines, OR have a documented disability, and be a U.S. "
+               "citizen/resident. The program serves a limited number of students. Not every "
+               "student qualifies — do not assume universal access.",
+     "modality_note": "Eligibility- and application-based, independent of course modality."},
+    {"name": "Accessibility / Accommodation Services", "category": SUPPORT,
+     "needs": ["accessibility"],
+     "what": "NCC's coordination of accommodations and support for students with a documented "
+             "disability.",
+     "when": "The evidence points to an access need (not an effort or content-help need).",
+     "how": "Direct the student to apply for accommodations (Application for Accommodation for "
+            "Disability and records-release paperwork) through NCC's accommodation process.",
+     "limits": "Requires documentation and the student's request; accommodations are arranged "
+               "through the process, not granted ad hoc in the course."},
+    {"name": "Academic Advising", "category": SUPPORT,
+     "needs": ["advising"],
+     "what": "Each student's assigned advisor, who helps with persistence, course selection, "
+             "staying on track, and connecting to NCC resources. Advising is required each "
+             "semester.",
+     "when": "A persistence/path concern bigger than one assignment — and the destination of "
+             "a Dropout Detective alert.",
+     "how": "Loop in the student's advisor (directly or via a Dropout Detective note/alert).",
+     "limits": "Advisors guide persistence and pathway — they are not the content tutor for "
+               "your course."},
+    {"name": "NCC Library", "category": SUPPORT,
+     "needs": ["support", "course_design"],
+     "what": "The NCC Library, which supports all of the college's programs with research help "
+             "and resources.",
+     "when": "A student (or an assignment) needs research, source, or information-literacy help.",
+     "how": "Point students to the Library's research help and resources.",
+     "limits": "Research/resource support, not general subject tutoring."},
+]
+RESOURCES_BY_NAME = {r["name"]: r for r in RESOURCES}
+COURSE_TOOLS = [r for r in RESOURCES if r["category"] == TOOL]
+STUDENT_SUPPORTS = [r for r in RESOURCES if r["category"] == SUPPORT]
+
+
+def modality_class(modality):
+    """Collapse a course's modality string into one of: online, campus, cte."""
+    m = (modality or "").lower()
+    if "online" in m:
+        return "online"
+    if "cte" in m or "hands-on" in m or "shop" in m or "lab" in m or "field" in m:
+        return "cte"
+    return "campus"
+
+
+def support_context_note(team):
+    """Modality-aware guidance for choosing a STUDENT SUPPORT. Deliberately NOT a
+    lookup table: it frames which options are most accessible while keeping several
+    valid, and reminds faculty to match the need before referring anyone."""
+    mc = modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality"))
+    if mc == "online":
+        return ("For this asynchronous online course, <strong>Brainfuse online tutoring</strong> "
+                "(sidebar link in Canvas) is usually the most accessible tutoring option — "
+                "remember the 15-hours-per-year limit. The <strong>Learning Center (Student Success "
+                "Center)</strong> is still open to online students, and <strong>TRiO</strong> may "
+                "fit an eligible student. First confirm the need is academic support, not an unclear "
+                "assignment.")
+    if mc == "cte":
+        return ("This is a hands-on / CTE course, so tutoring is not automatically the answer. Check "
+                "the evidence first: a competency gap may call for additional guided practice, "
+                "clarified directions, or an accessibility accommodation rather than tutoring. If "
+                "academic support is warranted, the <strong>Learning Center (Student Success Center)</strong> "
+                "and <strong>Brainfuse</strong> (15 hrs/yr) are both available; <strong>TRiO</strong> "
+                "may fit an eligible student with broader needs.")
+    return ("For this on-campus course, the <strong>Learning Center (Student Success Center)</strong> "
+            "in Building A is a natural in-person option; <strong>Brainfuse online tutoring</strong> "
+            "(15 hrs/yr) is available too, and <strong>TRiO</strong> may fit an eligible student. "
+            "First confirm the need is academic support rather than a course-design or communication "
+            "issue.")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints.
+# ---------------------------------------------------------------------------
+CHECKPOINTS = [
+    "First Week",
+    "Early Semester",
+    "First Major Assessment",
+    "Midterm",
+    "Final Stretch",
+]
+# Full private player check (mission claim + suspicion vote) happens ONLY after
+# CP1, CP3, CP5 (indices 0, 2, 4). CP2 has no private round. CP4 (index 3) has a
+# brief, privacy-preserving pass-the-device round whose ONLY purpose is the
+# Thunderflunked's Emergency Sabotage opportunity (no mission, no suspicion vote).
+HAS_PRIVATE = {0, 2, 4}
+# Emergency Sabotage is available during CP3 (index 2, inside the full private
+# round) and CP4 (index 3, inside the brief round), offered in the Thunderflunked's
+# own private turn. It is one-time and expires after CP4.
+SABOTAGE_WINDOW = {2, 3}
+
+
+# GM pacing plan: cumulative target minute-marks per phase for the locked
+# private-round schedule (full private after CP1/CP3/CP5; CP2 none; CP4 brief
+# sabotage-only) targeting ~60 min. Used only for the GM's on-screen pacing
+# panel; it does not affect gameplay.
+PACING = [
+    ("setup", "Setup / roles / trading / draft / handoff", 0, 12),
+    ("cp1", "Checkpoint 1: First Week (+ full private)", 12, 21),
+    ("cp2", "Checkpoint 2: Early Semester (no private)", 21, 28),
+    ("cp3", "Checkpoint 3: First Major Assessment (+ full private)", 28, 39),
+    ("cp4", "Checkpoint 4: Midterm (brief sabotage only)", 39, 47),
+    ("cp5", "Checkpoint 5: Final Stretch (+ full private)", 47, 57),
+    ("final", "Final accusation / reveal / debrief", 57, 64),
+]
+
+
+def current_phase_key(game):
+    if game.get("final_open"):
+        return "final"
+    idx = game["checkpoint_index"]
+    if idx == 0 and not game["opened_once"]:
+        return "setup"
+    return "cp%d" % (idx + 1)
+
+
+def make_game_code(length=5):
+    return "".join(random.choice(CODE_CHARACTERS) for _ in range(length))
+
+
+def get_team(game_code, team_index):
+    if game_code not in games:
+        return None
+    teams = games[game_code]["teams"]
+    if team_index < 0 or team_index >= len(teams):
+        return None
+    return teams[team_index]
+
+
+def find_team_index(game_code, team_name):
+    if game_code not in games:
+        return None
+    target = team_name.strip().lower()
+    for i, team in enumerate(games[game_code]["teams"]):
+        if team["name"].strip().lower() == target:
+            return i
+    return None
+
+
+# ===========================================================================
+# Shared page layout (CSS, accessibility, NCC brand). No JS, no external assets.
+# ===========================================================================
+NCC_RED = "#A4343A"
+NCC_GRAY = "#676767"
+
+BASE_CSS = """
+:root{--red:#A4343A;--gray:#676767;--ink:#1f2224;--bg:#f4f1ec;--card:#ffffff;
+      --line:#d9d4cc;--good:#2e7d4f;--warn:#b26a00;--bad:#9e2b25;}
+*{box-sizing:border-box;}
+body{margin:0;font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+     color:var(--ink);background:var(--bg);line-height:1.5;}
+.wrap{max-width:900px;margin:0 auto;padding:20px;}
+header.bar{background:var(--red);color:#fff;padding:14px 20px;}
+header.bar .wrap{padding:0;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}
+header.bar h1{font-size:1.25rem;margin:0;}
+header.bar .tag{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;opacity:.9;}
+h1,h2,h3,h4{color:var(--ink);}
+h2{border-bottom:3px solid var(--red);padding-bottom:4px;margin-top:1.4em;}
+a{color:var(--red);}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+      padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.evidence{border-left:5px solid var(--gray);}
+.notice{background:#fff7e6;border:1px solid #f0d9a6;border-radius:8px;padding:12px 14px;margin:12px 0;}
+.btn,button{background:var(--red);color:#fff;border:0;border-radius:8px;
+      padding:10px 16px;font-size:1rem;cursor:pointer;text-decoration:none;display:inline-block;}
+.btn.secondary,button.secondary{background:#fff;color:var(--red);border:2px solid var(--red);}
+button:focus,a:focus,input:focus,select:focus{outline:3px solid #000;outline-offset:2px;}
+label{display:block;margin:.4em 0;}
+.choice{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0;background:#fff;}
+.choice small{color:var(--gray);display:block;margin-top:4px;}
+.meter{margin:10px 0;}
+.meter .top{display:flex;justify-content:space-between;font-weight:600;}
+.meter .track{background:#e6e1d8;border-radius:6px;height:16px;overflow:hidden;border:1px solid var(--line);}
+.meter .fill{height:100%;}
+.status-Normal{color:var(--good);} .status-Strained{color:var(--warn);} .status-Critical{color:var(--bad);}
+.fill-Normal{background:var(--good);} .fill-Strained{background:var(--warn);} .fill-Critical{background:var(--bad);}
+table{border-collapse:collapse;width:100%;margin:10px 0;}
+th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;}
+th{background:#efe9e0;}
+.err{color:#fff;background:var(--bad);padding:10px 12px;border-radius:8px;}
+.muted{color:var(--gray);}
+.pill{display:inline-block;background:#efe9e0;border-radius:20px;padding:2px 10px;font-size:.85rem;}
+.resource{border-left:5px solid var(--line);}
+.resource.support{border-left-color:var(--red);}
+.resource.tool{border-left-color:var(--gray);}
+.resource h3{margin-top:0;}
+details.card summary{cursor:pointer;font-size:1rem;}
+details.card[open] summary{margin-bottom:8px;}
+.private{background:#2a2d31;color:#fff;}
+.private .wrap{min-height:40vh;}
+.private h1,.private h2,.private h3{color:#fff;}
+.private .card{background:#3a3f45;border-color:#555;color:#fff;}
+.big{font-size:1.3rem;}
+.center{text-align:center;}
+.footer{margin-top:24px;font-size:.9rem;}
+ul.clean{list-style:none;padding-left:0;}
+ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
+.tilegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin:12px 0;}
+.tile{position:relative;border:2px solid var(--line);border-radius:10px;padding:12px 12px 10px;background:#fff;cursor:pointer;display:block;}
+.tile .num{font-weight:700;font-size:1.05rem;color:var(--red);}
+.tile .nm{display:block;font-weight:600;margin-top:2px;}
+.tile .ctx{display:block;color:var(--gray);font-size:.78rem;margin-top:6px;}
+.tile input{position:absolute;opacity:0;width:1px;height:1px;}
+.tile .check{position:absolute;top:8px;right:10px;font-size:.7rem;font-weight:700;color:#fff;background:var(--red);border-radius:10px;padding:1px 7px;opacity:0;}
+.tile.sel,.tile:has(input:checked){border-color:var(--red);background:#faecec;box-shadow:0 0 0 2px var(--red) inset;}
+.tile.sel .check,.tile:has(input:checked) .check{opacity:1;}
+.tile:has(input:focus){outline:3px solid #000;outline-offset:2px;}
+.selbar{position:sticky;top:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:10px 0;z-index:5;}
+.selbar.ok{border-color:var(--good);}
+#selcount{font-weight:700;}
+#selcount.count-ok{color:var(--good);} #selcount.count-no{color:var(--warn);}
+.selbar label{display:inline;}
+.selbar input[type=text]{width:220px;max-width:60vw;}
+/* Canvas-style course shell */
+body.shell{background:#fff;}
+.lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
+.lms-global{background:#394B58;width:84px;flex:0 0 84px;display:flex;flex-direction:column;align-items:stretch;padding:8px 0;}
+.lms-global .gi{color:#fff;opacity:.9;text-align:center;font-size:.6rem;line-height:1.1;padding:9px 2px;}
+.lms-global .gi svg{display:block;margin:0 auto 3px;width:22px;height:22px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
+.lms-course{flex:0 0 200px;border-right:1px solid #c7cdd1;padding:16px 0;background:#fff;}
+.lms-course .ch{font-weight:700;padding:0 16px 12px;color:#A4343A;font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;}
+.lms-course a{display:block;padding:9px 16px;color:#394B58;text-decoration:none;border-left:4px solid transparent;}
+.lms-course a:hover{background:#f2f4f5;}
+.lms-course a.active{color:#A4343A;font-weight:700;border-left-color:#A4343A;}
+.lms-content{flex:1;padding:18px 26px;min-width:0;}
+.lms-crumb{color:#A4343A;font-size:.85rem;margin-bottom:6px;}
+.lms-crumb a{color:#A4343A;text-decoration:none;}
+.lms-h1{font-size:1.7rem;margin:0 0 16px;font-weight:600;color:#2d3b45;}
+.lms .card{box-shadow:none;border-color:#e1e4e6;}
+.lms .card h2{border-bottom:1px solid #e1e4e6;}
+.lms table th{background:#f5f5f5;}
+.lms-content a.btn{text-decoration:none;}
+@media (max-width:760px){
+ .lms{flex-direction:column;}
+ .lms-global{flex-direction:row;width:100%;flex:0 0 auto;overflow-x:auto;}
+ .lms-global .gi{flex:0 0 auto;}
+ .lms-course{flex:0 0 auto;border-right:0;border-bottom:1px solid #c7cdd1;display:flex;flex-wrap:wrap;padding:8px;}
+ .lms-course .ch{width:100%;padding-bottom:6px;}
+ .lms-course a{border-left:0;border-bottom:3px solid transparent;}
+ .lms-course a.active{border-left:0;border-bottom-color:#A4343A;}
+}
+"""
+
+
+def page(title, body, screen="team", header_tag="Faculty Development Game", bare=False):
+    body_class = {"team": "", "projector": "projector", "gm": "gm",
+                  "private": "private", "landing": "", "shell": "shell"}.get(screen, "")
+    head = (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>" + e(title) + "</title><style>" + BASE_CSS + "</style></head>"
+        "<body class='" + body_class + "'>"
+    )
+    if bare:
+        # No standard NCC chrome: the caller supplies its own full-viewport layout
+        # (used by the Canvas-style course shell).
+        return head + body + "</body></html>"
+    return (
+        head
+        + "<header class='bar'><div class='wrap'><h1>Northwest Iowa Community College</h1>"
+        "<span class='tag'>" + e(header_tag) + "</span></div></header>"
+        "<main class='wrap'>" + body + "</main></body></html>"
+    )
+
+
+def resource_meters(scores, statuses):
+    html = "<div class='card'><h3>Course Resources</h3>"
+    for name in RESOURCE_NAMES:
+        val = scores[name]
+        st = statuses[name]
+        html += (
+            "<div class='meter'>"
+            "<div class='top'><span>" + name + "</span>"
+            "<span class='status-" + st + "'>" + str(val) + " / 100 &mdash; " + st + "</span></div>"
+            "<div class='track'><div class='fill fill-" + st + "' style='width:" + str(val) + "%'></div></div>"
+            "<div class='muted' style='font-size:.85rem'>" + RESOURCE_BLURB[name] + "</div>"
+            "</div>"
+        )
+    html += "</div>"
+    return html
+
+
+def scores_table(scores, statuses):
+    rows = ""
+    for name in RESOURCE_NAMES:
+        rows += ("<tr><td>" + name + "</td><td>" + str(scores[name])
+                 + "</td><td class='status-" + statuses[name] + "'>" + statuses[name] + "</td></tr>")
+    return ("<table><tr><th>Resource</th><th>Score</th><th>Status</th></tr>"
+            + rows + "</table>")
+
+
+def student_list_html(labels):
+    if not labels:
+        return "<p class='muted'>(none)</p>"
+    return "<ul class='clean'>" + "".join("<li>" + e(s) + "</li>" for s in labels) + "</ul>"
+
+
+def student_card_html(label):
+    """A compact physical-card-style readout of one student's visible stats."""
+    info = STUDENT_INFO[label]
+    st = STUDENT_STATS[label]
+    stats = "".join(
+        "<tr><td>" + STAT_LABELS[k] + "</td><td>" + ("&#9679;" * st[k]) + ("&#9675;" * (5 - st[k]))
+        + " <span class='muted'>(" + str(st[k]) + "/5)</span></td></tr>"
+        for k in STAT_KEYS
+    )
+    strengths = "".join("<li>" + e(x) + "</li>" for x in info["strengths"])
+    challenges = "".join("<li>" + e(x) + "</li>" for x in info["challenges"])
+    return (
+        "<div class='card'><h4>" + e(label) + "</h4>"
+        "<p class='muted'>" + e(info["context"]) + "</p>"
+        "<table>" + stats + "</table>"
+        "<p><strong>Strengths:</strong></p><ul>" + strengths + "</ul>"
+        "<p><strong>Challenges:</strong></p><ul>" + challenges + "</ul></div>"
+    )
+
+
+# ===========================================================================
+# Home
+# ===========================================================================
+@app.route("/")
+def home():
+    body = (
+        "<div class='card'><p>Choose a screen to open:</p>"
+        "<p><a class='btn' href='/gm'>Game Master Dashboard</a></p>"
+        "<p><a class='btn secondary' href='/team'>Team Screen</a></p>"
+        "<p><a class='btn secondary' href='/projector'>Projector / Room Screen</a></p>"
+        "</div>"
+    )
+    return page("Faculty Development Game", body, "landing")
+
+
+# ===========================================================================
+# Game Master Dashboard
+# ===========================================================================
+def course_control_html(game):
+    phase = game.get("course_trading", "closed")
+    if phase == "not_open":
+        return ("<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: NOT OPEN</strong></p>"
+                "<form method='post' action='/gm/course/open'><button type='submit'>Open Course Trading</button></form></div>")
+    if phase == "open":
+        return ("<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: OPEN</strong></p>"
+                "<form method='post' action='/gm/course/close'><button type='submit'>Close Course Trading</button></form></div>")
+    return "<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: CLOSED</strong></p></div>"
+
+
+def game_control_html(code, game):
+    index = game["checkpoint_index"]
+    number = index + 1
+    name = CHECKPOINTS[index]
+    is_open = game["checkpoint_open"]
+    opened_once = game["opened_once"]
+    final = game.get("final_open")
+
+    if final:
+        status = "FINAL ACCUSATION & OUTCOME"
+    elif is_open:
+        status = "OPEN (teams can see the current checkpoint)"
+    elif opened_once:
+        status = "LOCKED (teams waiting after this checkpoint)"
+    else:
+        status = "LOCKED (not yet opened)"
+
+    buttons = ""
+    if not final:
+        if not is_open:
+            buttons += ("<form method='post' action='/gm/open' style='display:inline'>"
+                        "<button type='submit'>Open Checkpoint</button></form> ")
+        if is_open:
+            buttons += ("<form method='post' action='/gm/lock' style='display:inline'>"
+                        "<button type='submit'>Lock Checkpoint</button></form> ")
+        can_advance = (not is_open) and opened_once and (index < len(CHECKPOINTS) - 1)
+        if can_advance:
+            buttons += ("<form method='post' action='/gm/advance' style='display:inline'>"
+                        "<button type='submit'>Advance to Next Checkpoint</button></form> ")
+        if (not is_open) and opened_once and index == len(CHECKPOINTS) - 1:
+            buttons += ("<form method='post' action='/gm/final' style='display:inline'>"
+                        "<button type='submit'>Proceed to Final Accusation &amp; Outcome</button></form>")
+
+    return (
+        "<div class='card'><h2>Game Control</h2>"
+        "<p><strong>Current checkpoint:</strong> " + str(number) + " of "
+        + str(len(CHECKPOINTS)) + " &mdash; " + name + "</p>"
+        "<p><strong>Status:</strong> " + status + "</p>"
+        "<p>" + buttons + "</p></div>"
+    )
+
+
+def gm_team_block(code, game, team_i, team):
+    teams = game["teams"]
+    n_teams = len(teams)
+    out = "<div class='card'><h3>" + e(team["name"]) + "</h3>"
+
+    # Players / roles / allegiance (GM only).
+    assignments = team.get("assignments", [])
+    if assignments:
+        out += "<p><strong>Players &amp; Roles:</strong></p><ul>"
+        for idx, a in enumerate(assignments):
+            tf = " <strong style='color:#A4343A'>[THUNDERFLUNKED - GM ONLY]</strong>" if team.get("thunderflunked") == idx else ""
+            out += "<li>" + e(a["player"]) + " &mdash; " + a["role"] + tf + "</li>"
+        out += "</ul>"
+        if team.get("unrepresented"):
+            out += ("<p class='muted'>Unrepresented Perspectives: "
+                    + ", ".join(team["unrepresented"]) + "</p>")
+    elif team.get("players"):
+        out += "<p><strong>Players:</strong> " + ", ".join(e(p) for p in team["players"]) + "</p>"
+    else:
+        out += "<p class='muted'>(no players registered yet)</p>"
+
+    out += "<p><strong>Course:</strong> " + (e(team.get("course")) if team.get("course") else "(not chosen yet)") + "</p>"
+
+    if team.get("starting_roster"):
+        out += "<p><strong>Starting Roster:</strong> " + ", ".join(e(s) for s in team["starting_roster"]) + "</p>"
+        out += "<p><strong>Rejected:</strong> " + ", ".join(e(s) for s in team.get("rejected_students", [])) + "</p>"
+    if team.get("late_adds"):
+        out += "<p><strong>Active Late Adds:</strong> " + ", ".join(e(s) for s in team["late_adds"]) + "</p>"
+
+    if team.get("resources"):
+        out += "<p><strong>Current Resources:</strong></p>" + scores_table(team["resources"], team["statuses"])
+        out += "<p><strong>Overall Course Score: " + str(team["overall"]) + "</strong></p>"
+
+    # Handoff status.
+    h = team.get("handoff", {})
+    rej = ", ".join(team.get("rejected_students", [])) or "(none)"
+    if n_teams <= 1:
+        out += ("<p><strong>Rejected Handoff (single-team test mode):</strong> "
+                + ("complete" if handoff_done(team) else "not confirmed")
+                + "<br>Rejected: " + rej + "</p>")
+    else:
+        dest = teams[(team_i + 1) % n_teams]["name"]
+        src = teams[(team_i - 1) % n_teams]["name"]
+        out += ("<p><strong>Rejected Handoff:</strong><br>"
+                "Passed to " + e(dest) + ": " + ("Yes" if h.get("pass_confirmed") else "No") + "<br>"
+                "Received from " + e(src) + ": " + ("Yes" if h.get("receive_confirmed") else "No")
+                + " (" + (", ".join(h.get("received", [])) or "none") + ")</p>")
+
+    # Checkpoint decisions.
+    cp = team.get("cp", {})
+    out += "<p><strong>Checkpoint decisions:</strong></p><ul>"
+    for i in range(len(CHECKPOINTS)):
+        d = cp.get(i)
+        if d and d.get("submitted"):
+            out += "<li>CP" + str(i + 1) + ": " + e("; ".join(d.get("summary", []))) + "</li>"
+        else:
+            out += "<li>CP" + str(i + 1) + ": (not submitted)</li>"
+    out += "</ul>"
+
+    # Private checks (CP1/3/5) - GM only.
+    out += "<p><strong>Private Player Checks (GM only):</strong></p><ul>"
+    for i in sorted(HAS_PRIVATE):
+        rnd = team.get("private", {}).get(i, {})
+        votes = rnd.get("votes", {})
+        complete = len(votes) == len(team.get("players", [])) and team.get("players")
+        tally = {}
+        for v in votes.values():
+            nm = team["players"][int(v)]
+            tally[nm] = tally.get(nm, 0) + 1
+        totals = ", ".join(nm + ": " + str(c) for nm, c in tally.items()) or "(none)"
+        out += ("<li>CP" + str(i + 1) + ": " + ("complete" if complete else "in progress / not started")
+                + " &mdash; vote totals: " + e(totals) + "</li>")
+    out += "</ul>"
+    out += "<p><strong>Missions completed:</strong> " + str(len(team.get("missions_complete", []))) + "</p>"
+
+    # Sabotage (GM only).
+    sab = team.get("sabotage", {})
+    if sab.get("used"):
+        out += ("<p><strong>Emergency Sabotage (GM only):</strong> USED at CP"
+                + str(sab.get("cp", "?") ) + " &mdash; " + e(sab.get("label", "")) + "</p>")
+    else:
+        out += "<p><strong>Emergency Sabotage (GM only):</strong> not used</p>"
+
+    # Accusation / outcome.
+    if team.get("accusation") is not None:
+        accused = team["players"][team["accusation"]]
+        correct = team["accusation"] == team.get("thunderflunked")
+        out += ("<p><strong>Final Accusation (GM only):</strong> " + e(accused)
+                + " &mdash; " + ("CORRECT" if correct else "incorrect") + "</p>")
+    if team.get("outcome"):
+        out += "<p><strong>Outcome:</strong> " + team["outcome"] + "</p>"
+
+    out += "</div>"
+    return out
+
+
+def pacing_panel(code, game):
+    start = game.get("timer_start")
+    phase_key = current_phase_key(game)
+    rows = ""
+    for key, label, a, b in PACING:
+        here = (key == phase_key)
+        mark = str(a) + "-" + str(b) + " min"
+        rows += ("<tr" + (" style='background:#faecec;font-weight:700'" if here else "") + ">"
+                 "<td>" + ("&rarr; " if here else "") + label + "</td><td>" + mark + "</td></tr>")
+    schedule = ("<table><tr><th>Phase</th><th>Target</th></tr>" + rows + "</table>")
+
+    if not start:
+        return ("<div class='card'><h2>Session Pacing</h2>"
+                "<p>Start the clock when you kick off with the room. Target is ~60 min; this plan "
+                "allows ~75 for the full private round after every checkpoint. You talk fast, so "
+                "<strong>ahead of target is good.</strong></p>"
+                "<form method='post' action='/gm/timer/start'><button type='submit'>Start Session Timer</button></form>"
+                + schedule + "</div>")
+
+    elapsed = int(time.time() - start)
+    win = next((p for p in PACING if p[0] == phase_key), PACING[0])
+    _, plabel, a, b = win
+    emin = elapsed // 60
+    if emin < a:
+        status, cls = "Ahead of plan", "status-Normal"
+    elif emin <= b:
+        status, cls = "On pace", "status-Normal"
+    elif emin <= b + 3:
+        status, cls = "Slightly behind", "status-Strained"
+    else:
+        status, cls = "Behind - consider a cut", "status-Critical"
+
+    clock = ("<p class='big'>Elapsed: <span id='sessclock'>00:00</span></p>"
+             "<p>Current phase: <strong>" + plabel + "</strong> (target " + str(a) + "-" + str(b) + " min)<br>"
+             "<span class='" + cls + "'><strong>" + status + "</strong></span></p>")
+    js = ("<script>(function(){var el=document.getElementById('sessclock');if(!el)return;"
+          "var s=" + str(elapsed) + ";function f(){var m=Math.floor(s/60),x=s%60;"
+          "el.textContent=(m<10?'0':'')+m+':'+(x<10?'0':'')+x;s++;}f();setInterval(f,1000);})();</script>")
+    reset = ("<form method='post' action='/gm/timer/reset' style='display:inline'>"
+             "<button class='secondary' type='submit'>Reset Timer</button></form>")
+    return ("<div class='card'><h2>Session Pacing</h2>" + clock
+            + "<p>Refresh to update the pace status. " + reset + "</p>" + schedule + js + "</div>")
+
+
+@app.route("/gm/timer/start", methods=["POST"])
+def gm_timer_start():
+    if active_code is not None:
+        games[active_code]["timer_start"] = time.time()
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/timer/reset", methods=["POST"])
+def gm_timer_reset():
+    if active_code is not None:
+        games[active_code]["timer_start"] = None
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm")
+def gm():
+    if active_code is None:
+        body = "<div class='card'><p>No active game yet. Create one to begin.</p></div>"
+    else:
+        game = games[active_code]
+        body = ("<div class='card'><p>Active game code: <strong class='big'>" + active_code + "</strong></p></div>"
+                + pacing_panel(active_code, game)
+                + course_control_html(game) + game_control_html(active_code, game))
+        teams = game["teams"]
+        if teams:
+            body += "<h2>Teams</h2>"
+            for i, team in enumerate(teams):
+                body += gm_team_block(active_code, game, i, team)
+        else:
+            body += "<div class='card'><p>No teams have joined yet.</p></div>"
+
+    create = ("<form method='post' action='/gm/create'>"
+              "<button type='submit'>Create New Game</button></form>")
+    logout = ""
+    if app.config.get("GM_PASSWORD") and session.get("is_gm"):
+        logout = ("<form method='post' action='/gm/logout' style='display:inline'>"
+                  "<button class='secondary' type='submit'>Log Out</button></form> ")
+    body += ("<div class='footer'><p>" + create
+             + " <a class='btn secondary' href='/gm'>Refresh</a> " + logout
+             + "<a href='/'>Home</a></p></div>")
+    return page("Game Master Dashboard", body, "gm")
+
+
+@app.route("/gm/open", methods=["POST"])
+def gm_open():
+    if active_code is not None and not games[active_code].get("final_open"):
+        games[active_code]["checkpoint_open"] = True
+        games[active_code]["opened_once"] = True
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/lock", methods=["POST"])
+def gm_lock():
+    if active_code is not None:
+        games[active_code]["checkpoint_open"] = False
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/advance", methods=["POST"])
+def gm_advance():
+    if active_code is not None:
+        game = games[active_code]
+        index = game["checkpoint_index"]
+        if (not game["checkpoint_open"] and game["opened_once"]
+                and index < len(CHECKPOINTS) - 1):
+            game["checkpoint_index"] = index + 1
+            game["checkpoint_open"] = False
+            game["opened_once"] = False
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/final", methods=["POST"])
+def gm_final():
+    if active_code is not None:
+        game = games[active_code]
+        if (not game["checkpoint_open"] and game["opened_once"]
+                and game["checkpoint_index"] == len(CHECKPOINTS) - 1):
+            game["final_open"] = True
+            game["checkpoint_open"] = False
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/course/open", methods=["POST"])
+def gm_course_open():
+    if active_code is not None and games[active_code].get("course_trading") == "not_open":
+        games[active_code]["course_trading"] = "open"
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/course/close", methods=["POST"])
+def gm_course_close():
+    if active_code is not None and games[active_code].get("course_trading") == "open":
+        games[active_code]["course_trading"] = "closed"
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/create", methods=["POST"])
+def create_game():
+    global active_code
+    code = make_game_code()
+    games[code] = {
+        "teams": [],
+        "checkpoint_index": 0,
+        "checkpoint_open": False,
+        "opened_once": False,
+        "course_trading": "not_open",
+        "final_open": False,
+        "timer_start": None,   # epoch seconds when the GM starts the session clock
+    }
+    active_code = code
+    return redirect(url_for("gm"))
+
+
+# ===========================================================================
+# Team Screen - join
+# ===========================================================================
+@app.route("/team")
+def team():
+    body = (
+        "<div class='card'><form method='post' action='/team/join'>"
+        "<p><label>Game Code<br><input type='text' name='game_code' autocomplete='off'></label></p>"
+        "<p><label>Team Name<br><input type='text' name='team_name' autocomplete='off'></label></p>"
+        "<p><button type='submit'>Join Game</button></p></form></div>"
+        "<p class='footer'><a href='/'>Home</a></p>"
+    )
+    return page("Team Screen", body)
+
+
+def error_page(message):
+    body = ("<div class='card'><p class='err'>" + e(message) + "</p>"
+            "<p><a class='btn secondary' href='/team'>Try again</a> <a href='/'>Home</a></p></div>")
+    return page("Team Screen", body)
+
+
+@app.route("/team/join", methods=["POST"])
+def team_join():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_name = request.form.get("team_name", "").strip()
+
+    if game_code not in games:
+        return error_page("That game code was not found. Please check the code and try again.")
+    if team_name == "":
+        return error_page("Please enter a team name.")
+
+    existing_index = find_team_index(game_code, team_name)
+    if existing_index is not None:
+        team = get_team(game_code, existing_index)
+        return resume_screen(game_code, existing_index, team)
+
+    games[game_code]["teams"].append({"name": team_name, "players": []})
+    team_index = len(games[game_code]["teams"]) - 1
+    return count_form(game_code, team_index, team_name)
+
+
+def count_form(game_code, team_index, team_name):
+    options = ""
+    for count in ALLOWED_PLAYER_COUNTS:
+        options += ("<label><input type='radio' name='player_count' value='" + str(count)
+                    + "'> " + str(count) + " players</label>")
+    body = (
+        "<div class='card'><p>You are on team <strong>" + e(team_name) + "</strong> in game "
+        + game_code + ".</p><h2>How many players are at your table?</h2>"
+        "<form method='post' action='/team/players'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + options + "<p><button type='submit'>Next</button></p></form></div>"
+    )
+    return page("Team Setup", body)
+
+
+def resume_screen(game_code, team_index, team):
+    """Route a team to the correct screen based on how far setup got, and on
+    the game's synchronized phase. Reads state only; never mutates the team."""
+    game = games[game_code]
+    if not team.get("players"):
+        return count_form(game_code, team_index, team["name"])
+    if not team.get("assignments"):
+        return role_form(game_code, team_index, team)
+    if not team.get("course"):
+        phase = game.get("course_trading", "closed")
+        if phase != "closed":
+            return trade_window_screen(game_code, team_index, team)
+        return course_registration_screen(game_code, team_index, team)
+    if not team.get("draft_pool"):
+        return pool_form(game_code, team_index, team)
+    if not team.get("starting_roster"):
+        return roster_form(game_code, team_index, team)
+    if not handoff_done(team):
+        return handoff_screen(game_code, team_index, team)
+    if game.get("final_open"):
+        return final_screen(game_code, team_index, team)
+    return status_screen(game_code, team_index, team)
+
+
+@app.route("/team/players", methods=["POST"])
+def team_players():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    player_count = request.form.get("player_count", "")
+
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    if not player_count.isdigit() or int(player_count) not in ALLOWED_PLAYER_COUNTS:
+        return error_page("Please choose 4, 5, or 6 players.")
+
+    count = int(player_count)
+    team = get_team(game_code, int(team_index))
+    name_fields = ""
+    for i in range(1, count + 1):
+        name_fields += ("<p><label>Player " + str(i) + " name<br>"
+                        "<input type='text' name='player_" + str(i) + "' autocomplete='off'></label></p>")
+    body = (
+        "<div class='card'><h2>Register players for " + e(team["name"]) + "</h2>"
+        "<form method='post' action='/team/save'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + team_index + "'>"
+        "<input type='hidden' name='player_count' value='" + str(count) + "'>"
+        + name_fields + "<p><button type='submit'>Register Players</button></p></form></div>"
+    )
+    return page("Team Setup", body)
+
+
+@app.route("/team/save", methods=["POST"])
+def team_save():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    player_count = request.form.get("player_count", "")
+
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    if not player_count.isdigit() or int(player_count) not in ALLOWED_PLAYER_COUNTS:
+        return error_page("Please choose 4, 5, or 6 players.")
+
+    count = int(player_count)
+    names = []
+    for i in range(1, count + 1):
+        name = request.form.get("player_" + str(i), "").strip()
+        if name == "":
+            return error_page("Every player name is required. Please go back and fill them all in.")
+        names.append(name)
+
+    team = get_team(game_code, int(team_index))
+    team["players"] = names
+    # Assign allegiance privately now: exactly one Thunderflunked per table.
+    # Revealed to each player privately during their first private turn.
+    if "thunderflunked" not in team:
+        team["thunderflunked"] = random.randrange(count)
+        team["allegiance_seen"] = []
+        team["missions_complete"] = []
+        team["sabotage"] = {"used": False, "cp": None, "label": None, "prompted": {}}
+        team["private"] = {}
+
+    return role_form(game_code, int(team_index), team)
+
+
+def role_option_tags(selected=""):
+    tags = "<option value=''>-- choose a role --</option>"
+    for role in PUBLIC_ROLES:
+        chosen = " selected" if role == selected else ""
+        tags += "<option value='" + role + "'" + chosen + ">" + role + "</option>"
+    return tags
+
+
+def role_form(game_code, team_index, team, error_message="", previous=None):
+    if previous is None:
+        previous = {}
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    perspectives = "".join(
+        "<li><strong>" + r + ":</strong> " + ROLE_PERSPECTIVES[r] + "</li>" for r in PUBLIC_ROLES
+    )
+    rows = ""
+    for i, player in enumerate(team["players"], start=1):
+        selected = previous.get("role_for_" + str(i), "")
+        rows += ("<p><label>" + e(player) + "<br><select name='role_for_" + str(i) + "'>"
+                 + role_option_tags(selected) + "</select></label></p>")
+    body = (
+        "<div class='card'><h2>Public Roles</h2>"
+        "<p>Your Role is the perspective you are responsible for bringing into team "
+        "decisions. It does not give you special powers. Use it to challenge the group "
+        "when that part of the course is being overlooked.</p>"
+        "<ul>" + perspectives + "</ul></div>"
+        "<div class='card'><h3>Record the physical Role Card each player drew</h3>"
+        "<p>Each role can only be used once.</p>" + error_html +
+        "<form method='post' action='/team/roles'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + rows + "<p><button type='submit'>Save Role Assignments</button></p></form></div>"
+    )
+    return page("Public Roles", body)
+
+
+@app.route("/team/roles", methods=["POST"])
+def team_roles():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+
+    team = get_team(game_code, int(team_index))
+    names = team["players"]
+    chosen = {}
+    picked_roles = []
+    for i in range(1, len(names) + 1):
+        chosen["role_for_" + str(i)] = request.form.get("role_for_" + str(i), "")
+        picked_roles.append(chosen["role_for_" + str(i)])
+
+    if any(role == "" for role in picked_roles):
+        return role_form(game_code, int(team_index), team, "Every player must be given a role.", chosen)
+    if any(role not in PUBLIC_ROLES for role in picked_roles):
+        return role_form(game_code, int(team_index), team, "One of the selected roles is not valid.", chosen)
+    if len(set(picked_roles)) != len(picked_roles):
+        return role_form(game_code, int(team_index), team,
+                         "The same role cannot be given to more than one player.", chosen)
+
+    team["assignments"] = [{"role": r, "player": p} for r, p in zip(picked_roles, names)]
+    team["unrepresented"] = [r for r in PUBLIC_ROLES if r not in picked_roles]
+    return resume_screen(game_code, int(team_index), team)
+
+
+# ---------------------------------------------------------------------------
+# Course trading / registration
+# ---------------------------------------------------------------------------
+def course_form(game_code, team_index, team):
+    options = "<option value=''>-- choose your Course Card --</option>"
+    for c in COURSE_NAMES:
+        options += "<option value='" + e(c) + "'>" + e(c) + "</option>"
+    return (
+        "<div class='card'><h3>Register your Course Card</h3>"
+        "<p>Select the course that matches the physical Course Card now in front of your team.</p>"
+        "<form method='post' action='/team/course'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<select name='course'>" + options + "</select> "
+        "<button type='submit'>Save Course</button></form></div>"
+    )
+
+
+def trade_window_screen(game_code, team_index, team):
+    phase = games[game_code].get("course_trading", "closed")
+    refresh = ("<p class='footer'><a class='btn secondary' href='" + status_url(game_code, team_index)
+               + "'>Refresh</a> <a href='/'>Home</a></p>")
+    if phase == "open":
+        body = (
+            "<div class='card'><h2>Course Trading Is Open</h2>"
+            "<p>You may negotiate a one-for-one Course Card trade with another team. Both teams must agree.</p>"
+            "<p>You may inspect Course Cards before agreeing. The software does not track trades &mdash; "
+            "exchange the physical cards.</p>"
+            "<p>Keep the Course Card your team will teach in front of you. Do not register your course yet.</p>"
+            "<p class='muted'>Waiting for the Game Master to close Course Trading.</p></div>"
+        )
+    else:
+        body = (
+            "<div class='card'><h2>Course Assignment</h2>"
+            "<p>Draw one physical Course Card for your team.</p>"
+            "<p>Course trading has not opened yet. Keep the card your team drew in front of you.</p>"
+            "<p class='muted'>Waiting for the Game Master to open Course Trading.</p></div>"
+        )
+    return page("Course Trading - " + team["name"], body + refresh)
+
+
+def course_registration_screen(game_code, team_index, team):
+    body = ("<div class='card'><h2>Trading Closed</h2>"
+            "<p>The Course Card now in front of your team is your course for the semester.</p></div>"
+            + course_form(game_code, team_index, team))
+    return page("Register Course - " + team["name"], body)
+
+
+@app.route("/team/course", methods=["POST"])
+def team_course():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    course = request.form.get("course", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+
+    team = get_team(game_code, int(team_index))
+    if not team.get("course"):
+        phase = games[game_code].get("course_trading", "closed")
+        if phase != "closed":
+            return trade_window_screen(game_code, int(team_index), team)
+    if course not in COURSE_NAMES:
+        return error_page("Please choose a Course Card from the list.")
+    team["course"] = course
+    return pool_form(game_code, int(team_index), team)
+
+
+# ---------------------------------------------------------------------------
+# Student deal (15) and draft (10)
+# ---------------------------------------------------------------------------
+def parse_numbers(text, allowed):
+    """Parse free text like '1 3 7, 12-15' into the matching student labels,
+    restricted to `allowed` (labels formatted '#NN Name'), preserving order."""
+    import re
+    nums = set()
+    for token in re.findall(r"\d+(?:-\d+)?", text or ""):
+        if "-" in token:
+            a, b = token.split("-")
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            nums.update(range(a, b + 1))
+        else:
+            nums.add(int(token))
+    return [lab for lab in allowed if int(lab[1:3]) in nums]
+
+
+def selected_from_form(allowed):
+    """Combine checkbox selections and the Quick-entry number box into an
+    ordered, de-duplicated list restricted to `allowed`. Lets number entry work
+    even with JavaScript disabled."""
+    chosen = set(request.form.getlist("students")) | set(parse_numbers(request.form.get("numbers", ""), allowed))
+    return [lab for lab in allowed if lab in chosen]
+
+
+def tile_grid(options, checked):
+    if checked is None:
+        checked = set()
+    html = "<div class='tilegrid'>"
+    for lab in options:
+        num = int(lab[1:3])
+        name = lab[4:]
+        ck = " checked" if lab in checked else ""
+        html += ("<label class='tile'><input type='checkbox' name='students' value='" + e(lab)
+                 + "' data-num='" + str(num) + "'" + ck + ">"
+                 "<span class='check'>Selected</span>"
+                 "<span class='num'>#" + ("%02d" % num) + "</span>"
+                 "<span class='nm'>" + e(name) + "</span>"
+                 "<span class='ctx'>" + e(STUDENT_INFO[lab]["context"]) + "</span></label>")
+    return html + "</div>"
+
+
+def selection_bar(target):
+    return ("<div class='selbar' id='selbar'>"
+            "<span id='selcount'>Selected 0 of " + str(target) + "</span> "
+            "<label>Quick entry (type card numbers, e.g. 1 3 7 or 12-15): "
+            "<input type='text' id='numbers' name='numbers' autocomplete='off'></label> "
+            "<button type='button' class='secondary' id='selclear'>Clear</button></div>")
+
+
+def selection_script(target):
+    return (
+        "<script>(function(){var f=document.getElementById('selform');if(!f)return;"
+        "var t=" + str(target) + ";var boxes=f.querySelectorAll('input[name=\"students\"]');"
+        "var c=document.getElementById('selcount');var bar=document.getElementById('selbar');"
+        "var nm=document.getElementById('numbers');"
+        "function up(){var n=0;boxes.forEach(function(b){var l=b.closest('label');"
+        "if(l)l.classList.toggle('sel',b.checked);if(b.checked)n++;});"
+        "c.textContent='Selected '+n+' of '+t;c.className=(n===t)?'count-ok':'count-no';"
+        "bar.className='selbar'+((n===t)?' ok':'');}"
+        "boxes.forEach(function(b){b.addEventListener('change',up);});"
+        "if(nm){nm.addEventListener('input',function(){var s={};"
+        "(nm.value.match(/\\d+(?:-\\d+)?/g)||[]).forEach(function(k){"
+        "if(k.indexOf('-')>-1){var p=k.split('-');var a=+p[0],b=+p[1];if(a>b){var z=a;a=b;b=z;}"
+        "for(var i=a;i<=b;i++)s[i]=1;}else s[+k]=1;});"
+        "boxes.forEach(function(b){b.checked=!!s[+b.getAttribute('data-num')];});up();});}"
+        "var cl=document.getElementById('selclear');"
+        "if(cl)cl.addEventListener('click',function(){boxes.forEach(function(b){b.checked=false;});"
+        "if(nm)nm.value='';up();});up();})();</script>")
+
+
+def pool_form(game_code, team_index, team, error_message="", checked=None):
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    body = (
+        "<div class='card'><h2>Step 1: Register your dealt Student Cards</h2>"
+        "<p>Course: <strong>" + e(team["course"]) + "</strong></p>"
+        "<p>Record the <strong>" + str(DEALT_COUNT) + "</strong> students matching the physical cards your "
+        "table dealt itself. Fastest: type the card numbers in Quick entry. You can also tap the cards.</p>"
+        + error_html +
+        "<form method='post' action='/team/pool' id='selform'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + selection_bar(DEALT_COUNT)
+        + tile_grid(STUDENTS, checked)
+        + "<p><button type='submit'>Save Dealt Cards</button></p></form>"
+        + selection_script(DEALT_COUNT) + "</div>"
+    )
+    return page("Student Deal", body)
+
+
+@app.route("/team/pool", methods=["POST"])
+def team_pool():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+
+    team = get_team(game_code, int(team_index))
+    selected = selected_from_form(STUDENTS)
+    if len(selected) != DEALT_COUNT:
+        return pool_form(game_code, int(team_index), team,
+                         "Please record exactly " + str(DEALT_COUNT) + ". You have "
+                         + str(len(selected)) + ".", set(selected))
+    team["draft_pool"] = selected
+    return roster_form(game_code, int(team_index), team)
+
+
+def roster_form(game_code, team_index, team, error_message="", checked=None):
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    pool = team.get("draft_pool", [])
+    body = (
+        "<div class='card'><h2>Step 2: Draft your starting roster</h2>"
+        "<p>These are the " + str(DEALT_COUNT) + " cards you registered. Choose exactly "
+        + "<strong>" + str(ROSTER_COUNT) + "</strong> for your starting roster. The other "
+        + str(DEALT_COUNT - ROSTER_COUNT) + " become Rejected Students. "
+        "Type the card numbers to keep, or tap the cards.</p>" + error_html +
+        "<form method='post' action='/team/roster' id='selform'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + selection_bar(ROSTER_COUNT)
+        + tile_grid(pool, checked)
+        + "<p><button type='submit'>Save Starting Roster</button></p></form>"
+        + selection_script(ROSTER_COUNT) + "</div>"
+    )
+    return page("Student Draft", body)
+
+
+@app.route("/team/roster", methods=["POST"])
+def team_roster():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+
+    team = get_team(game_code, int(team_index))
+    pool = team.get("draft_pool", [])
+    selected = selected_from_form(pool)
+    if len(selected) != ROSTER_COUNT:
+        return roster_form(game_code, int(team_index), team,
+                           "Please choose exactly " + str(ROSTER_COUNT) + ". You have "
+                           + str(len(selected)) + ".", set(selected))
+
+    roster = [s for s in pool if s in selected]
+    rejected = [s for s in pool if s not in selected]
+    team["starting_roster"] = roster
+    team["active_roster"] = list(roster)  # late adds will extend this at CP2
+    team["rejected_students"] = rejected
+
+    scores, statuses, overall = compute_scores(roster)
+    team["resources"] = dict(scores)
+    team["start_resources"] = dict(scores)
+    team["statuses"] = statuses
+    team["overall"] = overall
+    team["start_overall"] = overall
+
+    body = (
+        "<div class='card'><h2>Starting Conditions for " + e(team["name"]) + "</h2>"
+        "<div class='notice'><p>" + STARTING_PREAMBLE + "</p>"
+        "<p><strong>Your roster pattern:</strong> " + roster_interpretation(roster) + "</p></div></div>"
+        + resource_meters(scores, statuses)
+        + "<div class='card'><p><strong>Overall Course Score: " + str(overall) + "</strong></p></div>"
+        "<div class='card'><h3>Starting Roster (" + str(len(roster)) + ")</h3>" + student_list_html(roster)
+        + "<h3>Rejected Students (" + str(len(rejected)) + ")</h3>" + student_list_html(rejected)
+        + "<p>Roster locked. Continue to the next setup step.</p>"
+        + "<p><a class='btn' href='" + status_url(game_code, int(team_index)) + "'>Continue</a></p></div>"
+    )
+    return page("Starting Conditions", body)
+
+
+@app.route("/team/status")
+def team_status():
+    game_code = request.args.get("game_code", "").strip().upper()
+    team_index = request.args.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    return resume_screen(game_code, int(team_index), team)
+
+
+def status_url(game_code, team_index):
+    return "/team/status?game_code=" + game_code + "&team_index=" + str(team_index)
+
+
+def team_footer(game_code, team_index):
+    return ("<p class='footer'><em>You cannot advance yourself. The Game Master controls the room.</em><br>"
+            "<a class='btn secondary' href='" + status_url(game_code, team_index) + "'>Refresh</a> "
+            "<a href='/'>Home</a></p>")
+
+
+def status_screen(game_code, team_index, team):
+    """Live waiting/checkpoint screen for a fully-set-up team (pre-final)."""
+    game = games[game_code]
+    index = game["checkpoint_index"]
+    number = index + 1
+    name = CHECKPOINTS[index]
+
+    if game["checkpoint_open"]:
+        return checkpoint_screen(game_code, team_index, team)
+    if game["opened_once"]:
+        body = ("<div class='card'><h2>Checkpoint " + str(number) + ": " + name + " &mdash; Locked</h2>"
+                "<p>Your decisions are locked. Please wait for the Game Master.</p></div>")
+    else:
+        body = ("<div class='card'><h2>Please wait for the Game Master</h2>"
+                "<p>Checkpoint " + str(number) + " (" + name + ") has not been opened yet.</p></div>")
+    body = ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
+            "<p>" + open_course_button(game_code, team_index) + "</p></div>"
+            + resource_meters(team["resources"], team["statuses"]) + body)
+    return page("Team Screen - " + team["name"], body + team_footer(game_code, team_index))
+
+
+# ---------------------------------------------------------------------------
+# Rejected-student handoff (synchronized setup phase)
+# ---------------------------------------------------------------------------
+def handoff_done(team):
+    h = team.get("handoff", {})
+    return bool(h.get("pass_confirmed")) and bool(h.get("receive_confirmed"))
+
+
+def handoff_screen(game_code, team_index, team):
+    teams = games[game_code]["teams"]
+    n = len(teams)
+    heading = "<div class='card'><h2>Rejected Student Handoff</h2>"
+    refresh = team_footer(game_code, team_index)
+
+    if n <= 1:
+        body = (heading + "<p><strong>Test mode:</strong> only one team is in this game, so there is no "
+                "other team to pass to or receive from. No physical handoff is simulated.</p>"
+                "<form method='post' action='/team/handoff/testmode'>"
+                "<input type='hidden' name='game_code' value='" + game_code + "'>"
+                "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+                "<button type='submit'>Continue (test mode)</button></form></div>")
+        return page("Handoff - " + team["name"], body + refresh)
+
+    dest_team = teams[(team_index + 1) % n]
+    source_team = teams[(team_index - 1) % n]
+    h = team.get("handoff", {})
+
+    if not h.get("pass_confirmed"):
+        body = (heading + "<p>Your team did not place these five students on your Starting Roster.</p>"
+                + student_list_html(team.get("rejected_students", []))
+                + "<p>Pass these five physical Student Cards to <strong>" + e(dest_team["name"]) + "</strong>.</p>"
+                "<form method='post' action='/team/handoff/pass'>"
+                "<input type='hidden' name='game_code' value='" + game_code + "'>"
+                "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+                "<button type='submit'>Cards Passed</button></form></div>")
+        return page("Handoff - " + team["name"], body + refresh)
+
+    if not source_team.get("handoff", {}).get("pass_confirmed"):
+        body = (heading + "<p>You have passed your Rejected Student Cards to " + e(dest_team["name"]) + ".</p>"
+                "<p class='muted'>Waiting for <strong>" + e(source_team["name"])
+                + "</strong> to pass your incoming Student Cards.</p></div>")
+        return page("Handoff - " + team["name"], body + refresh)
+
+    body = (heading + "<h3>Incoming Student Cards</h3>"
+            "<p>You should receive these five physical Student Cards from <strong>"
+            + e(source_team["name"]) + "</strong>.</p>"
+            + student_list_html(source_team.get("rejected_students", []))
+            + "<form method='post' action='/team/handoff/receive'>"
+            "<input type='hidden' name='game_code' value='" + game_code + "'>"
+            "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+            "<button type='submit'>Cards Received</button></form></div>")
+    return page("Handoff - " + team["name"], body + refresh)
+
+
+@app.route("/team/handoff/pass", methods=["POST"])
+def team_handoff_pass():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    index = int(team_index)
+    teams = games[game_code]["teams"]
+    h = team.setdefault("handoff", {})
+    if not h.get("pass_confirmed"):
+        h["pass_confirmed"] = True
+        h["pass_to"] = teams[(index + 1) % len(teams)]["name"]
+    return resume_screen(game_code, index, team)
+
+
+@app.route("/team/handoff/receive", methods=["POST"])
+def team_handoff_receive():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    index = int(team_index)
+    teams = games[game_code]["teams"]
+    source_team = teams[(index - 1) % len(teams)]
+    if not source_team.get("handoff", {}).get("pass_confirmed"):
+        return handoff_screen(game_code, index, team)
+    h = team.setdefault("handoff", {})
+    if not h.get("receive_confirmed"):
+        h["received"] = list(source_team.get("rejected_students", []))
+        h["source"] = source_team["name"]
+        h["receive_confirmed"] = True
+    return resume_screen(game_code, index, team)
+
+
+@app.route("/team/handoff/testmode", methods=["POST"])
+def team_handoff_testmode():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    index = int(team_index)
+    if not handoff_done(team):
+        team["handoff"] = {"pass_confirmed": True, "receive_confirmed": True,
+                           "received": [], "pass_to": None, "source": None, "test_mode": True}
+    return resume_screen(game_code, index, team)
+
+
+def received_students(team):
+    """The five incoming cards (empty in single-team test mode)."""
+    return team.get("handoff", {}).get("received", [])
+
+
+# ===========================================================================
+# CHECKPOINT ENGINE
+# ===========================================================================
+def team_cast(team):
+    """Pick stable narrative representatives from the starting roster so authored
+    evidence is coherent regardless of which students were drafted. Computed once."""
+    if "cast" in team:
+        return team["cast"]
+    roster = team["starting_roster"]
+    used = set()
+
+    def pick(scorefn):
+        best, bestv = None, None
+        for s in roster:
+            if s in used:
+                continue
+            v = scorefn(STUDENT_STATS[s])
+            if bestv is None or v > bestv:
+                bestv, best = v, s
+        if best is not None:
+            used.add(best)
+        return best
+
+    cast = {
+        "calendar": pick(lambda st: st["motivation"] + st["readiness"] - 2 * st["self_management"]),
+        "dodge": pick(lambda st: -(st["motivation"] + st["self_management"])),
+        "question_mark": pick(lambda st: st["motivation"] - st["readiness"] - st["adaptability"]),
+        "silent_sos": pick(lambda st: st["communication"] - 2 * st["help_seeking"]),
+        "engaged": pick(lambda st: st["motivation"] + st["readiness"]),
+        "strong": pick(lambda st: st["readiness"] + st["communication"] + st["self_management"]),
+    }
+    team["cast"] = cast
+    return cast
+
+
+def course_reality_note():
+    return ("<div class='notice'><p><strong>Before deciding, review your Course Card.</strong> "
+            "Your course has structural realities that may change how an option actually plays out.</p></div>")
+
+
+# --- Checkpoint action tables. deltas apply to (SS, CQ, FC, TR). -----------
+def D(ss=0, cq=0, fc=0, tr=0):
+    return {"Student Success": ss, "Course Quality": cq,
+            "Faculty Capacity": fc, "Time/Resources": tr}
+
+
+CP_ACTIONS = {
+    0: [  # First Week - LOOK BEFORE REACTING
+        {"key": "zeros", "label": "Enter zeros for missing work so the gradebook is accurate",
+         "meta": "Effort: Low | Reach: Whole class | Consideration: Students see the real picture; early grades look worse",
+         "deltas": D(ss=-3, cq=10, fc=-2)},
+        {"key": "message", "label": "Message the students who haven't submitted (Canvas 'Message Students Who')",
+         "meta": "Effort: Low | Reach: Targeted | Consideration: Fast, but relies on student follow-through",
+         "deltas": D(ss=9, fc=-3)},
+        {"key": "contact", "label": "Call or email each at-risk student individually",
+         "meta": "Effort: High | Reach: Individual | Consideration: Personal and effective, but heavy on your time",
+         "deltas": D(ss=12, fc=-10, tr=-5)},
+        {"key": "clarify", "label": "Post a clarification, an example, and the rubric for the whole class",
+         "meta": "Effort: Moderate | Reach: Whole class | Consideration: Heads off repeat confusion for everyone",
+         "deltas": D(ss=9, cq=12, fc=-4)},
+        {"key": "fix_schedule", "label": "Reconcile the syllabus and Canvas due dates",
+         "meta": "Effort: Low | Reach: Whole class | Consideration: Fixes a course inconsistency, not a student mistake",
+         "deltas": D(ss=5, cq=13, fc=-2)},
+        {"key": "extend", "label": "Extend the first assignment deadline for everyone",
+         "meta": "Effort: Low | Reach: Whole class | Consideration: Helps now, but compresses your grading window",
+         "deltas": D(ss=6, cq=-5, tr=-7)},
+        {"key": "tutoring", "label": "Connect students with academic support (Learning Center or Brainfuse)",
+         "meta": "Faculty effort: Low | Reach: Whole class | Consideration: Scalable, but students must choose to use it",
+         "deltas": D(ss=7, cq=3)},
+        {"key": "monitor", "label": "Monitor / take no action yet",
+         "meta": "Effort: None | Reach: None | Consideration: Conditions may resolve, hold, or worsen",
+         "deltas": D(ss=-9, cq=-5)},
+    ],
+    1: [  # Early Semester - BUILD SYSTEMS THAT ABSORB CHANGE
+        {"key": "start_here", "label": "Send the late-add students a targeted Start Here message",
+         "meta": "Effort: Low | Scope: Targeted | Consideration: Fast and specific to the new students",
+         "deltas": D(ss=9, fc=-3)},
+        {"key": "pathway", "label": "Build a reusable late-start module in Canvas",
+         "meta": "Effort: High now | Scope: Scalable | Consideration: A system that serves every future late add",
+         "deltas": D(cq=14, tr=8, fc=-8)},
+        {"key": "catchup", "label": "Open a short catch-up window for foundational work",
+         "meta": "Effort: Low | Scope: Flexible | Consideration: Flexibility now, grading/workload later",
+         "deltas": D(ss=9, cq=-3, tr=-7)},
+        {"key": "orientation", "label": "Hold an orientation / office-hours check-in for the new students",
+         "meta": "Effort: High | Scope: Whole group | Consideration: Strong clarification; costs your bandwidth",
+         "deltas": D(ss=12, cq=4, fc=-9)},
+        {"key": "advisor", "label": "Loop in advising and academic support (Learning Center / Brainfuse) for the new students",
+         "meta": "Effort: Low | Scope: Scalable | Consideration: Routes needs to the right support, off your plate",
+         "deltas": D(ss=8, tr=4, fc=-2)},
+        {"key": "monitor", "label": "Monitor (no onboarding action yet)",
+         "meta": "Effort: None | Scope: None | Consideration: New students may drift without an entry point",
+         "deltas": D(ss=-11, cq=-3)},
+    ],
+    2: [  # First Major Assessment - INVESTIGATE BEFORE DECIDING
+        {"key": "reteach", "label": "Reteach the weak skill to the whole class",
+         "meta": "Faculty effort: Moderate | Reach: Whole class | Consideration: Addresses the shared gap directly",
+         "deltas": D(ss=11, cq=9, fc=-5)},
+        {"key": "aligned_practice", "label": "Add aligned practice that matches the rubric's demand",
+         "meta": "Faculty effort: High | Reach: Whole class | Consideration: Fixes the practice-to-assessment mismatch",
+         "deltas": D(ss=9, cq=14, fc=-5, tr=-4)},
+        {"key": "revision", "label": "Allow a structured revision/resubmission after feedback",
+         "meta": "Faculty effort: High | Reach: Whole class | Consideration: Strong learning, heavy grading load",
+         "deltas": D(ss=13, cq=5, fc=-9, tr=-6)},
+        {"key": "outreach_low", "label": "Outreach to low-engagement students + refer to tutoring",
+         "meta": "Faculty effort: Moderate | Reach: Targeted | Consideration: Addresses engagement, not the class-wide gap",
+         "deltas": D(ss=9, fc=-4)},
+        {"key": "change_future", "label": "Revise how you teach this skill next term",
+         "meta": "Faculty effort: Low | Reach: Future | Consideration: Helps later cohorts, not this one now",
+         "deltas": D(cq=8)},
+        {"key": "redesign_assessment", "label": "Realign the rubric/assessment for future terms",
+         "meta": "Faculty effort: Low | Reach: Future | Consideration: Improves alignment going forward",
+         "deltas": D(cq=10, fc=-3)},
+        {"key": "continue", "label": "Continue without change",
+         "meta": "Faculty effort: None | Reach: None | Consideration: Leaves the mismatch in place",
+         "deltas": D(ss=-12, cq=-10)},
+        {"key": "monitor", "label": "Monitor and reassess",
+         "meta": "Faculty effort: None | Reach: None | Consideration: The gap persists for now",
+         "deltas": D(ss=-7, cq=-7)},
+    ],
+}
+
+CP_LIMITS = {0: 3, 1: 2, 2: 3}  # max selectable actions
+CP_MONITOR = {0: "monitor", 1: "monitor", 2: "monitor"}
+
+# What KIND of need each action addresses. Teaches faculty to classify the problem
+# (support / course-design / communication / advising / accessibility) before acting.
+# Keys with no entry (monitor, continue) deliberately address no need.
+ACTION_NEEDS = {
+    (0, "zeros"): "course_design", (0, "message"): "communication",
+    (0, "contact"): "communication", (0, "clarify"): "course_design",
+    (0, "fix_schedule"): "course_design", (0, "extend"): "course_design",
+    (0, "tutoring"): "support",
+    (1, "start_here"): "communication", (1, "pathway"): "course_design",
+    (1, "catchup"): "course_design", (1, "orientation"): "communication",
+    (1, "advisor"): "advising",
+    (2, "reteach"): "course_design", (2, "aligned_practice"): "course_design",
+    (2, "revision"): "course_design", (2, "outreach_low"): "support",
+    (2, "change_future"): "course_design", (2, "redesign_assessment"): "course_design",
+}
+
+
+def support_referral_outcome(team):
+    """One concise, modality-aware line describing how an academic-support referral
+    actually played out for this course. Not a lookup of the 'right' answer - it
+    reflects context so faculty see that modality changes how a referral lands."""
+    mc = modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality"))
+    if mc == "online":
+        return ("Because this is an online course, the students who followed through mostly used "
+                "Brainfuse (the Canvas sidebar link, within their 15-hour yearly allowance); the "
+                "Learning Center (Student Success Center) stayed open to them as well.")
+    if mc == "cte":
+        return ("Because this is a hands-on course, tutoring helped a few students but did not replace "
+                "guided practice on the physical competencies - watch whether the real need was "
+                "practice, clearer directions, or an accommodation.")
+    return ("Being on campus, several students used the Learning Center (Student Success Center) in "
+            "Building A; others used Brainfuse online tutoring (15 hours per year).")
+
+CP1_REASSESS_OPTIONS = [
+    "After the next assignment",
+    "If another assignment is missed",
+    "At the next semester checkpoint",
+]
+
+# CP4 (Midterm) - PRIORITIZE AND SCALE. One priority + one supporting.
+CP4_PRIORITY = [
+    {"key": "urgent", "label": "Dropout Detective alert + advisor note for the highest-risk student",
+     "deltas": D(ss=11, fc=-5)},
+    {"key": "scalable", "label": "Scalable whole-class fix for the shared misconception",
+     "deltas": D(ss=10, cq=13, fc=-5)},
+    {"key": "feedback", "label": "Show students where feedback lives (SpeedGrader comments)",
+     "deltas": D(ss=6, cq=9, fc=-2)},
+    {"key": "tool", "label": "Use a Canvas tool/workflow to flag and route at-risk students",
+     "deltas": D(ss=8, fc=-2, tr=4)},
+    {"key": "individual_all", "label": "Individually email every student in the class",
+     "deltas": D(ss=7, fc=-16, tr=-10)},
+    {"key": "defer", "label": "Intentionally defer a lower-priority issue this round",
+     "deltas": D(ss=-3, tr=6)},
+]
+# Supporting response: same menu, roughly half the effect.
+CP4_SUPPORT = CP4_PRIORITY
+
+# CP5 (Final Stretch) - FINISH SUSTAINABLY AND ACCURATELY.
+# "sustainable" is a legitimate recovery choice: protecting an efficient routine you
+# already built (reuse, don't rebuild) is a realistic sustainable practice that
+# restores Faculty Capacity for the finish. It is not a generic "restore" button -
+# it competes with the other protect choices and reflects a real teaching behavior.
+CP5_PROTECT = [
+    {"key": "sustainable", "label": "Protect a sustainable routine you already built (reuse feedback and systems instead of rebuilding)",
+     "deltas": D(cq=5, fc=10, tr=4)},
+    {"key": "grading", "label": "Timely grading/feedback on remaining required work",
+     "deltas": D(ss=8, cq=9, fc=-5)},
+    {"key": "persistence", "label": "The student sitting just below the passing threshold",
+     "deltas": D(ss=12, fc=-4)},
+    {"key": "communication", "label": "Clear final communication: what's left, and when",
+     "deltas": D(ss=7, cq=7, fc=-3)},
+]
+CP5_REPAIR = [
+    {"key": "gradebook", "label": "Gradebook accuracy: zeros entered and last date of attendance recorded",
+     "deltas": D(ss=-3, cq=12)},
+    {"key": "visibility", "label": "Feedback visibility so students can actually find your comments",
+     "deltas": D(ss=7, cq=8)},
+    {"key": "alignment", "label": "Final alignment of remaining assessments",
+     "deltas": D(cq=11)},
+]
+# Declining unnecessary end-of-term work protects the instructor: it recovers
+# Faculty Capacity for the finish (a realistic sustainable practice).
+CP5_NOT_ADD = [
+    {"key": "extra_credit", "label": "A brand-new extra-credit assignment for the whole class",
+     "deltas": D(tr=8, fc=9)},
+    {"key": "new_module", "label": "A new end-of-term module or content unit",
+     "deltas": D(tr=10, fc=10)},
+    {"key": "new_policy", "label": "A new late/grading policy this late in the term",
+     "deltas": D(cq=3, tr=6, fc=8)},
+]
+
+
+def cp_dict(team):
+    return team.setdefault("cp", {})
+
+
+def apply_checkpoint(team, index, chosen_deltas_list, summary):
+    """Apply a checkpoint's combined deltas exactly once and store a summary."""
+    cp = cp_dict(team)
+    rec = cp.setdefault(index, {})
+    if rec.get("applied"):
+        return
+    total = D()
+    for d in chosen_deltas_list:
+        for k, v in d.items():
+            total[k] += v
+    apply_deltas(team, total)
+    rec["applied"] = True
+    rec["summary"] = summary
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint dispatch
+# ---------------------------------------------------------------------------
+def checkpoint_screen(game_code, team_index, team):
+    index = games[game_code]["checkpoint_index"]
+    if index == 0:
+        return cp1_screen(game_code, team_index, team)
+    if index == 1:
+        return cp2_screen(game_code, team_index, team)
+    if index == 2:
+        return cp3_screen(game_code, team_index, team)
+    if index == 3:
+        return cp4_screen(game_code, team_index, team)
+    if index == 4:
+        return cp5_screen(game_code, team_index, team)
+    return status_screen(game_code, team_index, team)
+
+
+def open_course_button(game_code, team_index):
+    return ("<a class='btn secondary' href='" + shell_url(game_code, team_index, "home")
+            + "'>View Course (gradebook, messages, announcements)</a>")
+
+
+def cp_header(game_code, team_index, team, index):
+    return ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
+            "<p>" + open_course_button(game_code, team_index) + "</p></div>"
+            + resource_meters(team["resources"], team["statuses"]))
+
+
+def multiselect_form(game_code, team_index, index, error_message=""):
+    actions = CP_ACTIONS[index]
+    limit = CP_LIMITS[index]
+    monitor_key = CP_MONITOR.get(index)
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    rows = ""
+    for a in actions:
+        cb_id = " id='monitor-cb'" if a["key"] == monitor_key else ""
+        rows += ("<div class='choice'><label><input type='checkbox' name='actions' value='" + a["key"]
+                 + "'" + cb_id + "> <strong>" + a["label"] + "</strong></label>"
+                 "<small>" + a["meta"] + "</small></div>")
+    extra = script = ""
+    if index == 0:
+        reassess = ""
+        for opt in CP1_REASSESS_OPTIONS:
+            reassess += "<label><input type='radio' name='reassess' value='" + e(opt) + "'> " + opt + "</label>"
+        # Shown only when Monitor is selected (progressive enhancement: if JS is
+        # unavailable the block stays visible and the server still validates it).
+        extra = ("<div id='reassess-block'><p><strong>Because you are considering Monitor, when will "
+                 "you reassess?</strong></p>" + reassess + "</div>")
+        script = ("<script>(function(){var c=document.getElementById('monitor-cb'),"
+                  "b=document.getElementById('reassess-block');if(!c||!b)return;"
+                  "function u(){b.style.display=c.checked?'':'none';}u();"
+                  "c.addEventListener('change',u);})();</script>")
+    return (
+        "<div class='card'><h3>What, if anything, will your team do?</h3>"
+        "<p>You may select up to " + str(limit) + " action(s). Choosing more is not automatically better: "
+        "every action also spends <strong>Faculty Capacity</strong>, and stacking several labor-intensive "
+        "actions can cost more than your team can realistically sustain.</p>"
+        + error_html +
+        "<form method='post' action='/team/cp/submit'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<input type='hidden' name='cp' value='" + str(index) + "'>"
+        + rows + extra + "<p><button type='submit'>Submit Decision</button></p></form>"
+        + script + "</div>"
+    )
+
+
+# ---- Checkpoint 1: First Week ---------------------------------------------
+def cp1_evidence(team):
+    c = team_cast(team)
+    a, b, d, s = c["calendar"], c["dodge"], c["question_mark"], c["silent_sos"]
+    return (
+        "<div class='card evidence'><h3>First Week Course Check</h3>"
+        "<p>Review four areas before reacting.</p>"
+        "<h4>1. Roster</h4><p>Your class is enrolled and active. Four students stand out this week:</p>"
+        "<ul><li><strong>" + e(a) + "</strong></li><li><strong>" + e(b) + "</strong></li>"
+        "<li><strong>" + e(d) + "</strong></li><li><strong>" + e(s) + "</strong></li></ul>"
+        "<h4>2. Grades</h4><ul>"
+        "<li><strong>" + e(a) + "</strong> &mdash; Assignment 1: missing (blank grade cell)</li>"
+        "<li><strong>" + e(b) + "</strong> &mdash; Assignment 1: missing (blank grade cell)</li>"
+        "<li><strong>" + e(d) + "</strong> &mdash; Assignment 1: submitted</li>"
+        "<li><strong>" + e(s) + "</strong> &mdash; Assignment 1: submitted</li></ul>"
+        "<p><strong>Class-level issue:</strong> several missing assignments show as blank cells "
+        "instead of zeros, so the gradebook may look better than reality.</p>"
+        "<h4>3. Course Activity</h4><ul>"
+        "<li><strong>" + e(a) + "</strong> &mdash; logging in and reading regularly, but did not submit "
+        "Assignment 1. Notes that the syllabus says Sunday while the Canvas due date shows Thursday.</li>"
+        "<li><strong>" + e(b) + "</strong> &mdash; low, sporadic activity; rarely logs in, missing assignment.</li>"
+        "<li><strong>" + e(d) + "</strong> &mdash; active and submitted, but the work suggests confusion "
+        "about what the assignment was asking for.</li>"
+        "<li><strong>" + e(s) + "</strong> &mdash; active and submitted, with the same misunderstanding as "
+        + e(d) + ", but has not sent any message.</li></ul>"
+        "<h4>4. Messages</h4><ul>"
+        "<li><strong>" + e(d) + "</strong> messaged you: \"I turned it in but I'm not sure I did the right "
+        "thing &mdash; the instructions were confusing.\"</li>"
+        "<li><strong>" + e(a) + "</strong> has read announcements but not written in.</li>"
+        "<li><strong>" + e(b) + "</strong> and <strong>" + e(s) + "</strong> have not written in.</li></ul>"
+        "<p class='muted'>Note the due-date mismatch: the syllabus and Canvas disagree. That may be a course "
+        "inconsistency, not only a student mistake.</p></div>"
+    )
+
+
+def cp1_narrative(team):
+    c = team_cast(team)
+    a, b, d, s = c["calendar"], c["dodge"], c["question_mark"], c["silent_sos"]
+    actions = team["cp"][0]["actions"]
+    lines = []
+    if "zeros" in actions:
+        lines.append("You entered zeros for the missing work. The gradebook now reflects reality, and "
+                     + e(a) + " and " + e(b) + " can see the real impact of the missing assignment.")
+    if "message" in actions:
+        lines.append("Your targeted message reaches " + e(b) + ", who responds, submits the missing work, and catches up.")
+    if "contact" in actions:
+        lines.append("You contacted students individually. " + e(a) + " re-engages after the personal outreach, though it took real instructor time.")
+    if "clarify" in actions:
+        lines.append("You posted a clarification, an example, and the rubric. " + e(d) + " and " + e(s)
+                     + " both see the corrected expectation; the shared misunderstanding stops spreading.")
+    if "fix_schedule" in actions:
+        lines.append("You reconciled the syllabus and Canvas due dates. " + e(a)
+                     + " was not careless after all - the course was telling students two different things. That's fixed now.")
+    if "extend" in actions:
+        lines.append("You extended the deadline for everyone. More students submit, but your grading window is now compressed.")
+    if "tutoring" in actions:
+        lines.append("You connected the class with academic support. " + support_referral_outcome(team)
+                     + " " + e(d) + " schedules a session. A few days later, " + e(s)
+                     + " submits work showing the same misunderstanding of the directions.")
+    if "monitor" in actions:
+        line = ("You chose to monitor for now. " + e(s) + " remains active and keeps submitting; the same "
+                "misunderstanding appears again, and no message has been received from them.")
+        if team["cp"][0].get("reassess"):
+            line += " You plan to reassess: " + e(team["cp"][0]["reassess"]) + "."
+        lines.append(line)
+    if "clarify" not in actions:
+        lines.append("Because the class-wide clarification did not go out, " + e(s)
+                     + " keeps working from the same misunderstanding without asking for help.")
+    return "".join("<p>" + x + "</p>" for x in lines)
+
+
+def cp1_screen(game_code, team_index, team):
+    team["cp1_reviewed"] = True
+    rec = team.get("cp", {}).get(0)
+    intro = ("<div class='card'><h2>Checkpoint 1: First Week</h2>"
+             "<p>Your course has run for one week. Look before reacting.</p></div>")
+    base = cp_header(game_code, team_index, team,0) + intro
+    if rec and rec.get("submitted"):
+        chosen = "".join("<li>" + action_label(0, k) + "</li>" for k in rec["actions"])
+        body = (base + "<div class='card'><h3>Your First Week decision</h3><ul>" + chosen + "</ul>"
+                "<h3>What happened</h3>" + cp1_narrative(team) + "</div>"
+                + private_block(game_code, team_index, team, 0))
+        return page("Checkpoint 1 - " + team["name"], body + team_footer(game_code, team_index))
+    body = base + cp1_evidence(team) + resources_consult_block(team, 0) + multiselect_form(game_code, team_index, 0)
+    return page("Checkpoint 1 - " + team["name"], body + team_footer(game_code, team_index))
+
+
+# ---- Checkpoint 2: Early Semester / Late Adds -----------------------------
+def ensure_late_adds(team):
+    """Controlled-random late adds from the received cards, chosen once."""
+    if "late_adds" in team:
+        return team["late_adds"]
+    received = received_students(team)
+    if not received:
+        # Single-team test mode: simulate a couple of new enrollments from
+        # students not already in play, so the checkpoint still functions.
+        in_play = set(team.get("starting_roster", [])) | set(team.get("rejected_students", []))
+        pool = [s for s in STUDENTS if s not in in_play]
+        random.shuffle(pool)
+        count = random.choice([2, 3])
+        adds = pool[:count]
+    else:
+        count = random.choice([2, 3, min(4, len(received))])
+        count = min(count, len(received))
+        adds = random.sample(received, count)
+    team["late_adds"] = adds
+    team["active_roster"] = list(team.get("starting_roster", [])) + adds
+    return adds
+
+
+def cp2_evidence(team):
+    adds = ensure_late_adds(team)
+    cards = "".join(student_card_html(s) for s in adds)
+    return (
+        "<div class='card evidence'><h3>New Student Intake</h3>"
+        "<p><strong>" + str(len(adds)) + "</strong> student(s) have joined your course after the start of the "
+        "term. Students joining the course are not damage &mdash; the question is whether your course can absorb "
+        "normal enrollment change.</p>"
+        "<h4>Where your course is right now</h4><ul>"
+        "<li>You are a few modules in; foundational content has already been covered.</li>"
+        "<li>New students can access the current module but may have missed start-here material.</li>"
+        "<li>An assessment is coming up within the next couple of weeks.</li>"
+        "<li>Onboarding / start-here structure and course navigation determine how quickly they orient.</li>"
+        "<li>Support visibility varies by how students entered the course.</li></ul></div>"
+        "<div class='card'><h3>The students joining your roster</h3>"
+        "<p>Review their full cards before deciding.</p>" + cards + "</div>"
+        + course_reality_note()
+    )
+
+
+def cp2_narrative(team):
+    actions = team["cp"][1]["actions"]
+    adds = team.get("late_adds", [])
+    names = ", ".join(e(s) for s in adds) or "the new students"
+    lines = []
+    if "start_here" in actions:
+        lines.append("Your targeted start-here message reaches " + names + "; they know where to begin.")
+    if "pathway" in actions:
+        lines.append("You built a reusable late-start pathway. It cost real time up front, but it now exists for every future late add &mdash; a system, not a one-off.")
+    if "catchup" in actions:
+        lines.append("You opened a catch-up window. Students use it, though it stretches your grading timeline.")
+    if "orientation" in actions:
+        lines.append("You held a group orientation. Clarity improves sharply, but it consumed a meaningful chunk of your bandwidth.")
+    if "advisor" in actions:
+        lines.append("You looped in advising and academic support for " + names
+                     + ". Their advisors follow up. " + support_referral_outcome(team))
+    if "monitor" in actions:
+        lines.append("You chose not to onboard the new students yet. A couple of them drift early without a clear entry point.")
+    if not actions:
+        lines.append("No onboarding action was taken; the new students find their own way in, unevenly.")
+    return "".join("<p>" + x + "</p>" for x in lines)
+
+
+def cp2_screen(game_code, team_index, team):
+    rec = team.get("cp", {}).get(1)
+    intro = ("<div class='card'><h2>Checkpoint 2: Early Semester</h2>"
+             "<p>Build systems that can absorb normal change.</p></div>")
+    base = cp_header(game_code, team_index, team,1) + intro
+    if rec and rec.get("submitted"):
+        chosen = "".join("<li>" + action_label(1, k) + "</li>" for k in rec["actions"]) or "<li>(no action)</li>"
+        body = (base + "<div class='card'><h3>Your onboarding decision</h3><ul>" + chosen + "</ul>"
+                "<h3>What happened</h3>" + cp2_narrative(team) + "</div>"
+                + "<div class='card'><p class='muted'>No private player check this checkpoint. "
+                  "Please wait for the Game Master to advance.</p></div>")
+        return page("Checkpoint 2 - " + team["name"], body + team_footer(game_code, team_index))
+    body = base + cp2_evidence(team) + resources_consult_block(team, 1) + multiselect_form(game_code, team_index, 1)
+    return page("Checkpoint 2 - " + team["name"], body + team_footer(game_code, team_index))
+
+
+# ---- Checkpoint 3: First Major Assessment ---------------------------------
+def cp3_evidence(team):
+    c = team_cast(team)
+    strong, eng, dodge = c["strong"], c["engaged"], c["dodge"]
+    return (
+        "<div class='card evidence'><h3>First Major Assessment Results</h3>"
+        "<p>The first major assessment has closed. Performance is not catastrophic.</p>"
+        "<ul><li><strong>Class average: about 71%.</strong></li>"
+        "<li>Credibility Analysis: strong across the class.</li>"
+        "<li>Evidence Selection: strong to moderate.</li>"
+        "<li>Source Comparison: moderate.</li>"
+        "<li><strong>Justification of Evaluation: significantly weak &mdash; about 9 of 13 students "
+        "lost substantial points here.</strong></li></ul>"
+        "<h4>Investigate before deciding what it means</h4><ul>"
+        "<li>Three of the lowest-scoring students also show limited practice activity &mdash; e.g. <strong>"
+        + e(dodge) + "</strong>.</li>"
+        "<li>But at least two highly engaged students struggled with the same category &mdash; e.g. <strong>"
+        + e(eng) + "</strong>, who practiced fully.</li>"
+        "<li>A strong student, <strong>" + e(strong) + "</strong>, also missed part of it.</li>"
+        "<li>A student message: \"I could tell which source was stronger, I just didn't know how to prove "
+        "<em>why</em> the evidence supported that.\"</li></ul>"
+        "<h4>Practice vs. assessment</h4>"
+        "<p>Your practice activities asked students to <strong>identify</strong> which source is stronger. "
+        "The assessment rubric expected students to <strong>justify</strong> the evaluation using multiple "
+        "criteria and evidence. That is a real mismatch in cognitive demand &mdash; and some students also "
+        "simply did not practice. The evidence shows more than one cause at once.</p></div>"
+        + course_reality_note()
+    )
+
+
+def cp3_narrative(team):
+    actions = team["cp"][2]["actions"]
+    lines = []
+    if "reteach" in actions:
+        lines.append("Your targeted reteach lands on the specific weak skill (justification), and scores on the next related task improve.")
+    if "aligned_practice" in actions:
+        lines.append("You added practice that actually asks students to justify, not just identify. The practice-to-assessment mismatch closes. It cost grading and prep time.")
+    if "revision" in actions:
+        lines.append("You opened structured revision after feedback. Learning deepens, but your grading load climbs noticeably.")
+    if "outreach_low" in actions:
+        lines.append("You reached the lowest-engagement students individually and pointed them to academic support. "
+                     + support_referral_outcome(team)
+                     + " A few re-engage with practice. On the next task, several students who were already keeping up "
+                     "still miss points on the justification criterion.")
+    if "change_future" in actions:
+        lines.append("You revised how you will teach this skill in future terms. It helps later cohorts more than this one.")
+    if "redesign_assessment" in actions:
+        lines.append("You revised the future assessment design so practice and assessment align.")
+    if "continue" in actions:
+        lines.append("You continued without change. The justification gap persists into later work.")
+    if "monitor" in actions:
+        lines.append("You chose to monitor. The mismatch remains unaddressed for now.")
+    return "".join("<p>" + x + "</p>" for x in lines)
+
+
+def cp3_screen(game_code, team_index, team):
+    rec = team.get("cp", {}).get(2)
+    intro = ("<div class='card'><h2>Checkpoint 3: First Major Assessment</h2>"
+             "<p>Investigate performance before deciding what it means.</p></div>")
+    base = cp_header(game_code, team_index, team,2) + intro
+    if rec and rec.get("submitted"):
+        chosen = "".join("<li>" + action_label(2, k) + "</li>" for k in rec["actions"]) or "<li>(no action)</li>"
+        body = (base + "<div class='card'><h3>Your decision</h3><ul>" + chosen + "</ul>"
+                "<h3>What happened</h3>" + cp3_narrative(team) + "</div>"
+                + private_block(game_code, team_index, team, 2))
+        return page("Checkpoint 3 - " + team["name"], body + team_footer(game_code, team_index))
+    body = base + cp3_evidence(team) + resources_consult_block(team, 2) + multiselect_form(game_code, team_index, 2)
+    return page("Checkpoint 3 - " + team["name"], body + team_footer(game_code, team_index))
+
+
+# ---- Generic multiselect submit (CP1, CP2, CP3) ---------------------------
+def action_label(index, key):
+    for a in CP_ACTIONS[index]:
+        if a["key"] == key:
+            return a["label"]
+    return key
+
+
+@app.route("/team/cp/submit", methods=["POST"])
+def team_cp_submit():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    cp = request.form.get("cp", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    if not cp.isdigit() or int(cp) not in CP_ACTIONS:
+        return error_page("Something went wrong with that checkpoint.")
+
+    team = get_team(game_code, int(team_index))
+    index = int(cp)
+    ti = int(team_index)
+    if "resources" not in team:  # defensive: cannot act before setup is complete
+        return resume_screen(game_code, ti, team)
+    # Must be the live checkpoint.
+    if games[game_code]["checkpoint_index"] != index or not games[game_code]["checkpoint_open"]:
+        return checkpoint_screen(game_code, ti, team)
+    rec = cp_dict(team).get(index)
+    if rec and rec.get("submitted"):
+        return checkpoint_screen(game_code, ti, team)
+
+    actions = CP_ACTIONS[index]
+    keys = [a["key"] for a in actions]
+    selected = [k for k in request.form.getlist("actions") if k in keys]
+    reassess = request.form.get("reassess", "")
+    limit = CP_LIMITS[index]
+
+    if not selected:
+        return _multiselect_error(game_code, ti, team, index, "Please select at least one action (Monitor is a valid choice).")
+    if len(selected) > limit:
+        return _multiselect_error(game_code, ti, team, index,
+                                  "You may select at most " + str(limit) + " actions.")
+    if index == 0 and CP_MONITOR[index] in selected and reassess not in CP1_REASSESS_OPTIONS:
+        return _multiselect_error(game_code, ti, team, index,
+                                  "You chose Monitor, so please choose when you will reassess.")
+
+    ordered = [k for k in keys if k in selected]
+    rec = cp_dict(team).setdefault(index, {})
+    rec["submitted"] = True
+    rec["actions"] = ordered
+    if index == 0:
+        rec["reassess"] = reassess if CP_MONITOR[index] in ordered else None
+    deltas = [a["deltas"] for a in actions if a["key"] in ordered]
+    summary = [action_label(index, k) for k in ordered]
+    apply_checkpoint(team, index, deltas, summary)
+    return checkpoint_screen(game_code, ti, team)
+
+
+def _multiselect_error(game_code, team_index, team, index, msg):
+    if index == 0:
+        base = cp_header(game_code, team_index, team,0) + ("<div class='card'><h2>Checkpoint 1: First Week</h2></div>") + cp1_evidence(team)
+    elif index == 1:
+        base = cp_header(game_code, team_index, team,1) + ("<div class='card'><h2>Checkpoint 2: Early Semester</h2></div>") + cp2_evidence(team)
+    else:
+        base = cp_header(game_code, team_index, team,2) + ("<div class='card'><h2>Checkpoint 3: First Major Assessment</h2></div>") + cp3_evidence(team)
+    return page("Checkpoint - " + team["name"],
+                base + multiselect_form(game_code, team_index, index, msg) + team_footer(game_code, team_index))
+
+
+# ---- Checkpoint 4: Midterm (priority + supporting) ------------------------
+def cp4_prior_help(team):
+    """Callback: did an earlier whole-class intervention already help?"""
+    cp = team.get("cp", {})
+    whole_class = set()
+    for i, keys in [(0, {"clarify"}), (1, {"orientation", "pathway"}), (2, {"reteach", "aligned_practice"})]:
+        acts = set(cp.get(i, {}).get("actions", []))
+        if acts & keys:
+            whole_class |= acts & keys
+    return bool(whole_class)
+
+
+def cp4_constrained(team):
+    """If a resource is critical, remove the most expensive option."""
+    return any(team["resources"][n] < 30 for n in RESOURCE_NAMES)
+
+
+def cp4_options(team):
+    opts = list(CP4_PRIORITY)
+    if cp4_constrained(team):
+        opts = [o for o in opts if o["key"] != "individual_all"]
+    return opts
+
+
+def cp4_evidence(team):
+    c = team_cast(team)
+    dodge, sos = c["dodge"], c["silent_sos"]
+    callback = ""
+    if cp4_prior_help(team):
+        callback = ("<li><strong>Callback:</strong> an earlier whole-class step you took appears to have helped "
+                    + e(sos) + " re-engage without any individual outreach.</li>")
+    else:
+        callback = ("<li><strong>Note:</strong> " + e(sos) + " is still quietly behind; no whole-class step has "
+                    "reached them yet.</li>")
+    constraint = ""
+    if cp4_constrained(team):
+        constraint = ("<div class='notice'><p>One of your resources is Critical. Individualized outreach to "
+                      "everyone is not available this round &mdash; you do not have the capacity.</p></div>")
+    return (
+        "<div class='card evidence'><h3>Midterm: more needs than you can perfectly address</h3>"
+        "<p>Prioritize and scale. You cannot do everything well this round.</p><ul>"
+        "<li><strong>Persistence risk:</strong> " + e(dodge) + " missed another assignment and activity is declining.</li>"
+        "<li><strong>Shared misconception:</strong> several students show the same moderate error on recent work.</li>"
+        "<li><strong>Faculty backlog:</strong> grading and feedback are piling up.</li>"
+        "<li><strong>Process clarity:</strong> multiple students cannot find your feedback comments.</li>"
+        + callback + "</ul></div>" + constraint + course_reality_note()
+    )
+
+
+def cp4_select(name, options, label):
+    tags = "<option value=''>-- choose --</option>"
+    for o in options:
+        tags += "<option value='" + o["key"] + "'>" + o["label"] + "</option>"
+    return ("<p><label><strong>" + label + "</strong><br><select name='" + name + "'>" + tags + "</select></label></p>")
+
+
+def cp4_form(game_code, team_index, team, error_message=""):
+    opts = cp4_options(team)
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    return (
+        "<div class='card'><h3>Choose your midterm response</h3>" + error_html +
+        "<form method='post' action='/team/cp4/submit'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + cp4_select("priority", opts, "One priority response")
+        + cp4_select("supporting", opts, "One supporting response")
+        + "<p><button type='submit'>Submit Midterm Decision</button></p></form></div>"
+    )
+
+
+def cp4_label(key):
+    for o in CP4_PRIORITY:
+        if o["key"] == key:
+            return o["label"]
+    return key
+
+
+def cp4_narrative(team):
+    c = team_cast(team)
+    rec = team["cp"][3]
+    p, s = rec["priority"], rec["supporting"]
+    lines = ["Priority: <strong>" + cp4_label(p) + "</strong>.",
+             "Supporting: <strong>" + cp4_label(s) + "</strong>."]
+    if "urgent" in (p, s):
+        lines.append("You open Dropout Detective, add a note to " + e(c["dodge"]) + "'s advisor, and activate the alert. "
+                     "A day later the advisor replies that they have reached out to " + e(c["dodge"]) + " to talk about staying on track.")
+    if "individual_all" in (p, s):
+        lines.append("Reaching every student by hand takes most of your remaining time this round; many of them got the same message you could have sent once.")
+    if "scalable" in (p, s):
+        lines.append("The scalable whole-class move addressed the shared misconception efficiently.")
+    if "tool" in (p, s):
+        lines.append("Using a Course Tool let you flag the at-risk student without heavy manual effort.")
+    if "defer" in (p, s):
+        lines.append("You intentionally deferred a lower-risk issue, protecting capacity for what mattered most.")
+    return "".join("<p>" + x + "</p>" for x in lines)
+
+
+def cp4_screen(game_code, team_index, team):
+    rec = team.get("cp", {}).get(3)
+    intro = ("<div class='card'><h2>Checkpoint 4: Midterm</h2><p>Prioritize and scale.</p></div>")
+    base = cp_header(game_code, team_index, team,3) + intro
+    if rec and rec.get("submitted"):
+        body = (base + "<div class='card'><h3>Your midterm decision</h3>" + cp4_narrative(team) + "</div>"
+                + private_block(game_code, team_index, team, 3))
+        return page("Checkpoint 4 - " + team["name"], body + team_footer(game_code, team_index))
+    body = base + cp4_evidence(team) + resources_consult_block(team, 3) + cp4_form(game_code, team_index, team)
+    return page("Checkpoint 4 - " + team["name"], body + team_footer(game_code, team_index))
+
+
+@app.route("/team/cp4/submit", methods=["POST"])
+def team_cp4_submit():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    ti = int(team_index)
+    if "resources" not in team:
+        return resume_screen(game_code, ti, team)
+    if games[game_code]["checkpoint_index"] != 3 or not games[game_code]["checkpoint_open"]:
+        return checkpoint_screen(game_code, ti, team)
+    if team.get("cp", {}).get(3, {}).get("submitted"):
+        return checkpoint_screen(game_code, ti, team)
+
+    opts = cp4_options(team)
+    valid = {o["key"] for o in opts}
+    priority = request.form.get("priority", "")
+    supporting = request.form.get("supporting", "")
+    if priority not in valid or supporting not in valid:
+        return page("Checkpoint 4 - " + team["name"],
+                    cp_header(game_code, team_index, team,3) + cp4_evidence(team)
+                    + cp4_form(game_code, ti, team, "Please choose a valid priority and supporting response.")
+                    + team_footer(game_code, ti))
+    if priority == supporting:
+        return page("Checkpoint 4 - " + team["name"],
+                    cp_header(game_code, team_index, team,3) + cp4_evidence(team)
+                    + cp4_form(game_code, ti, team, "Choose two different responses.")
+                    + team_footer(game_code, ti))
+
+    rec = cp_dict(team).setdefault(3, {})
+    rec["submitted"] = True
+    rec["priority"] = priority
+    rec["supporting"] = supporting
+    # Priority full effect; supporting half effect.
+    pd = next(o["deltas"] for o in CP4_PRIORITY if o["key"] == priority)
+    sd = next(o["deltas"] for o in CP4_PRIORITY if o["key"] == supporting)
+    half = {k: round(v / 2) for k, v in sd.items()}
+    summary = ["Priority: " + cp4_label(priority), "Supporting: " + cp4_label(supporting)]
+    apply_checkpoint(team, 3, [pd, half], summary)
+    return checkpoint_screen(game_code, ti, team)
+
+
+# ---- Checkpoint 5: Final Stretch (protect / repair / do-not-add) ----------
+def cp5_evidence(team):
+    c = team_cast(team)
+    near = c["dodge"]
+    return (
+        "<div class='card evidence'><h3>Final Stretch</h3>"
+        "<p>Finish the semester sustainably and accurately. A student failing does not automatically "
+        "mean the course failed.</p><ul>"
+        "<li><strong>" + e(near) + "</strong> is near the passing threshold heading into finals.</li>"
+        "<li>Remaining required assessments still need grading and feedback.</li>"
+        "<li>Some missing work still shows as blank cells rather than zeros.</li>"
+        "<li>Final grades, accurate last-activity dates, and the Course Improvement Survey are due soon.</li>"
+        "<li>A few students have asked for new extra-credit opportunities.</li></ul></div>"
+        "<div class='card'><p>Choose one thing to <strong>protect</strong>, one thing to <strong>repair</strong>, "
+        "and one thing you will intentionally <strong>not add</strong>.</p></div>"
+    )
+
+
+def cp5_select(name, options, label):
+    tags = "<option value=''>-- choose --</option>"
+    for o in options:
+        tags += "<option value='" + o["key"] + "'>" + o["label"] + "</option>"
+    return ("<p><label><strong>" + label + "</strong><br><select name='" + name + "'>" + tags + "</select></label></p>")
+
+
+def cp5_form(game_code, team_index, team, error_message=""):
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    return (
+        "<div class='card'><h3>Your final decision</h3>" + error_html +
+        "<form method='post' action='/team/cp5/submit'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + cp5_select("protect", CP5_PROTECT, "Protect")
+        + cp5_select("repair", CP5_REPAIR, "Repair")
+        + cp5_select("not_add", CP5_NOT_ADD, "Intentionally do NOT add")
+        + "<p><button type='submit'>Submit Final Decision</button></p></form></div>"
+    )
+
+
+def _cp5_label(options, key):
+    for o in options:
+        if o["key"] == key:
+            return o["label"]
+    return key
+
+
+def cp5_narrative(team):
+    rec = team["cp"][4]
+    return ("<p>Protect: <strong>" + _cp5_label(CP5_PROTECT, rec["protect"]) + "</strong></p>"
+            "<p>Repair: <strong>" + _cp5_label(CP5_REPAIR, rec["repair"]) + "</strong></p>"
+            "<p>Do not add: <strong>" + _cp5_label(CP5_NOT_ADD, rec["not_add"]) + "</strong></p>"
+            "<p>You spend the final weeks on the work you chose to protect and repair, and you hold the line "
+            "on what you decided not to add.</p>")
+
+
+def cp5_screen(game_code, team_index, team):
+    rec = team.get("cp", {}).get(4)
+    intro = ("<div class='card'><h2>Checkpoint 5: Final Stretch</h2><p>Finish sustainably and accurately.</p></div>")
+    base = cp_header(game_code, team_index, team,4) + intro
+    if rec and rec.get("submitted"):
+        body = (base + "<div class='card'><h3>Your final decision</h3>" + cp5_narrative(team) + "</div>"
+                + private_block(game_code, team_index, team, 4))
+        return page("Checkpoint 5 - " + team["name"], body + team_footer(game_code, team_index))
+    body = base + cp5_evidence(team) + resources_consult_block(team, 4) + cp5_form(game_code, team_index, team)
+    return page("Checkpoint 5 - " + team["name"], body + team_footer(game_code, team_index))
+
+
+@app.route("/team/cp5/submit", methods=["POST"])
+def team_cp5_submit():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    ti = int(team_index)
+    if "resources" not in team:
+        return resume_screen(game_code, ti, team)
+    if games[game_code]["checkpoint_index"] != 4 or not games[game_code]["checkpoint_open"]:
+        return checkpoint_screen(game_code, ti, team)
+    if team.get("cp", {}).get(4, {}).get("submitted"):
+        return checkpoint_screen(game_code, ti, team)
+
+    protect = request.form.get("protect", "")
+    repair = request.form.get("repair", "")
+    not_add = request.form.get("not_add", "")
+    if (protect not in {o["key"] for o in CP5_PROTECT}
+            or repair not in {o["key"] for o in CP5_REPAIR}
+            or not_add not in {o["key"] for o in CP5_NOT_ADD}):
+        return page("Checkpoint 5 - " + team["name"],
+                    cp_header(game_code, team_index, team,4) + cp5_evidence(team)
+                    + cp5_form(game_code, ti, team, "Please choose one option in each category.")
+                    + team_footer(game_code, ti))
+
+    rec = cp_dict(team).setdefault(4, {})
+    rec["submitted"] = True
+    rec["protect"], rec["repair"], rec["not_add"] = protect, repair, not_add
+    deltas = [
+        next(o["deltas"] for o in CP5_PROTECT if o["key"] == protect),
+        next(o["deltas"] for o in CP5_REPAIR if o["key"] == repair),
+        next(o["deltas"] for o in CP5_NOT_ADD if o["key"] == not_add),
+    ]
+    summary = ["Protect: " + _cp5_label(CP5_PROTECT, protect),
+               "Repair: " + _cp5_label(CP5_REPAIR, repair),
+               "Do not add: " + _cp5_label(CP5_NOT_ADD, not_add)]
+    apply_checkpoint(team, 4, deltas, summary)
+    return checkpoint_screen(game_code, ti, team)
+
+
+# ===========================================================================
+# PRIVATE PLAYER CHECK (CP1, CP3, CP5): allegiance reveal, mission, (sabotage
+# at CP3 for Thunderflunked), suspicion vote. Pass-the-computer, one at a time.
+# ===========================================================================
+def private_round(team, cp):
+    return team.setdefault("private", {}).setdefault(cp, {"decisions": {}, "votes": {}, "started": False})
+
+
+def is_full_private(cp):
+    """CP1/CP3/CP5 run the full private round (mission + suspicion vote)."""
+    return cp in HAS_PRIVATE
+
+
+def private_current(team, cp):
+    """First player index who has not finished their turn. In a full round a turn
+    ends with a suspicion vote; in the brief CP4 round it ends with a 'pass'."""
+    rnd = private_round(team, cp)
+    done = rnd["votes"] if is_full_private(cp) else {str(i): True for i in rnd.setdefault("passed", [])}
+    for i in range(len(team["players"])):
+        if str(i) not in done:
+            return i
+    return None
+
+
+def private_complete(team, cp):
+    if is_full_private(cp):
+        return private_current(team, cp) is None and bool(private_round(team, cp)["votes"])
+    # Brief round: complete once every player has passed through.
+    rnd = private_round(team, cp)
+    return private_current(team, cp) is None and bool(rnd.get("started"))
+
+
+def suspicion_report(team, cp):
+    rnd = private_round(team, cp)
+    tally = {}
+    for v in rnd["votes"].values():
+        tally[v] = tally.get(v, 0) + 1
+    if not tally:
+        return "<p>No suspicion has been recorded.</p>"
+    top = max(tally.values())
+    leaders = [c for c, n in tally.items() if n == top]
+    if top == 1:
+        text = "Suspicion is scattered across the team."
+    elif len(leaders) == 1:
+        text = "Suspicion is concentrated around one member of the team."
+    else:
+        text = "Suspicion is divided across more than one member of the team."
+    return "<p class='big'>" + text + "</p>"
+
+
+def sabotage_available(team, game):
+    return (not team["sabotage"]["used"]) and (game["checkpoint_index"] in SABOTAGE_WINDOW)
+
+
+def private_block(game_code, team_index, team, cp):
+    """Embedded in a CP1/CP3/CP5 screen after the decision: neutral pass gate,
+    or the vague suspicion report once everyone has gone. For the brief CP4 round
+    (cp not in HAS_PRIVATE) the heading and the completed-state message are
+    kept neutral so the Thunderflunked is not singled out."""
+    full = is_full_private(cp)
+    heading = "Private Player Check" if full else "Private Check"
+    cur = private_current(team, cp)
+    if cur is None:
+        done = (suspicion_report(team, cp) if full
+                else "<p>Everyone has passed the device.</p>")
+        return ("<div class='card'><h2>" + heading + "</h2>" + done
+                + "<p class='muted'>Please wait for the Game Master to advance.</p></div>")
+    lead = ("Everyone takes a short private turn. " if not full else "")
+    return (
+        "<div class='card'><h2>" + heading + "</h2>"
+        "<p>" + lead + "Pass the computer to <strong>" + e(team["players"][cur])
+        + "</strong>. Everyone else should look away.</p>"
+        "<form method='post' action='/team/private/ready'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<input type='hidden' name='cp' value='" + str(cp) + "'>"
+        "<button type='submit'>I'm Ready</button></form></div>"
+    )
+
+
+def brief_pass_page(game_code, team_index, team, cp, player):
+    """The only screen most players see in the brief CP4 round: a neutral 'nothing
+    for you this round' pass screen (identical for everyone, so it never reveals
+    who the Thunderflunked is)."""
+    body = ("<div class='card'><h2>Private Check</h2>"
+            "<p><strong>" + e(team["players"][player]) + "</strong> &mdash; there is nothing for "
+            "you to do privately this round. Pass the computer to the next player.</p>"
+            "<form method='post' action='/team/private/pass'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + "<button type='submit'>Pass the Device</button></form></div>")
+    return page("Private", body, "private")
+
+
+def private_hidden(game_code, team_index, cp, player):
+    return ("<input type='hidden' name='game_code' value='" + game_code + "'>"
+            "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+            "<input type='hidden' name='cp' value='" + str(cp) + "'>"
+            "<input type='hidden' name='player' value='" + str(player) + "'>")
+
+
+def private_route(game_code, team_index, team, cp):
+    """Return the next private sub-screen for the current player, or None when
+    the current player's turn is done (caller then re-shows the checkpoint)."""
+    cur = private_current(team, cp)
+    if cur is None:
+        return None
+    i = cur
+    k = str(i)
+    rnd = private_round(team, cp)
+    game = games[game_code]
+
+    # Brief round (CP4): sabotage opportunity for the Thunderflunked only; everyone
+    # else just passes. No allegiance / mission / vote.
+    if not is_full_private(cp):
+        if (i == team["thunderflunked"] and cp in SABOTAGE_WINDOW and sabotage_available(team, game)
+                and not team["sabotage"]["prompted"].get(cp)):
+            return sabotage_page(game_code, team_index, team, cp, i)
+        return brief_pass_page(game_code, team_index, team, cp, i)
+
+    # Step 0: allegiance reveal (once per player, ever).
+    if i not in team["allegiance_seen"]:
+        return allegiance_page(game_code, team_index, team, cp, i)
+
+    # Step 1: secret mission (skip if already completed in an earlier round).
+    mission_decided = (k in rnd["decisions"]) or (k in team["missions_complete"])
+    if not mission_decided:
+        return private_mission_form(game_code, team_index, team, cp, i)
+
+    # Step 2: sabotage (only the Thunderflunked, only during the CP2-CP4 window,
+    # offered once per eligible checkpoint, if still available).
+    if (i == team["thunderflunked"] and cp in SABOTAGE_WINDOW and sabotage_available(team, game)
+            and not team["sabotage"]["prompted"].get(cp)):
+        return sabotage_page(game_code, team_index, team, cp, i)
+
+    # Step 3: suspicion vote.
+    if k not in rnd["votes"]:
+        return private_vote_form(game_code, team_index, team, cp, i)
+    return None
+
+
+def allegiance_page(game_code, team_index, team, cp, player):
+    is_tf = (player == team["thunderflunked"])
+    if is_tf:
+        role_html = ("<h3>You are THUNDERFLUNKED</h3>"
+                     "<p>You're here to make sure they don't get the students and course through the semester.</p>"
+                     "<p>You are the only Thunderflunked person at this table. Sabotage mainly through persuasion: "
+                     "push reasonable ideas too far, favor individual fixes over scalable ones, spend capacity on "
+                     "low-priority issues. Occasionally support good ideas to stay unsuspected.</p>")
+    else:
+        role_html = ("<h3>You are THUNDERSTRUCK</h3>"
+                     "<p>You're here to get your students and course through the semester.</p>"
+                     "<p>Someone at your table is Thunderflunked. You do not know who.</p>")
+    body = ("<div class='card'><h2>Private Player Check</h2>"
+            "<p><strong>" + e(team["players"][player]) + "</strong> &mdash; your allegiance (keep it secret):</p>"
+            "<div class='card'>" + role_html + "</div>"
+            "<form method='post' action='/team/private/allegiance'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + "<button type='submit'>Continue</button></form></div>")
+    return page("Private", body, "private")
+
+
+def private_mission_form(game_code, team_index, team, cp, player):
+    body = ("<div class='card'><h2>Private Player Check</h2>"
+            "<p><strong>" + e(team["players"][player]) + "</strong> &mdash; Part A: Secret Mission</p>"
+            "<p>Look at the physical <strong>Secret Mission card</strong> you were dealt at the start. "
+            "Only you can see it. If its condition has been met <em>and</em> the card says it may be claimed "
+            "at this point in the game, choose <strong>Claim Mission</strong>. Otherwise choose "
+            "<strong>Not Yet</strong> &mdash; you will be asked again at later checkpoints.</p>"
+            "<p class='muted'>Completing a mission is a small bonus recognition at the end. It does not decide "
+            "who wins, and it is separate from your Thunderstruck/Thunderflunked allegiance.</p>"
+            "<form method='post' action='/team/private/mission/claim' style='display:inline'>"
+            + private_hidden(game_code, team_index, cp, player) + "<button type='submit'>Claim Mission</button></form> "
+            "<form method='post' action='/team/private/mission/notyet' style='display:inline'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + "<button class='secondary' type='submit'>Not Yet</button></form></div>")
+    return page("Private", body, "private")
+
+
+def private_mission_confirm_page(game_code, team_index, team, cp, player):
+    body = ("<div class='card'><h2>Private Player Check</h2>"
+            "<p><strong>" + e(team["players"][player]) + "</strong>: Confirm that your physical Secret Mission "
+            "says it may be claimed now and that you completed its condition.</p>"
+            "<form method='post' action='/team/private/mission/confirm' style='display:inline'>"
+            + private_hidden(game_code, team_index, cp, player) + "<button type='submit'>Confirm Claim</button></form> "
+            "<form method='post' action='/team/private/mission/back' style='display:inline'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + "<button class='secondary' type='submit'>Go Back</button></form></div>")
+    return page("Private", body, "private")
+
+
+def private_vote_form(game_code, team_index, team, cp, voter, error_message=""):
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    candidates = [i for i in range(len(team["players"])) if i != voter]
+    random.shuffle(candidates)
+    options = ""
+    for pos, cand in enumerate(candidates, start=1):
+        options += ("<label><input type='radio' name='candidate' value='" + str(cand) + "'> "
+                    + str(pos) + ". " + e(team["players"][cand]) + "</label>")
+    body = ("<div class='card'><h2>Private Player Check</h2>"
+            "<p><strong>" + e(team["players"][voter]) + "</strong> &mdash; Part B: Suspicion Vote</p>"
+            "<p>Select the person you currently suspect most. This is not your final accusation.</p>"
+            + error_html +
+            "<form method='post' action='/team/private/vote'>"
+            + private_hidden(game_code, team_index, cp, voter)
+            + options + "<p><button type='submit'>Confirm Vote</button></p></form></div>")
+    return page("Private", body, "private")
+
+
+def _private_team(game_code):
+    team_index = request.form.get("team_index", "")
+    cp = request.form.get("cp", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return None
+    if not cp.isdigit():
+        return None
+    return get_team(game_code, int(team_index)), int(team_index), int(cp)
+
+
+def _private_resume(game_code, team_index, team, cp):
+    nxt = private_route(game_code, team_index, team, cp)
+    if nxt is None:
+        return checkpoint_screen(game_code, team_index, team)
+    return nxt
+
+
+@app.route("/team/private/ready", methods=["POST"])
+def team_private_ready():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    private_round(team, cp)["started"] = True
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/private/allegiance", methods=["POST"])
+def team_private_allegiance():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    player = request.form.get("player", "")
+    if player.isdigit() and int(player) not in team["allegiance_seen"]:
+        team["allegiance_seen"].append(int(player))
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/private/mission/claim", methods=["POST"])
+def team_private_mission_claim():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    if cur is None:
+        return checkpoint_screen(game_code, ti, team)
+    return private_mission_confirm_page(game_code, ti, team, cp, cur)
+
+
+@app.route("/team/private/mission/back", methods=["POST"])
+def team_private_mission_back():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/private/mission/confirm", methods=["POST"])
+def team_private_mission_confirm():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    if cur is None:
+        return checkpoint_screen(game_code, ti, team)
+    k = str(cur)
+    private_round(team, cp)["decisions"][k] = "complete"
+    if k not in team["missions_complete"]:
+        team["missions_complete"].append(k)
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/private/mission/notyet", methods=["POST"])
+def team_private_mission_notyet():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    if cur is None:
+        return checkpoint_screen(game_code, ti, team)
+    private_round(team, cp)["decisions"][str(cur)] = "not_yet"
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/private/pass", methods=["POST"])
+def team_private_pass():
+    """Ends a player's turn in the brief CP4 round (no vote)."""
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    if cur is None:
+        return checkpoint_screen(game_code, ti, team)
+    passed = private_round(team, cp).setdefault("passed", [])
+    if cur not in passed:
+        passed.append(cur)
+    # Ends this player's brief turn: return to the pass gate (checkpoint screen),
+    # not the next player's screen, so the device is handed over deliberately.
+    return checkpoint_screen(game_code, ti, team)
+
+
+@app.route("/team/private/vote", methods=["POST"])
+def team_private_vote():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    # The voter index is submitted in the hidden "player" field (see private_hidden).
+    voter = request.form.get("player", "")
+    if cur is None or voter != str(cur):
+        return checkpoint_screen(game_code, ti, team)
+    candidate = request.form.get("candidate", "")
+    valid = [str(i) for i in range(len(team["players"])) if i != cur]
+    if candidate not in valid:
+        return private_vote_form(game_code, ti, team, cp, cur,
+                                 "Please select one candidate (you cannot vote for yourself).")
+    private_round(team, cp)["votes"][str(cur)] = candidate
+    # The vote ends this player's turn: return to the pass gate (checkpoint screen),
+    # which shows "pass to the next player" or the vague report when everyone is done.
+    # Do NOT auto-advance into the next player's private screens on this device.
+    return checkpoint_screen(game_code, ti, team)
+
+
+# ===========================================================================
+# EMERGENCY SABOTAGE - offered to the Thunderflunked inside their private turn
+# at CP3 (index 2, full private round) and CP4 (index 3, brief round). One time
+# total; expires after CP4. (Keys are checkpoint indices.)
+# ===========================================================================
+SABOTAGE_OPTIONS = {
+    2: [  # CP3 (full private round)
+        {"key": "revision_drag", "label": "Revision grading drags on longer than expected", "deltas": D(fc=-3)},
+        {"key": "reteach_delay", "label": "The reteach is delayed about a week", "deltas": D(ss=-3)},
+        {"key": "practice_clunky", "label": "The new practice rolls out clunky and eats time", "deltas": D(tr=-3)},
+    ],
+    3: [  # CP4 (brief round)
+        {"key": "outreach_delay", "label": "The priority outreach is delayed", "deltas": D(ss=-3)},
+        {"key": "feedback_misroute", "label": "Feedback routing is misconfigured", "deltas": D(cq=-3)},
+        {"key": "manual_tracking", "label": "Extra manual tracking is introduced", "deltas": D(fc=-3)},
+    ],
+}
+
+
+def sabotage_page(game_code, team_index, team, cp, player):
+    """Offered to the Thunderflunked during their private turn at CP3 (full round)
+    or CP4 (brief round).
+    Activate applies a small hidden effect; Save For Later continues the turn."""
+    opts = SABOTAGE_OPTIONS.get(cp, [])
+    options_html = ""
+    for o in opts:
+        options_html += ("<label><input type='radio' name='option' value='" + o["key"] + "'> " + o["label"] + "</label>")
+    body = ("<div class='card'><h2>Emergency Sabotage Available</h2>"
+            "<p>You are Thunderflunked. You may activate your one Emergency Sabotage now, or save it for a "
+            "later checkpoint. It is small by design, and it expires after Checkpoint 4. No one else will be "
+            "told you did this.</p>"
+            "<form method='post' action='/team/sabotage/activate'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + options_html + "<p><button type='submit'>Activate</button></p></form>"
+            "<form method='post' action='/team/sabotage/save' style='display:inline'>"
+            + private_hidden(game_code, team_index, cp, player)
+            + "<button class='secondary' type='submit'>Save For Later</button></form></div>")
+    return page("Private", body, "private")
+
+
+@app.route("/team/sabotage/save", methods=["POST"])
+def sabotage_save():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    team["sabotage"]["prompted"][cp] = True  # don't re-offer this checkpoint
+    return _private_resume(game_code, ti, team, cp)
+
+
+@app.route("/team/sabotage/activate", methods=["POST"])
+def sabotage_activate():
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    game = games[game_code]
+    option = request.form.get("option", "")
+
+    # Expired or invalid checkpoint: silently continue the private turn.
+    if not sabotage_available(team, game) or cp not in SABOTAGE_OPTIONS:
+        team["sabotage"]["prompted"][cp] = True
+        return _private_resume(game_code, ti, team, cp)
+
+    chosen = next((o for o in SABOTAGE_OPTIONS[cp] if o["key"] == option), None)
+    if chosen is None:
+        player = int(request.form.get("player", "0"))
+        return sabotage_page(game_code, ti, team, cp, player)
+
+    apply_deltas(team, chosen["deltas"])
+    team["sabotage"]["used"] = True
+    team["sabotage"]["cp"] = cp + 1  # store as 1-based checkpoint number
+    team["sabotage"]["label"] = chosen["label"]
+    team["sabotage"]["prompted"][cp] = True
+    return _private_resume(game_code, ti, team, cp)
+
+
+# ===========================================================================
+# COURSE SHELL (Canvas-style read-only view of the team's course, updating at
+# each checkpoint and reflecting the team's own decisions). This is a
+# presentation surface over existing state - no new simulation. It never shows
+# allegiance, missions, suspicion, or votes.
+# ===========================================================================
+SHELL_TABS = [
+    ("home", "Home"),
+    ("syllabus", "Syllabus"),
+    ("modules", "Modules"),
+    ("gradebook", "Gradebook"),
+    ("announcements", "Announcements"),
+    ("inbox", "Inbox"),
+    ("roster", "Roster"),
+    ("resources", "Student Support & Tools"),
+]
+
+# Graded items and when (by checkpoint index) they first appear in the gradebook.
+GB_ITEMS = [
+    {"key": "a1", "name": "Assignment 1: Getting Started", "reveal": 0, "max": 20, "type": "simple"},
+    {"key": "a2", "name": "Assignment 2", "reveal": 1, "max": 20, "type": "simple"},
+    {"key": "ma1", "name": "Major Assessment 1", "reveal": 2, "max": 100, "type": "major"},
+    {"key": "a3", "name": "Assignment 3", "reveal": 3, "max": 20, "type": "simple"},
+    {"key": "final", "name": "Final Project", "reveal": 4, "max": 100, "type": "simple"},
+]
+
+MA1_CATEGORIES = ["Credibility Analysis", "Evidence Selection",
+                  "Source Comparison", "Justification of Evaluation"]
+
+
+def shell_url(game_code, team_index, tab="home"):
+    return ("/team/shell?game_code=" + game_code + "&team_index=" + str(team_index)
+            + "&tab=" + tab)
+
+
+def shell_cp_index(game_code):
+    return games[game_code]["checkpoint_index"]
+
+
+def shell_active_roster(team):
+    return team.get("active_roster") or team.get("starting_roster", [])
+
+
+def _enrolled_from(team, label):
+    """Checkpoint index at which a student is on the roster (0 start; 1 if late add)."""
+    return 1 if label in team.get("late_adds", []) else 0
+
+
+def _zeros_entered(team):
+    return "zeros" in team.get("cp", {}).get(0, {}).get("actions", [])
+
+
+def _addressed_alignment(team):
+    acts = set(team.get("cp", {}).get(2, {}).get("actions", []))
+    return bool(acts & {"reteach", "aligned_practice", "revision"})
+
+
+def _gb_missing(team, label, item):
+    """Deterministic (no RNG) submission state, with cast-driven narrative overrides."""
+    c = team_cast(team)
+    st = STUDENT_STATS[label]
+    if item["key"] == "a1" and label in (c.get("calendar"), c.get("dodge")):
+        return True
+    if item["key"] == "a3" and label == c.get("dodge"):
+        return True  # Midterm persistence risk: misses another assignment
+    return (st["self_management"] + st["motivation"]) <= 4
+
+
+def _gb_simple_score(label, maxpts):
+    st = STUDENT_STATS[label]
+    ab = st["readiness"] + st["motivation"]  # 2..10
+    frac = 0.55 + (ab - 2) / 8.0 * 0.4       # 0.55..0.95
+    return int(round(maxpts * frac))
+
+
+def _gb_major(team, label):
+    st = STUDENT_STATS[label]
+    ab = st["readiness"] + st["motivation"]            # 2..10
+    practice = st["self_management"] + st["help_seeking"]  # engagement proxy
+    cred = min(25, 15 + ab)
+    evid = min(25, 13 + ab)
+    source = min(25, 10 + int(round(ab * 0.9)))
+    justif = max(3, min(25, 5 + int(round((ab - 4) * 0.9))))  # the authored weak skill
+    total = cred + evid + source + justif
+    if practice <= 4:
+        total = max(35, total - 12)
+    return {"total": total,
+            "cats": dict(zip(MA1_CATEGORIES, [cred, evid, source, justif]))}
+
+
+def _gb_cell(team, label, item, cp_index):
+    """Return (display, css_class) for one gradebook cell."""
+    if _enrolled_from(team, label) > item["reveal"]:
+        return ("enrolled later", "muted")
+    if item["type"] == "major":
+        m = _gb_major(team, label)
+        return (str(m["total"]) + " / 100", "")
+    if _gb_missing(team, label, item):
+        return ("0" if _zeros_entered(team) else "missing", "status-Critical" if _zeros_entered(team) else "muted")
+    score = _gb_simple_score(label, item["max"])
+    if item["key"] == "final" and _addressed_alignment(team):
+        score = min(item["max"], score + 2)  # prior alignment work pays off
+    return (str(score) + " / " + str(item["max"]), "")
+
+
+def shell_gradebook(team, cp_index):
+    roster = shell_active_roster(team)
+    items = [it for it in GB_ITEMS if it["reveal"] <= cp_index]
+    if not items:
+        return "<div class='card'><p>No graded items have been posted yet.</p></div>"
+    head = "<tr><th>Student</th>" + "".join("<th>" + it["name"] + "</th>" for it in items) + "</tr>"
+    rows = ""
+    for s in roster:
+        cells = ""
+        for it in items:
+            disp, cls = _gb_cell(team, s, it, cp_index)
+            cells += "<td class='" + cls + "'>" + disp + "</td>"
+        late = " <span class='pill'>late add</span>" if s in team.get("late_adds", []) else ""
+        rows += "<tr><td>" + e(s) + late + "</td>" + cells + "</tr>"
+    out = ("<div class='card'><h2>Gradebook</h2>"
+           "<p class='muted'>Missing work shows as "
+           + ("<strong>0</strong> because your team entered zeros."
+              if _zeros_entered(team) else "<strong>missing</strong> (blank cell) - the gradebook may look better than reality.")
+           + "</p>"
+           "<div style='overflow-x:auto'><table>" + head + rows + "</table></div></div>")
+    # Major-assessment detail once it exists.
+    if any(it["key"] == "ma1" for it in items):
+        totals = [_gb_major(team, s)["total"] for s in roster if _enrolled_from(team, s) <= 2]
+        avg = round(sum(totals) / len(totals)) if totals else 0
+        cat_rows = ""
+        for s in roster:
+            if _enrolled_from(team, s) > 2:
+                continue
+            m = _gb_major(team, s)
+            cat_rows += ("<tr><td>" + e(s) + "</td>"
+                         + "".join("<td>" + str(m["cats"][c]) + " / 25</td>" for c in MA1_CATEGORIES)
+                         + "</tr>")
+        out += ("<div class='card'><h3>Major Assessment 1 - category breakdown</h3>"
+                "<p><strong>Class average: " + str(avg) + "%.</strong> Most of the lost points are in "
+                "<strong>Justification of Evaluation</strong> - including some highly engaged students. "
+                "Practice asked students to <em>identify</em> the stronger source; the rubric expected them to "
+                "<em>justify</em> the evaluation with evidence.</p>"
+                "<div style='overflow-x:auto'><table><tr><th>Student</th>"
+                + "".join("<th>" + c + "</th>" for c in MA1_CATEGORIES) + "</tr>"
+                + cat_rows + "</table></div></div>")
+    return out
+
+
+def shell_syllabus(team, cp_index):
+    course = COURSE_BY_NAME[team["course"]]
+    mismatch = ""
+    if cp_index == 0:
+        mismatch = ("<div class='notice'><p><strong>Heads up:</strong> the syllabus of record lists Assignment 1 "
+                    "as due <strong>Sunday 11:59 PM</strong>, but the Canvas due date currently shows "
+                    "<strong>Thursday</strong>. These disagree.</p></div>")
+    return (
+        "<div class='card'><h2>Syllabus</h2>"
+        "<p><strong>" + e(course["name"]) + "</strong> (" + course["code"] + ") &mdash; "
+        + str(course["credits"]) + " credits &mdash; " + course["modality"] + "</p>"
+        "<p>" + course["desc"] + "</p>"
+        "<h3>Meeting / learning pattern</h3><p>" + course["pattern"] + "</p>"
+        "<h3>Assessment pattern</h3><p>" + course["assessment"] + "</p>"
+        "<h3>Prerequisite</h3><p>" + course["prereq"] + "</p>"
+        "<h3>Course notes (structural)</h3><ul><li>" + course["realities"][0] + "</li>"
+        "<li>" + course["realities"][1] + "</li></ul></div>"
+        + mismatch +
+        "<div class='card'><h3>Schedule (excerpt)</h3><table>"
+        "<tr><th>When</th><th>Item</th><th>Due</th></tr>"
+        "<tr><td>Week 1</td><td>Assignment 1: Getting Started</td><td>Sunday 11:59 PM (syllabus of record)</td></tr>"
+        "<tr><td>Early term</td><td>Assignment 2</td><td>Posted in Canvas</td></tr>"
+        "<tr><td>Mid term</td><td>Major Assessment 1</td><td>Posted in Canvas</td></tr>"
+        "<tr><td>Later</td><td>Assignment 3 / Final Project</td><td>Posted in Canvas</td></tr>"
+        "</table></div>"
+    )
+
+
+def shell_modules(team, cp_index):
+    course = COURSE_BY_NAME[team["course"]]
+    modality = course["modality"]
+    if "Asynchronous" in modality:
+        gate = ("This course is self-paced online with no fixed meeting time, so the Start Here module and clear "
+                "navigation carry the course. Students who drift are hard to see.")
+    elif "CTE" in modality:
+        gate = ("Competencies are sequential: later modules and the capstone require earlier ones to be complete. "
+                "Lab/shop stations and build teams are limited.")
+    else:
+        gate = "Modules are aligned to the in-class meetings; content builds week to week."
+    names = ["Start Here & Syllabus", "Module 1: Foundations", "Module 2",
+             "Module 3", "Module 4", "Final / Capstone"]
+    current = min(cp_index + 1, len(names) - 1)
+    items = ""
+    for i, nm in enumerate(names):
+        state = "complete" if i < current else ("current" if i == current else "upcoming")
+        tag = {"complete": "<span class='pill'>done</span>",
+               "current": "<span class='pill'>current</span>",
+               "upcoming": "<span class='muted'>upcoming</span>"}[state]
+        items += "<li>" + nm + " &mdash; " + tag + "</li>"
+    late_note = ""
+    if cp_index >= 1 and team.get("late_adds"):
+        late_note = ("<div class='notice'><p>New students enter at the current module. Use the Start Here module "
+                     "and onboarding to help them catch up on foundational content.</p></div>")
+    return ("<div class='card'><h2>Modules</h2><p class='muted'>" + gate + "</p>"
+            "<ul class='clean'>" + items + "</ul></div>" + late_note)
+
+
+def _resource_card_html(r):
+    needs = " ".join("<span class='pill'>" + e(NEED_LABELS[n]) + "</span>" for n in r["needs"])
+    cat_cls = "tool" if r["category"] == TOOL else "support"
+    return (
+        "<div class='card resource " + cat_cls + "'>"
+        "<p class='muted' style='margin:0 0 4px'><strong>" + e(r["category"]) + "</strong></p>"
+        "<h3 style='margin:0 0 6px'>" + e(r["name"]) + "</h3>"
+        "<p style='margin:0 0 8px'>" + needs + "</p>"
+        "<p><strong>What it is:</strong> " + e(r["what"]) + "</p>"
+        "<p><strong>When it may help:</strong> " + e(r["when"]) + "</p>"
+        "<p><strong>How faculty use/connect:</strong> " + e(r["how"]) + "</p>"
+        "<p class='muted'><strong>Limitations:</strong> " + e(r["limits"]) + "</p>"
+        "</div>"
+    )
+
+
+def resources_panel_full(team):
+    """Full two-category reference for the course shell Resources tab."""
+    tools = "".join(_resource_card_html(r) for r in COURSE_TOOLS)
+    supports = "".join(_resource_card_html(r) for r in STUDENT_SUPPORTS)
+    return (
+        "<div class='card'><h2>Resources &amp; Student Support</h2>"
+        "<p class='muted'>Two kinds of help. <strong>Course tools</strong> are what you do inside "
+        "this course. <strong>Student supports</strong> are real NCC services you connect a student "
+        "with. Match the response to what the evidence actually shows: a support need, a course-design "
+        "need, a communication need, an advising/persistence concern, or an accessibility need.</p></div>"
+        "<div class='card notice'><p><strong>Choosing a student support for this course:</strong> "
+        + support_context_note(team) + "</p></div>"
+        "<div class='card'><h3>Student Supports (real NCC services)</h3></div>" + supports
+        + "<div class='card'><h3>Course Tools (inside Canvas)</h3></div>" + tools
+    )
+
+
+def shell_resources(team, cp_index):
+    return resources_panel_full(team)
+
+
+# A SMALL set of resources plausibly worth considering at each checkpoint - a mix
+# of course tools and student supports, deliberately including options that may NOT
+# fit, so the game never signals the "correct" choice. The full catalog lives on the
+# shell's Student Support & Tools tab and on the physical cards.
+CP_RELEVANT_RESOURCES = {
+    0: ["Simple Syllabus", "Canvas Grades / Entering Zeros", "Message Students Who…",
+        "Rubrics", "Announcements / Scheduled Announcements", "Brainfuse Online Tutoring"],
+    1: ["Canvas Modules / Start Here", "Announcements / Scheduled Announcements",
+        "Academic Advising", "Learning Center (Student Success Center)",
+        "Brainfuse Online Tutoring", "Dropout Detective"],
+    2: ["Rubrics", "SpeedGrader / Reusable Feedback", "Canvas Modules / Start Here",
+        "Course Analytics / Access Report", "Brainfuse Online Tutoring",
+        "Accessibility / Accommodation Services"],
+    3: ["Dropout Detective", "Course Analytics / Access Report", "SpeedGrader / Reusable Feedback",
+        "Message Students Who…", "Academic Advising", "TRiO Student Support Services"],
+    4: ["Canvas Grades / Entering Zeros", "Grade Publish", "Course Improvement Survey",
+        "SpeedGrader / Reusable Feedback", "Academic Advising",
+        "Learning Center (Student Success Center)"],
+}
+
+
+def resources_consult_block(team, cp_index):
+    """Compact, collapsible reference for the current checkpoint. Shows only a small,
+    situation-relevant subset (mixing tools and supports, with some that may not fit)
+    so faculty still have to interpret the evidence. It does not name a correct choice."""
+    names = CP_RELEVANT_RESOURCES.get(cp_index, [])
+    items = ""
+    for nm in names:
+        r = RESOURCES_BY_NAME.get(nm)
+        if not r:
+            continue
+        tag = "Student support" if r["category"] == SUPPORT else "Course tool"
+        items += ("<li><strong>" + e(r["name"]) + "</strong> <span class='muted'>(" + tag
+                  + ")</span> &mdash; " + e(r["what"]) + "</li>")
+    return (
+        "<details class='card'><summary><strong>Consult your Course Tool and Student Support cards</strong> "
+        "if one may help</summary>"
+        "<p class='muted'>Decide what kind of need the evidence shows before you choose. Some of these may "
+        "help here and some may not &mdash; you decide. Your physical cards and the "
+        "<em>Student Support &amp; Tools</em> tab carry the full When / How / Limitations for every resource.</p>"
+        "<ul>" + items + "</ul></details>"
+    )
+
+
+def shell_announcements(team, cp_index):
+    cp0 = team.get("cp", {}).get(0, {}).get("actions", [])
+    cp1 = team.get("cp", {}).get(1, {}).get("actions", [])
+    cp2 = team.get("cp", {}).get(2, {}).get("actions", [])
+    anns = [("Week 0", "Welcome to " + e(team["course"]),
+             "Welcome! Please review the syllabus and complete Assignment 1.")]
+    if "clarify" in cp0:
+        anns.append(("Week 1", "Clarification on Assignment 1",
+                     "Several of you asked about expectations. Here is a clearer explanation, an example, "
+                     "and the rubric."))
+    if "fix_schedule" in cp0:
+        anns.append(("Week 1", "Corrected due date for Assignment 1",
+                     "The syllabus and Canvas listed different due dates. Canvas now matches the syllabus of "
+                     "record. Thank you to those who flagged it."))
+    if "extend" in cp0:
+        anns.append(("Week 1", "Assignment 1 deadline extended",
+                     "The Assignment 1 due date has been extended for everyone."))
+    if "tutoring" in cp0:
+        anns.append(("Week 1", "Free tutoring: Learning Center (Student Success Center) and Brainfuse",
+                     "Reminder: the Learning Center (Student Success Center) in Building A offers free tutoring, and "
+                     "Brainfuse online tutoring (the sidebar link in this course, 15 hours per year) is free as well."))
+    if cp_index >= 1 and "start_here" in cp1:
+        anns.append(("Early semester", "Start Here for new students",
+                     "If you recently joined, begin with this message and the Start Here module."))
+    if cp_index >= 1 and "orientation" in cp1:
+        anns.append(("Early semester", "Orientation / check-in",
+                     "Optional live check-in to get oriented. Details inside."))
+    if cp_index >= 1 and "advisor" in cp1:
+        anns.append(("Early semester", "Support for new students",
+                     "New students: your advisor, the Learning Center (Student Success Center), and Brainfuse online tutoring are ready to help you catch up."))
+    if cp_index >= 2 and ("reteach" in cp2 or "aligned_practice" in cp2):
+        anns.append(("After Assessment 1", "Revisiting justification",
+                     "We will revisit how to justify an evaluation with evidence. New aligned practice is posted."))
+    if cp_index >= 4:
+        anns.append(("Final stretch", "End-of-term checklist",
+                     "Remaining required work, the final grades timeline, and the Course Improvement Survey."))
+    cards = ""
+    for when, title, body in reversed(anns):
+        cards += ("<div class='card'><p class='muted'>" + when + "</p><h3>" + title + "</h3><p>" + body + "</p></div>")
+    return "<div class='card'><h2>Announcements</h2></div>" + cards
+
+
+def shell_inbox(team, cp_index):
+    c = team_cast(team)
+    msgs = [("Week 1", e(c["question_mark"]),
+             "I turned it in but I'm not sure I did the right thing - the instructions were confusing."),
+            ("Week 1", "Course note",
+             "No message has been received from " + e(c["silent_sos"]) + ", who is active and submitting but "
+             "appears to share the same misunderstanding. They have not asked for help.")]
+    if cp_index >= 1 and team.get("late_adds"):
+        msgs.append(("Early semester", e(team["late_adds"][0]),
+                     "Hi, I was just added to this course - where should I start?"))
+    if cp_index >= 3:
+        msgs.append(("Midterm", e(c["strong"]),
+                     "I can't find your feedback comments on my last assignment - where do I look?"))
+    if cp_index >= 4:
+        msgs.append(("Final stretch", e(c["engaged"]),
+                     "Is there any extra credit available to bring my grade up?"))
+    cards = ""
+    for when, who, body in msgs:
+        cards += ("<div class='card'><p class='muted'>" + when + " &mdash; from " + who + "</p><p>" + body + "</p></div>")
+    return "<div class='card'><h2>Inbox</h2></div>" + cards
+
+
+def shell_roster(team, cp_index):
+    roster = shell_active_roster(team)
+    rows = ""
+    labels = ["R", "M", "C", "SM", "A", "HS"]
+    for s in roster:
+        st = STUDENT_STATS[s]
+        late = " <span class='pill'>late add</span>" if s in team.get("late_adds", []) else ""
+        stat_cells = "".join("<td>" + str(st[k]) + "</td>" for k in STAT_KEYS)
+        rows += ("<tr><td>" + e(s) + late + "</td>" + stat_cells
+                 + "<td class='muted'>" + e(STUDENT_INFO[s]["context"]) + "</td></tr>")
+    header = ("<tr><th>Student</th>"
+              + "".join("<th title='" + STAT_LABELS[k] + "'>" + labels[i] + "</th>"
+                        for i, k in enumerate(STAT_KEYS))
+              + "<th>Context</th></tr>")
+    return ("<div class='card'><h2>Roster</h2>"
+            "<p class='muted'>Stats (1-5): R Readiness, M Motivation, C Communication, "
+            "SM Self-Management, A Adaptability, HS Help-Seeking. Communication is \"can we have a productive "
+            "conversation?\"; Help-Seeking is \"will they start it when stuck?\"</p>"
+            "<div style='overflow-x:auto'><table>" + header + rows + "</table></div></div>")
+
+
+def shell_home(game_code, team_index, team, cp_index):
+    roster = shell_active_roster(team)
+    latest_simple = None
+    for it in GB_ITEMS:
+        if it["type"] == "simple" and it["reveal"] <= cp_index:
+            latest_simple = it
+    missing = 0
+    if latest_simple:
+        missing = sum(1 for s in roster
+                      if _enrolled_from(team, s) <= latest_simple["reveal"]
+                      and _gb_missing(team, s, latest_simple))
+    num = cp_index + 1
+    tiles = (
+        "<table><tr><th>Checkpoint</th><td>" + str(num) + " of " + str(len(CHECKPOINTS))
+        + " &mdash; " + CHECKPOINTS[cp_index] + "</td></tr>"
+        "<tr><th>Active students</th><td>" + str(len(roster)) + "</td></tr>"
+        "<tr><th>Missing on latest assignment</th><td>" + str(missing) + "</td></tr>"
+        "</table>")
+    return ("<div class='card'><h2>Course Home</h2>" + tiles + "</div>"
+            + resource_meters(team["resources"], team["statuses"]))
+
+
+# Canvas-style course navigation order/labels (keys map to the renderers).
+COURSE_NAV = [
+    ("home", "Home"),
+    ("announcements", "Announcements"),
+    ("modules", "Modules"),
+    ("gradebook", "Grades"),
+    ("roster", "People"),
+    ("syllabus", "Syllabus"),
+    ("inbox", "Inbox"),
+    ("resources", "Student Support"),
+]
+NAV_LABEL = dict(COURSE_NAV)
+
+# Minimal inline SVG icons for the decorative global nav rail (no emoji, no assets).
+_GI = {
+    "account": "<circle cx='12' cy='8' r='4'/><path d='M4 21c0-4 4-6 8-6s8 2 8 6'/>",
+    "dashboard": "<rect x='3' y='3' width='7' height='7'/><rect x='14' y='3' width='7' height='7'/>"
+                 "<rect x='3' y='14' width='7' height='7'/><rect x='14' y='14' width='7' height='7'/>",
+    "courses": "<path d='M5 4h12a2 2 0 0 1 2 2v14H7a2 2 0 0 0-2 2z'/><path d='M9 4v16'/>",
+    "calendar": "<rect x='3' y='4' width='18' height='17' rx='2'/><path d='M3 9h18M8 2v4M16 2v4'/>",
+    "inbox": "<path d='M3 12l4-7h10l4 7v7a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z'/><path d='M3 12h5l1 2h4l1-2h5'/>",
+    "help": "<circle cx='12' cy='12' r='9'/><path d='M9.5 9a2.5 2.5 0 0 1 4.5 1.5c0 1.5-2 2-2 3.5'/>"
+            "<circle cx='12' cy='17.5' r='.7' fill='currentColor' stroke='none'/>",
+}
+
+
+def _gi_item(key, label):
+    return ("<div class='gi'><svg viewBox='0 0 24 24' aria-hidden='true'>" + _GI[key]
+            + "</svg>" + label + "</div>")
+
+
+def global_rail():
+    # Decorative Canvas-style global rail (aria-hidden; real nav is the course list).
+    items = [("account", "Account"), ("dashboard", "Dashboard"), ("courses", "Courses"),
+             ("calendar", "Calendar"), ("inbox", "Inbox"), ("help", "Help")]
+    return ("<nav class='lms-global' aria-hidden='true'>"
+            + "".join(_gi_item(k, lbl) for k, lbl in items) + "</nav>")
+
+
+def course_nav(game_code, team_index, active, course_code):
+    links = ""
+    for key, label in COURSE_NAV:
+        cls = " class='active'" if key == active else ""
+        cur = " aria-current='page'" if key == active else ""
+        links += ("<a" + cls + cur + " href='" + shell_url(game_code, team_index, key) + "'>"
+                  + label + "</a>")
+    return ("<nav class='lms-course' aria-label='Course navigation'>"
+            "<div class='ch'>" + course_code + "</div>" + links + "</nav>")
+
+
+@app.route("/team/shell")
+def team_shell():
+    game_code = request.args.get("game_code", "").strip().upper()
+    team_index = request.args.get("team_index", "")
+    tab = request.args.get("tab", "home")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    ti = int(team_index)
+    if "resources" not in team:  # course not set up yet
+        return resume_screen(game_code, ti, team)
+    if tab not in dict(SHELL_TABS):
+        tab = "home"
+    cp_index = shell_cp_index(game_code)
+    # Make sure late adds exist once the game has reached CP2, so the gradebook/
+    # roster reflect them even if the team opens the shell before the CP2 decision.
+    if cp_index >= 1:
+        ensure_late_adds(team)
+
+    renderers = {
+        "home": lambda: shell_home(game_code, ti, team, cp_index),
+        "syllabus": lambda: shell_syllabus(team, cp_index),
+        "modules": lambda: shell_modules(team, cp_index),
+        "gradebook": lambda: shell_gradebook(team, cp_index),
+        "announcements": lambda: shell_announcements(team, cp_index),
+        "inbox": lambda: shell_inbox(team, cp_index),
+        "roster": lambda: shell_roster(team, cp_index),
+        "resources": lambda: shell_resources(team, cp_index),
+    }
+    course = COURSE_BY_NAME[team["course"]]
+    crumb = ("<div class='lms-crumb'><a href='" + status_url(game_code, ti) + "'>" + e(team["name"])
+             + "</a> &rsaquo; " + course["code"] + " &rsaquo; " + NAV_LABEL[tab] + "</div>")
+    h1_text = e(team["course"]) if tab == "home" else NAV_LABEL[tab]
+    title = ("<h1 class='lms-h1'>" + h1_text + "</h1>"
+             "<p class='muted' style='margin-top:-10px'>" + course["code"] + " &middot; " + course["modality"]
+             + " &middot; Checkpoint " + str(cp_index + 1) + ": " + CHECKPOINTS[cp_index] + "</p>")
+    back = ("<p class='footer'><a class='btn' href='" + status_url(game_code, ti)
+            + "'>Back to team decision screen</a> <a href='/'>Home</a></p>")
+    content = ("<main class='lms-content'>" + crumb + title + renderers[tab]() + back + "</main>")
+    body = ("<div class='lms'>" + global_rail() + course_nav(game_code, ti, tab, course["code"])
+            + content + "</div>")
+    return page(e(team["course"]) + " - " + NAV_LABEL[tab], body, screen="shell", bare=True)
+
+
+# ===========================================================================
+# FINAL: accusation, reveal, outcome, debrief
+# ===========================================================================
+# Survival thresholds (documented in GAME_RULES.md). Tuned against simulated
+# playthroughs so that: thoughtful play survives from ANY legal roster (roster
+# does not determine success), sustained poor/passive play tends to fail, and a
+# single catastrophic resource cannot be hidden by three healthy ones.
+SURVIVE_OVERALL = 58   # Overall Course Score must be at least this.
+SURVIVE_FLOOR = 30     # No single resource may be below this (weakest-link).
+
+
+def course_survives(team):
+    res = team["resources"]
+    if team["overall"] < SURVIVE_OVERALL:
+        return False
+    if min(res[n] for n in RESOURCE_NAMES) < SURVIVE_FLOOR:
+        return False
+    return True
+
+
+def final_screen(game_code, team_index, team):
+    # Require the CP5 private check to be complete before accusing.
+    if not private_complete(team, 4):
+        body = ("<div class='card'><h2>Final Stretch complete</h2>"
+                "<p>Finish the final Private Player Check before the accusation.</p></div>"
+                + private_block(game_code, team_index, team, 4))
+        return page("Final - " + team["name"], cp_header(game_code, team_index, team,4) + body + team_footer(game_code, team_index))
+
+    if team.get("accusation") is None:
+        return final_accusation_screen(game_code, team_index, team)
+    return final_outcome_screen(game_code, team_index, team)
+
+
+def final_accusation_screen(game_code, team_index, team, error_message=""):
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    options = ""
+    for i, p in enumerate(team["players"]):
+        options += "<label><input type='radio' name='accused' value='" + str(i) + "'> " + e(p) + "</label>"
+    body = ("<div class='card'><h2>Final Suspicion Report</h2>" + suspicion_report(team, 4) + "</div>"
+            "<div class='card'><h2>Final Accusation</h2>"
+            "<p>Discuss as a team, then choose the one player you believe is Thunderflunked. "
+            "Prefer consensus.</p>" + error_html +
+            "<form method='post' action='/team/accuse'>"
+            "<input type='hidden' name='game_code' value='" + game_code + "'>"
+            "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+            + options + "<p><button type='submit'>Lock In Accusation</button></p></form></div>")
+    return page("Final Accusation - " + team["name"], body + team_footer(game_code, team_index))
+
+
+@app.route("/team/accuse", methods=["POST"])
+def team_accuse():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    ti = int(team_index)
+    if not games[game_code].get("final_open"):
+        return resume_screen(game_code, ti, team)
+    if team.get("accusation") is not None:
+        return final_outcome_screen(game_code, ti, team)
+    accused = request.form.get("accused", "")
+    if not accused.isdigit() or int(accused) >= len(team["players"]):
+        return final_accusation_screen(game_code, ti, team, "Please choose one player.")
+    team["accusation"] = int(accused)
+    return final_outcome_screen(game_code, ti, team)
+
+
+def semester_recap(team):
+    cp = team.get("cp", {})
+    bits = []
+    for i in range(len(CHECKPOINTS)):
+        d = cp.get(i)
+        if d and d.get("summary"):
+            bits.append("<li><strong>CP" + str(i + 1) + " (" + CHECKPOINTS[i] + "):</strong> "
+                        + e("; ".join(d["summary"])) + "</li>")
+    return "<ul>" + "".join(bits) + "</ul>" if bits else "<p>(no decisions recorded)</p>"
+
+
+def final_outcome_screen(game_code, team_index, team):
+    survived = course_survives(team)
+    team["outcome"] = "Survived" if survived else "Did Not Survive"
+    tf_name = team["players"][team["thunderflunked"]]
+    accused_name = team["players"][team["accusation"]]
+    correct = (team["accusation"] == team["thunderflunked"])
+    missions = len(team.get("missions_complete", []))
+
+    outcome_html = ("<div class='card'><h2>Course Outcome</h2>"
+                    "<p class='big status-" + ("Normal" if survived else "Critical") + "'>"
+                    + ("SURVIVED THE SEMESTER" if survived else "DID NOT SURVIVE THE SEMESTER") + "</p>"
+                    "<p><strong>" + e(team["course"]) + "</strong></p>"
+                    "<p><strong>Final Overall Course Score: " + str(team["overall"]) + "</strong></p></div>"
+                    + resource_meters(team["resources"], team["statuses"]))
+
+    reveal_html = ("<div class='card'><h2>Thunderflunked Reveal</h2>"
+                   "<p>The Thunderflunked player was <strong>" + e(tf_name) + "</strong>.</p>"
+                   "<p>Your team accused <strong>" + e(accused_name) + "</strong> &mdash; "
+                   + ("<strong>correct.</strong>" if correct else "incorrect.") + "</p>"
+                   "<p class='muted'>Identifying Thunderflunked is a secondary achievement. It does not decide "
+                   "whether the course survived.</p>"
+                   "<p><strong>Secret Missions completed at this table:</strong> " + str(missions) + " (secondary recognition).</p></div>")
+
+    recap_html = ("<div class='card'><h2>Semester Recap</h2>" + semester_recap(team) + "</div>")
+
+    debrief_html = ("<div class='card'><h2>Debrief</h2>"
+                    "<p>Thunderflunked did not have the power to destroy your course alone.</p>"
+                    "<p>They could suggest ideas, push priorities, and create pressure.</p>"
+                    "<p>Your team's process determined which ideas became decisions.</p>"
+                    "<p><strong>Good course design is not about knowing who has the bad idea. "
+                    "It is about having a process that catches the bad idea.</strong></p></div>")
+
+    body = outcome_html + reveal_html + recap_html + debrief_html
+    return page("Course Outcome - " + team["name"], body
+                + "<p class='footer'><a href='/'>Home</a></p>")
+
+
+# ===========================================================================
+# Projector / Room Screen (public). Never leaks secret information.
+# ===========================================================================
+@app.route("/projector")
+def projector():
+    if active_code is None:
+        return page("Projector", "<div class='card'><p>No active game yet.</p></div>"
+                    + "<p class='footer'><a href='/projector'>Refresh</a></p>", "projector")
+    game = games[active_code]
+    phase = game.get("course_trading", "closed")
+    if game.get("final_open"):
+        banner = "<div class='card'><h2>Final: Accusations &amp; Outcomes</h2></div>"
+    elif phase == "not_open":
+        banner = "<div class='card'><h2>Course Assignments</h2><p>Draw one Course Card for your team.</p></div>"
+    elif phase == "open":
+        banner = ("<div class='card'><h2>Course Trading Is Open</h2>"
+                  "<p>Negotiate a one-for-one trade with another team. Both teams must agree. "
+                  "Physically exchange Course Cards.</p></div>")
+    else:
+        cp_index = game["checkpoint_index"]
+        cp_status = "OPEN" if game["checkpoint_open"] else "LOCKED"
+        banner = ("<div class='card'><h2>Checkpoint " + str(cp_index + 1) + " of " + str(len(CHECKPOINTS))
+                  + ": " + CHECKPOINTS[cp_index] + " (" + cp_status + ")</h2></div>")
+
+    teams = game["teams"]
+    scored = [t for t in teams if t.get("overall") is not None and t.get("course")]
+    if game.get("final_open"):
+        rows = ""
+        for t in scored:
+            survived = course_survives(t) if t.get("accusation") is not None else None
+            if survived is None:
+                outcome = "(finishing)"
+            else:
+                outcome = "Survived" if survived else "Did Not Survive"
+            rows += ("<tr><td>" + e(t["name"]) + "</td><td>" + e(t["course"]) + "</td><td>"
+                     + str(t["overall"]) + "</td><td>" + outcome + "</td></tr>")
+        table = ("<table><tr><th>Team</th><th>Course</th><th>Final Score</th><th>Outcome</th></tr>"
+                 + rows + "</table>") if rows else "<p>No results yet.</p>"
+    else:
+        rows = ""
+        for t in scored:
+            rows += ("<tr><td>" + e(t["name"]) + "</td><td>" + e(t["course"]) + "</td><td>"
+                     + str(t["overall"]) + "</td></tr>")
+        table = ("<table><tr><th>Team</th><th>Course</th><th>Overall Course Score</th></tr>"
+                 + rows + "</table>") if rows else "<p>No course scores yet.</p>"
+
+    body = banner + "<div class='card'>" + table + "</div><p class='footer'><a href='/projector'>Refresh</a></p>"
+    return page("Projector", body, "projector")
+
+
+# ---------------------------------------------------------------------------
+# Boot: enable persistence from the environment (DATABASE_URL) and restore any
+# previously saved game. Runs at import so it applies under gunicorn on Render
+# as well as `python app.py` locally. With no DATABASE_URL set (local dev and
+# the test suite) persistence stays off and the game runs purely in memory.
+# ---------------------------------------------------------------------------
+storage.init_from_env()
+restore_state()
+
+
+if __name__ == "__main__":
+    # Bind to all interfaces by default so each team's device and the projector
+    # can reach the facilitator's machine over the room's local network. Override
+    # with FACULTY_GAME_HOST / FACULTY_GAME_PORT if needed. Render sets PORT; we
+    # honor it as a fallback. Debug/reloader is OFF by default so the server does
+    # not restart (and wipe in-memory state) mid-session.
+    host = os.environ.get("FACULTY_GAME_HOST", "0.0.0.0")
+    port = int(os.environ.get("FACULTY_GAME_PORT", os.environ.get("PORT", "5000")))
+    debug = os.environ.get("FACULTY_GAME_DEBUG", "0") == "1"
+    app.run(host=host, port=port, debug=debug)

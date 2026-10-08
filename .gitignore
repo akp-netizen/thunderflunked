@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local database and secrets (never commit these)
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
