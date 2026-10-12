@@ -17,3 +17,9 @@ env/
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# Redesign: large physical-game artifact bundles and scratch reconciliation folder
+# (kept locally for the redesign; not tracked in git)
+Thunderflunked_Physical_Game_1_Print_and_Docs.zip
+Thunderflunked_Physical_Game_2_Card_Images_and_QA_Renders.zip
+_reconciliation_bundle/
