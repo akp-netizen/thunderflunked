@@ -948,12 +948,15 @@ def test_persistence_and_restart():
         C.check("reassignment exclusion still holds after restart A",
                 all(s not in set(teamA["dealt"]) for s in teamA["reassigned"]))
 
-        # Re-entry by Game Code + Team Name lands on the live resume screen, and
-        # the game CONTINUES from where it left off (advance to CP4 and submit).
+        # Re-entry by Game Code + Team Name resumes the game. A team already in
+        # active play now lands on the split workspace (follow the redirect).
         rejoin = text(client.post("/team/join",
-                      data={"game_code": code, "team_name": "Team Alpha"}))
+                      data={"game_code": code, "team_name": "Team Alpha"},
+                      follow_redirects=True))
         C.check("re-entry by code+name resumes the game",
                 "Team Alpha" in rejoin and "Game Code" not in rejoin)
+        C.check("active re-entry lands on the split workspace",
+                "Team Workspace" in rejoin and "ws-panes" in rejoin)
         gm_advance(client)
         gm_open(client)
         r = client.post("/team/cp4/submit", data={"game_code": code, "team_index": str(idxA),
@@ -1207,6 +1210,109 @@ def test_digital_student_placement():
                     len(t["active_roster"]) == 15 and len(set(t["active_roster"])) == 15)
             C.check("[T=%d] exclusion of all original 15 holds" % T,
                     all(s not in set(t["dealt"]) for s in t["reassigned"]))
+
+
+def test_split_workspace():
+    """Step 1 split-screen: container layout, embed chrome, mobile toggle markup,
+    privacy isolation (private breaks out of the pane), iframe navigation, form
+    submission, and the return path."""
+    print("\n=== Split workspace (Canvas + Team Workspace) ===")
+    client = fresh_client()
+    code = create_game(client)
+    names = ["Ann", "Bo", "Cy", "Di"]
+    idx = register_team(client, code, "Split", names)
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    finish_reassignment(client, code)   # placement acknowledged -> active play
+    client.post("/gm/open")             # open CP1
+    qs = {"game_code": code, "team_index": str(idx)}
+
+    # --- Container: both panes, headings, toggle, and no secrets ---------------
+    cont = text(client.get("/team/workspace", query_string=qs))
+    C.check("workspace shows both pane headings", "Canvas Classroom" in cont and "Team Workspace" in cont)
+    C.check("left pane iframes the Canvas shell (embedded)", ("/team/shell?game_code=" + code) in cont)
+    C.check("right pane iframes the status screen (embedded)", ("/team/status?game_code=" + code) in cont)
+    C.check("both iframe srcs carry embed=1", cont.count("embed=1") >= 2)
+    C.check("mobile toggle is a pure-CSS radio group (no JS required)",
+            "type='radio'" in cont and "for='v-canvas'" in cont and "for='v-work'" in cont
+            and "ws-pane" in cont and "ws-panes" in cont)
+    C.check("toggle needs no JavaScript (no script tag in the container)", "<script>" not in cont)
+    C.check("no-JS small-screen hint present", "<noscript>" in cont)
+    C.check("radiogroup is labelled for assistive tech", "role='radiogroup'" in cont and "aria-label=" in cont)
+    for secret in ["THUNDERFLUNKED", "Thunderflunked", "Secret Mission", "Suspicion", "allegiance"]:
+        C.check("container hides '%s'" % secret, secret not in cont)
+    C.check("container (and iframe URLs) never name the Thunderflunked",
+            names[team["thunderflunked"]] not in cont)
+
+    # --- Embedded workspace pane drops cross-pane chrome -----------------------
+    emb = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("embedded status hides the View Course button", "View Course" not in emb)
+    C.check("embedded status hides the Home link", "href='/'>Home" not in emb)
+    C.check("embedded status refresh keeps embed", "embed=1" in emb)
+    plain = text(client.get("/team/status", query_string=qs))
+    C.check("non-embedded status shows the split-view link", "/team/workspace" in plain)
+    C.check("non-embedded status shows the View Course button", "View Course" in plain)
+
+    # --- Item 1: the embedded pane drops the redundant NCC branding bar --------
+    C.check("embedded status omits the NCC header bar", "<header class='bar'>" not in emb)
+    C.check("non-embedded status keeps the NCC header bar", "<header class='bar'>" in plain)
+    C.check("embedded status still shows resource meters", "Course Resources" in emb)
+    C.check("embedded status still shows the role reminder panel", "Public Roles" in emb)
+    C.check("embedded status still shows checkpoint info", "Checkpoint 1" in emb)
+
+    # --- Embedded Canvas pane: no back-to-decision chrome, nav keeps embed -----
+    esh = text(client.get("/team/shell", query_string={**qs, "tab": "home", "embed": "1"}))
+    C.check("embedded shell hides the back-to-decision footer", "Back to team decision screen" not in esh)
+    C.check("embedded shell nav links keep embed", "embed=1" in esh)
+    nsh = text(client.get("/team/shell", query_string={**qs, "tab": "home"}))
+    C.check("non-embedded shell keeps the back footer", "Back to team decision screen" in nsh)
+
+    # --- Form submission stays in the pane; private pass-gate breaks OUT -------
+    client.post("/team/cp/submit",
+                data={"game_code": code, "team_index": str(idx), "cp": "0",
+                      "actions": ["clarify"], "embed": "1"})
+    cp = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("embedded checkpoint still hides View Course after submit", "View Course" not in cp)
+    C.check("private pass-gate targets _top (takes over the whole window)",
+            "action='/team/private/ready' target='_top'" in cp)
+    C.check("pass-gate itself leaks no allegiance beside Canvas",
+            "THUNDERFLUNKED" not in cp and "THUNDERSTRUCK" not in cp)
+
+    # --- Item 3 (markup level): private screens are POST-only, so they can never
+    # be an iframe src and never render inside a pane. (Real browser rendering of
+    # target=_top is NOT exercised here -- see the report's browser caveat.)
+    for route in ["/team/private/ready", "/team/private/allegiance", "/team/private/vote",
+                  "/team/private/mission/claim", "/team/sabotage/activate"]:
+        r = client.get(route, query_string=qs)
+        C.check("private route %s is POST-only (never a GET/iframe src)" % route, r.status_code == 405)
+
+    # --- Return path: after the private round, public screen offers the split --
+    run_private_check(client, code, idx, team, 0)
+    pub = text(client.get("/team/status", query_string=qs))
+    C.check("post-private public screen offers a return-to-split link", "/team/workspace" in pub)
+    C.check("post-private public screen leaks no allegiance",
+            "THUNDERFLUNKED" not in pub and "THUNDERSTRUCK" not in pub)
+
+    # --- Item 4: return to the split after private interactions, incl. refresh --
+    cont2 = text(client.get("/team/workspace", query_string=qs))
+    C.check("split workspace still renders after the private round",
+            "Team Workspace" in cont2 and "ws-panes" in cont2)
+    refreshed = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("refreshed workspace pane shows only public state (no allegiance)",
+            "You are THUNDERFLUNKED" not in refreshed and "You are THUNDERSTRUCK" not in refreshed)
+    C.check("refreshed workspace pane still omits the NCC header bar",
+            "<header class='bar'>" not in refreshed)
+
+    # --- Entry gating: setup-incomplete teams never get the split -------------
+    c2 = fresh_client()
+    code2 = create_game(c2)
+    i2 = register_team(c2, code2, "Early", ["A", "B", "C", "D"])
+    early = text(c2.get("/team/workspace", query_string={"game_code": code2, "team_index": str(i2)}))
+    C.check("workspace for a setup-incomplete team does not render the split",
+            "ws-panes" not in early)
 
 
 def test_reassignment_pool_vs_backfill():
@@ -1556,6 +1662,7 @@ def main():
     test_number_entry_selection()
     test_digital_student_placement()
     test_reassignment_pool_vs_backfill()
+    test_split_workspace()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
     test_persistence_and_restart()

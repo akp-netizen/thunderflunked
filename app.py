@@ -1072,12 +1072,15 @@ def page(title, body, screen="team", header_tag="Faculty Development Game", bare
         # No standard NCC chrome: the caller supplies its own full-viewport layout
         # (used by the Canvas-style course shell).
         return head + body + "</body></html>"
-    return (
-        head
-        + "<header class='bar'><div class='wrap'><h1>Northwest Iowa Community College</h1>"
-        "<span class='tag'>" + e(header_tag) + "</span></div></header>"
-        "<main class='wrap'>" + body + "</main></body></html>"
-    )
+    # Inside a split pane the container already shows the NCC heading and the
+    # "Team Workspace" label, so drop the redundant branding bar (keeping the
+    # content wrap and all checkpoint info, meters, roles, and controls). This
+    # never applies to standalone/legacy pages or to the full-screen private
+    # screens, which are not embedded.
+    header = ("" if _embedded() else
+              "<header class='bar'><div class='wrap'><h1>Northwest Iowa Community College</h1>"
+              "<span class='tag'>" + e(header_tag) + "</span></div></header>")
+    return head + header + "<main class='wrap'>" + body + "</main></body></html>"
 
 
 def resource_meters(scores, statuses):
@@ -1658,6 +1661,10 @@ def team_join():
     existing_index = find_team_index(game_code, team_name)
     if existing_index is not None:
         team = get_team(game_code, existing_index)
+        # A team already in active play rejoins into the split workspace; teams
+        # still in setup resume their full-page setup flow.
+        if team_setup_complete(team):
+            return redirect(workspace_url(game_code, existing_index))
         return resume_screen(game_code, existing_index, team)
 
     games[game_code]["teams"].append({"name": team_name, "players": []})
@@ -2384,14 +2391,130 @@ def team_status():
     return resume_screen(game_code, int(team_index), team)
 
 
-def status_url(game_code, team_index):
-    return "/team/status?game_code=" + game_code + "&team_index=" + str(team_index)
+def status_url(game_code, team_index, embed=False):
+    url = "/team/status?game_code=" + game_code + "&team_index=" + str(team_index)
+    return url + "&embed=1" if embed else url
+
+
+def workspace_url(game_code, team_index):
+    return "/team/workspace?game_code=" + game_code + "&team_index=" + str(team_index)
+
+
+def _embedded():
+    """True when a workspace screen is being rendered inside a /team/workspace
+    split pane (the iframes pass embed=1, and public POST forms echo it). This is
+    layout-only: it changes navigation chrome, never game logic or state."""
+    try:
+        return request.values.get("embed") == "1"
+    except RuntimeError:
+        # Called outside a request (e.g. a unit test rendering a form directly).
+        return False
+
+
+def _embed_hidden():
+    """A hidden embed field so a public POST (e.g. a checkpoint decision) keeps
+    the re-rendered screen inside its split pane. Omitted for private forms,
+    which deliberately break out to the full window."""
+    return "<input type='hidden' name='embed' value='1'>" if _embedded() else ""
+
+
+def team_setup_complete(team):
+    """True once a team is in active gameplay (where resume_screen falls through
+    to the status/checkpoint screen). Used only to decide navigation chrome."""
+    if not team.get("course"):
+        return False
+    if team.get("deal_version") == 2:
+        return bool(team.get("placement_acked"))
+    return bool(team.get("starting_roster")) and handoff_done(team)
 
 
 def team_footer(game_code, team_index):
-    return ("<p class='footer'><em>You cannot advance yourself. The Game Master controls the room.</em><br>"
-            "<a class='btn secondary' href='" + status_url(game_code, team_index) + "'>Refresh</a> "
-            "<a href='/'>Home</a></p>")
+    note = "<em>You cannot advance yourself. The Game Master controls the room.</em><br>"
+    if _embedded():
+        # Inside a split pane: refresh reloads this pane only (keep embed); the
+        # container supplies Home/navigation, so we add nothing that could load
+        # the wrong pane.
+        return ("<p class='footer'>" + note + "<a class='btn secondary' href='"
+                + status_url(game_code, team_index, embed=True) + "'>Refresh</a></p>")
+    links = "<a class='btn secondary' href='" + status_url(game_code, team_index) + "'>Refresh</a> "
+    team = get_team(game_code, team_index)
+    if team is not None and team_setup_complete(team):
+        links += ("<a class='btn' href='" + workspace_url(game_code, team_index)
+                  + "'>Split view (Canvas + Workspace)</a> ")
+    links += "<a href='/'>Home</a>"
+    return "<p class='footer'>" + note + links + "</p>"
+
+
+@app.route("/team/workspace")
+def team_workspace():
+    """Split-screen entry point for active gameplay: Canvas on the left, the team
+    decision/status screen on the right, each an iframe onto its existing route.
+    No game logic here -- purely a layout container."""
+    game_code = request.args.get("game_code", "").strip().upper()
+    team_index = request.args.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    team = get_team(game_code, ti)
+    # Setup (including its full-screen private reveals) must never be split; until
+    # a team is in active play, fall back to the normal full-page flow.
+    if not team_setup_complete(team):
+        return resume_screen(game_code, ti, team)
+    return workspace_container(game_code, ti, team)
+
+
+def workspace_container(game_code, team_index, team):
+    shell_src = e(shell_url(game_code, team_index, "home") + "&embed=1")
+    work_src = e(status_url(game_code, team_index, embed=True))
+    # The narrow-screen toggle is a pure-CSS radio group (the "checkbox hack"), so
+    # it works with JavaScript DISABLED: the radios/labels are native form
+    # controls, and :checked drives which pane is shown. On laptop/desktop widths
+    # both panes always show and the toggle is hidden.
+    css = (
+        "<style>"
+        ".ws-wrap{display:flex;flex-direction:column;height:100vh;height:100dvh;}"
+        ".ws-vradio{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);}"
+        ".ws-tabs{display:none;border-bottom:1px solid #c7cdd1;}"
+        ".ws-tabs label{flex:1;padding:12px;text-align:center;background:#edf0f2;font-weight:700;"
+        "cursor:pointer;color:#2d3b45;}"
+        "#v-canvas:checked~.ws-tabs label[for=\"v-canvas\"],"
+        "#v-work:checked~.ws-tabs label[for=\"v-work\"]{background:#fff;box-shadow:inset 0 -3px 0 var(--red);}"
+        "#v-canvas:focus-visible~.ws-tabs label[for=\"v-canvas\"],"
+        "#v-work:focus-visible~.ws-tabs label[for=\"v-work\"]{outline:2px solid var(--red);outline-offset:-2px;}"
+        ".ws-panes{display:flex;flex:1;min-height:0;}"
+        ".ws-pane{display:flex;flex-direction:column;min-width:0;min-height:0;}"
+        ".ws-canvas{flex:1.15;border-right:1px solid #c7cdd1;}"
+        ".ws-work{flex:1;}"
+        ".ws-pane>h2{margin:0;padding:9px 14px;font-size:.95rem;letter-spacing:.02em;"
+        "background:#394B58;color:#fff;}"
+        ".ws-pane>iframe{flex:1;width:100%;border:0;background:#fff;}"
+        "@media(max-width:899px){.ws-tabs{display:flex;}"
+        ".ws-pane{flex:1 1 100%;border-right:0;display:none;}"
+        "#v-canvas:checked~.ws-panes .ws-canvas{display:flex;}"
+        "#v-work:checked~.ws-panes .ws-work{display:flex;}}"
+        "</style>"
+    )
+    panes = (
+        "<div class='ws-wrap'>"
+        "<input type='radio' name='wsv' id='v-canvas' class='ws-vradio'>"
+        "<input type='radio' name='wsv' id='v-work' class='ws-vradio' checked>"
+        "<div class='ws-tabs' role='radiogroup' aria-label='Choose view: Canvas or Team Workspace'>"
+        "<label for='v-canvas'>Canvas Classroom</label>"
+        "<label for='v-work'>Team Workspace</label>"
+        "</div>"
+        "<div class='ws-panes'>"
+        "<section id='ws-canvas' class='ws-pane ws-canvas' aria-label='Canvas Classroom'>"
+        "<h2>Canvas Classroom</h2>"
+        "<iframe title='Canvas Classroom' src='" + shell_src + "'></iframe></section>"
+        "<section id='ws-work' class='ws-pane ws-work' aria-label='Team Workspace'>"
+        "<h2>Team Workspace</h2>"
+        "<iframe title='Team Workspace' src='" + work_src + "'></iframe></section>"
+        "</div></div>"
+        "<noscript><p style='padding:8px 14px;margin:0;background:#fff;color:#2d3b45'>"
+        "On a small screen, use the <strong>Canvas Classroom</strong> / <strong>Team Workspace</strong> "
+        "buttons above to switch views.</p></noscript>"
+    )
+    return page("Team Workspace - " + team["name"], css + panes, screen="shell", bare=True)
 
 
 def status_screen(game_code, team_index, team):
@@ -2922,6 +3045,9 @@ def team_placement_ack():
     team = get_team(game_code, int(team_index))
     if team.get("reassigned"):
         team["placement_acked"] = True
+    # Setup is finished: enter active gameplay through the split workspace.
+    if team_setup_complete(team):
+        return redirect(workspace_url(game_code, int(team_index)))
     return resume_screen(game_code, int(team_index), team)
 
 
@@ -3179,6 +3305,8 @@ def checkpoint_screen(game_code, team_index, team):
 
 
 def open_course_button(game_code, team_index):
+    if _embedded():
+        return ""   # Canvas is already shown in the split's left pane.
     return ("<a class='btn secondary' href='" + shell_url(game_code, team_index, "home")
             + "'>View Course (gradebook, messages, announcements)</a>")
 
@@ -3223,7 +3351,7 @@ def multiselect_form(game_code, team_index, index, error_message=""):
         "<form method='post' action='/team/cp/submit'>"
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
         "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
-        "<input type='hidden' name='cp' value='" + str(index) + "'>"
+        "<input type='hidden' name='cp' value='" + str(index) + "'>" + _embed_hidden()
         + rows + extra + "<p><button type='submit'>Submit Decision</button></p></form>"
         + script + "</div>"
     )
@@ -3599,7 +3727,7 @@ def cp4_form(game_code, team_index, team, error_message=""):
         "<div class='card'><h3>Choose your midterm response</h3>" + error_html +
         "<form method='post' action='/team/cp4/submit'>"
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
-        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>" + _embed_hidden()
         + cp4_select("priority", opts, "One priority response")
         + cp4_select("supporting", opts, "One supporting response")
         + "<p><button type='submit'>Submit Midterm Decision</button></p></form></div>"
@@ -3719,7 +3847,7 @@ def cp5_form(game_code, team_index, team, error_message=""):
         "<div class='card'><h3>Your final decision</h3>" + error_html +
         "<form method='post' action='/team/cp5/submit'>"
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
-        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>" + _embed_hidden()
         + cp5_select("protect", CP5_PROTECT, "Protect")
         + cp5_select("repair", CP5_REPAIR, "Repair")
         + cp5_select("not_add", CP5_NOT_ADD, "Intentionally do NOT add")
@@ -3868,7 +3996,10 @@ def private_block(game_code, team_index, team, cp):
         "<div class='card'><h2>" + heading + "</h2>"
         "<p>" + lead + "Pass the computer to <strong>" + e(team["players"][cur])
         + "</strong>. Everyone else should look away.</p>"
-        "<form method='post' action='/team/private/ready'>"
+        # target=_top: if we are inside the split view, the private turn takes over
+        # the WHOLE window so no allegiance/mission/vote ever renders beside Canvas.
+        # (Harmless when already full-page.)
+        "<form method='post' action='/team/private/ready' target='_top'>"
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
         "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
         "<input type='hidden' name='cp' value='" + str(cp) + "'>"
@@ -4654,11 +4785,14 @@ def global_rail():
 
 
 def course_nav(game_code, team_index, active, course_code):
+    # Keep the embed flag on in-pane Canvas navigation so tab clicks stay inside
+    # the split's left pane (and keep their cross-pane chrome suppressed).
+    suffix = "&embed=1" if _embedded() else ""
     links = ""
     for key, label in COURSE_NAV:
         cls = " class='active'" if key == active else ""
         cur = " aria-current='page'" if key == active else ""
-        links += ("<a" + cls + cur + " href='" + shell_url(game_code, team_index, key) + "'>"
+        links += ("<a" + cls + cur + " href='" + shell_url(game_code, team_index, key) + suffix + "'>"
                   + label + "</a>")
     return ("<nav class='lms-course' aria-label='Course navigation'>"
             "<div class='ch'>" + course_code + "</div>" + links + "</nav>")
@@ -4694,13 +4828,19 @@ def team_shell():
         "resources": lambda: shell_resources(team, cp_index),
     }
     course = COURSE_BY_NAME[team["course"]]
-    crumb = ("<div class='lms-crumb'><a href='" + status_url(game_code, ti) + "'>" + e(team["name"])
-             + "</a> &rsaquo; " + course["code"] + " &rsaquo; " + NAV_LABEL[tab] + "</div>")
+    embedded = _embedded()
+    # In a split pane the team name is shown by the container and the decision
+    # screen is already on the right, so suppress cross-pane nav (a link here
+    # would otherwise load the workspace into the Canvas pane).
+    crumb_team = (e(team["name"]) if embedded
+                  else "<a href='" + status_url(game_code, ti) + "'>" + e(team["name"]) + "</a>")
+    crumb = ("<div class='lms-crumb'>" + crumb_team + " &rsaquo; " + course["code"]
+             + " &rsaquo; " + NAV_LABEL[tab] + "</div>")
     h1_text = e(team["course"]) if tab == "home" else NAV_LABEL[tab]
     title = ("<h1 class='lms-h1'>" + h1_text + "</h1>"
              "<p class='muted' style='margin-top:-10px'>" + course["code"] + " &middot; " + course["modality"]
              + " &middot; Checkpoint " + str(cp_index + 1) + ": " + CHECKPOINTS[cp_index] + "</p>")
-    back = ("<p class='footer'><a class='btn' href='" + status_url(game_code, ti)
+    back = "" if embedded else ("<p class='footer'><a class='btn' href='" + status_url(game_code, ti)
             + "'>Back to team decision screen</a> <a href='/'>Home</a></p>")
     content = ("<main class='lms-content'>" + crumb + title + renderers[tab]() + back + "</main>")
     body = ("<div class='lms'>" + global_rail() + course_nav(game_code, ti, tab, course["code"])
