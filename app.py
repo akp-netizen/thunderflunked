@@ -1112,24 +1112,58 @@ def student_list_html(labels):
     return "<ul class='clean'>" + "".join("<li>" + e(s) + "</li>" for s in labels) + "</ul>"
 
 
-def student_card_html(label):
-    """A compact physical-card-style readout of one student's visible stats."""
-    info = STUDENT_INFO[label]
+def student_image_src(label):
+    """Static path to the printed Student Card art (label '#NN Name')."""
+    return "/static/art/students/student_%02d.png" % int(label[1:3])
+
+
+def student_stat_table(label):
+    """The six visible stats as a dot table (shared by all student readouts)."""
     st = STUDENT_STATS[label]
-    stats = "".join(
+    return "<table>" + "".join(
         "<tr><td>" + STAT_LABELS[k] + "</td><td>" + ("&#9679;" * st[k]) + ("&#9675;" * (5 - st[k]))
         + " <span class='muted'>(" + str(st[k]) + "/5)</span></td></tr>"
         for k in STAT_KEYS
-    )
+    ) + "</table>"
+
+
+def student_image_tag(label, width=150):
+    return ("<img src='" + student_image_src(label) + "' alt='" + e(label)
+            + " Student Card' style='width:100%;max-width:" + str(width)
+            + "px;height:auto;border-radius:8px;display:block'>")
+
+
+def student_card_html(label):
+    """A physical-card-style readout: original artwork, name, all six stats,
+    context, strengths, challenges."""
+    info = STUDENT_INFO[label]
     strengths = "".join("<li>" + e(x) + "</li>" for x in info["strengths"])
     challenges = "".join("<li>" + e(x) + "</li>" for x in info["challenges"])
     return (
         "<div class='card'><h4>" + e(label) + "</h4>"
-        "<p class='muted'>" + e(info["context"]) + "</p>"
-        "<table>" + stats + "</table>"
-        "<p><strong>Strengths:</strong></p><ul>" + strengths + "</ul>"
+        + student_image_tag(label, 150)
+        + "<p class='muted'>" + e(info["context"]) + "</p>"
+        + student_stat_table(label)
+        + "<p><strong>Strengths:</strong></p><ul>" + strengths + "</ul>"
         "<p><strong>Challenges:</strong></p><ul>" + challenges + "</ul></div>"
     )
+
+
+def student_mini_card(label, selectable=False, checked=False, badge=""):
+    """Compact art + name + six stats tile. Used for the placement grid and the
+    final-class display. `badge` (e.g. 'Retained'/'Reassigned') labels the card."""
+    num = int(label[1:3])
+    name = e(label[4:])
+    badge_html = ("<span class='pill'>" + e(badge) + "</span>") if badge else ""
+    inner = (student_image_tag(label, 130)
+             + "<p style='margin:.3em 0 .1em'><strong>#%02d</strong> " % num + name + " " + badge_html + "</p>"
+             + student_stat_table(label))
+    if selectable:
+        ck = " checked" if checked else ""
+        return ("<label class='tile student-tile'><input type='checkbox' name='students' value='"
+                + e(label) + "' data-num='" + str(num) + "'" + ck + ">"
+                "<span class='check'>Retained</span>" + inner + "</label>")
+    return "<div class='card' style='display:inline-block;vertical-align:top;max-width:220px;margin:.3em'>" + inner + "</div>"
 
 
 # ===========================================================================
@@ -1203,6 +1237,42 @@ def game_control_html(code, game):
     )
 
 
+def reassignment_control_html(code, game):
+    """GM readiness view + controls for central student reassignment (Phase 3)."""
+    teams = game.get("teams", [])
+    if not any(t.get("deal_version") == 2 for t in teams):
+        return ""   # student placement has not begun
+    rows = ""
+    for t in teams:
+        if t.get("reassigned"):
+            st = "reassignment complete"
+        elif t.get("roster_confirmed"):
+            st = "finalized (retain 10 / refer 5)"
+        elif t.get("deal_version") == 2:
+            st = "choosing"
+        else:
+            st = "earlier setup"
+        rows += "<li>" + e(t["name"]) + " &mdash; " + st + "</li>"
+    if game.get("reassignment_done"):
+        tp = sum(len(t.get("reassigned_pool", [])) for t in teams)
+        tb = sum(len(t.get("reassigned_backfill", [])) for t in teams)
+        control = ("<p class='muted'>Replacements distributed: <strong>" + str(tp)
+                   + "</strong> from the shared pool, <strong>" + str(tb)
+                   + "</strong> administrative backfill. Each team now has 15 students.</p>")
+    elif game.get("reassignment_error"):
+        control = ("<p class='err'>" + e(game["reassignment_error"]) + "</p>"
+                   "<form method='post' action='/gm/reopen_placement'>"
+                   "<button type='submit'>Reopen Placement Decisions</button></form>")
+    elif reassignment_ready(game):
+        control = ("<p>All teams are finalized. Distribute the pooled students.</p>"
+                   "<form method='post' action='/gm/reassign'>"
+                   "<button type='submit'>Distribute Replacements</button></form>")
+    else:
+        control = "<p class='muted'>Waiting for every team to finalize before replacements are distributed.</p>"
+    return ("<div class='card'><h2>Student Reassignment</h2>"
+            "<ul class='clean'>" + rows + "</ul>" + control + "</div>")
+
+
 def gm_team_block(code, game, team_i, team):
     teams = game["teams"]
     n_teams = len(teams)
@@ -1246,30 +1316,56 @@ def gm_team_block(code, game, team_i, team):
 
     out += "<p><strong>Course:</strong> " + (e(team.get("course")) if team.get("course") else "(not chosen yet)") + "</p>"
 
-    if team.get("starting_roster"):
-        out += "<p><strong>Starting Roster:</strong> " + ", ".join(e(s) for s in team["starting_roster"]) + "</p>"
-        out += "<p><strong>Rejected:</strong> " + ", ".join(e(s) for s in team.get("rejected_students", [])) + "</p>"
-    if team.get("late_adds"):
-        out += "<p><strong>Active Late Adds:</strong> " + ", ".join(e(s) for s in team["late_adds"]) + "</p>"
+    if team.get("deal_version") == 2:
+        # Digital placement (2.0).
+        if team.get("roster_confirmed"):
+            out += ("<p><strong>Retained (10):</strong> " + ", ".join(e(s) for s in team.get("starting_roster", [])) + "</p>"
+                    "<p><strong>Referred (5):</strong> " + ", ".join(e(s) for s in team.get("released", [])) + "</p>")
+            if team.get("retain_rationale"):
+                out += "<p class='muted'><strong>Rationale:</strong> " + e(team["retain_rationale"]) + "</p>"
+        if team.get("reassigned"):
+            n_pool = len(team.get("reassigned_pool", []))
+            n_back = len(team.get("reassigned_backfill", []))
+            out += ("<p><strong>Reassigned in (5):</strong> " + str(n_pool) + " from shared pool, "
+                    + str(n_back) + " administrative backfill</p>"
+                    "<p class='muted'>" + ", ".join(e(s) for s in team["reassigned"]) + "</p>"
+                    "<p><strong>Final class (15):</strong> " + ", ".join(e(s) for s in team.get("active_roster", [])) + "</p>")
+    else:
+        if team.get("starting_roster"):
+            out += "<p><strong>Starting Roster:</strong> " + ", ".join(e(s) for s in team["starting_roster"]) + "</p>"
+            out += "<p><strong>Rejected:</strong> " + ", ".join(e(s) for s in team.get("rejected_students", [])) + "</p>"
+        if team.get("late_adds"):
+            out += "<p><strong>Active Late Adds:</strong> " + ", ".join(e(s) for s in team["late_adds"]) + "</p>"
 
     if team.get("resources"):
         out += "<p><strong>Current Resources:</strong></p>" + scores_table(team["resources"], team["statuses"])
         out += "<p><strong>Overall Course Score: " + str(team["overall"]) + "</strong></p>"
 
-    # Handoff status.
-    h = team.get("handoff", {})
-    rej = ", ".join(team.get("rejected_students", [])) or "(none)"
-    if n_teams <= 1:
-        out += ("<p><strong>Rejected Handoff (single-team test mode):</strong> "
-                + ("complete" if handoff_done(team) else "not confirmed")
-                + "<br>Rejected: " + rej + "</p>")
+    # Placement/handoff status.
+    if team.get("deal_version") == 2:
+        if team.get("reassigned"):
+            place = "reassignment complete"
+        elif team.get("roster_confirmed"):
+            place = "finalized &mdash; waiting for other teams"
+        elif team.get("dealt"):
+            place = "choosing (retain 10 / refer 5)"
+        else:
+            place = "not started"
+        out += "<p><strong>Placement review:</strong> " + place + "</p>"
     else:
-        dest = teams[(team_i + 1) % n_teams]["name"]
-        src = teams[(team_i - 1) % n_teams]["name"]
-        out += ("<p><strong>Rejected Handoff:</strong><br>"
-                "Passed to " + e(dest) + ": " + ("Yes" if h.get("pass_confirmed") else "No") + "<br>"
-                "Received from " + e(src) + ": " + ("Yes" if h.get("receive_confirmed") else "No")
-                + " (" + (", ".join(h.get("received", [])) or "none") + ")</p>")
+        h = team.get("handoff", {})
+        rej = ", ".join(team.get("rejected_students", [])) or "(none)"
+        if n_teams <= 1:
+            out += ("<p><strong>Rejected Handoff (single-team test mode):</strong> "
+                    + ("complete" if handoff_done(team) else "not confirmed")
+                    + "<br>Rejected: " + rej + "</p>")
+        else:
+            dest = teams[(team_i + 1) % n_teams]["name"]
+            src = teams[(team_i - 1) % n_teams]["name"]
+            out += ("<p><strong>Rejected Handoff:</strong><br>"
+                    "Passed to " + e(dest) + ": " + ("Yes" if h.get("pass_confirmed") else "No") + "<br>"
+                    "Received from " + e(src) + ": " + ("Yes" if h.get("receive_confirmed") else "No")
+                    + " (" + (", ".join(h.get("received", [])) or "none") + ")</p>")
 
     # Checkpoint decisions.
     cp = team.get("cp", {})
@@ -1385,7 +1481,8 @@ def gm():
         game = games[active_code]
         body = ("<div class='card'><p>Active game code: <strong class='big'>" + active_code + "</strong></p></div>"
                 + pacing_panel(active_code, game)
-                + course_control_html(game) + game_control_html(active_code, game))
+                + course_control_html(game) + game_control_html(active_code, game)
+                + reassignment_control_html(active_code, game))
         teams = game["teams"]
         if teams:
             body += "<h2>Teams</h2>"
@@ -1418,6 +1515,32 @@ def gm_open():
 def gm_lock():
     if active_code is not None:
         games[active_code]["checkpoint_open"] = False
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/reassign", methods=["POST"])
+def gm_reassign():
+    """GM-triggered central reassignment (also auto-runs when the last team
+    finalizes). Idempotent: a no-op once reassignment is done."""
+    if active_code is not None:
+        attempt_reassignment(active_code)
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/reopen_placement", methods=["POST"])
+def gm_reopen_placement():
+    """Safe recovery when no valid reassignment exists: unlock every team's
+    retain/refer decision so they can release a different five. Never undoes a
+    completed distribution."""
+    if active_code is not None:
+        game = games[active_code]
+        if not game.get("reassignment_done"):
+            for t in game["teams"]:
+                if t.get("deal_version") == 2:
+                    t["roster_confirmed"] = False
+                    t.pop("retain_pending", None)
+                    t.pop("release_pending", None)
+            game["reassignment_error"] = None
     return redirect(url_for("gm"))
 
 
@@ -1581,12 +1704,21 @@ def resume_screen(game_code, team_index, team):
         if phase != "closed":
             return trade_window_screen(game_code, team_index, team)
         return course_registration_screen(game_code, team_index, team)
-    if not team.get("draft_pool"):
-        return pool_form(game_code, team_index, team)
-    if not team.get("starting_roster"):
-        return roster_form(game_code, team_index, team)
-    if not handoff_done(team):
-        return handoff_screen(game_code, team_index, team)
+    if team.get("deal_version") == 2:
+        # Thunderflunked 2.0 digital placement: auto-deal 15 -> retain 10/refer 5
+        # -> central reassignment -> final 15-student class.
+        if not team.get("roster_confirmed"):
+            return roster_decision_screen(game_code, team_index, team)
+        if not team.get("placement_acked"):
+            return reassignment_screen(game_code, team_index, team)
+    else:
+        # Legacy manual deal/draft/table-handoff flow (pre-2.0 saved games).
+        if not team.get("draft_pool"):
+            return pool_form(game_code, team_index, team)
+        if not team.get("starting_roster"):
+            return roster_form(game_code, team_index, team)
+        if not handoff_done(team):
+            return handoff_screen(game_code, team_index, team)
     if game.get("final_open"):
         return final_screen(game_code, team_index, team)
     return status_screen(game_code, team_index, team)
@@ -2064,7 +2196,10 @@ def team_course():
     if course not in COURSE_NAMES:
         return error_page("Please choose a Course Card from the list.")
     team["course"] = course
-    return pool_form(game_code, int(team_index), team)
+    # Phase 1: deal 15 immediately (in this POST, so a later refresh never
+    # redeals) and enter the digital placement flow.
+    ensure_dealt(team)
+    return resume_screen(game_code, int(team_index), team)
 
 
 # ---------------------------------------------------------------------------
@@ -2388,6 +2523,406 @@ def team_handoff_testmode():
 def received_students(team):
     """The five incoming cards (empty in single-team test mode)."""
     return team.get("handoff", {}).get("received", [])
+
+
+# ===========================================================================
+# Thunderflunked 2.0 digital student placement
+#   Phase 1  Auto-deal 15 distinct students per team (independent deals).
+#   Phase 2  Retain 10, refer 5 for reassignment, with a team rationale; lock.
+#   Phase 3  Pool every team's 5 released, then redistribute 5 to each team so
+#            that no team receives any character from its own original 15, using
+#            a randomized max-flow matching that never strands the last team.
+#   Phase 4  Final class = 10 retained + 5 reassigned = 15, scored as a whole.
+#
+# FEASIBILITY (why there is a backfill step):
+#   With 30 characters, deals of 15, and teams free to release any 5, the pooled
+#   redistribution alone is NOT always possible. Let deg(c) = number of deals
+#   containing character c. Adversarial teams can release every copy of c, and
+#   those copies can only land on the T - deg(c) teams that exclude c, so we need
+#   deg(c) <= T - deg(c), i.e. deg(c) <= floor(T/2), for every c. But the degrees
+#   sum to 15*T, so some c has deg(c) >= ceil(15*T/30) = ceil(T/2). For ODD team
+#   counts ceil(T/2) > floor(T/2): a dead-end is unavoidable no matter how deals
+#   are generated. For EVEN counts the bound is only met by a perfectly balanced
+#   design, which (a) is still not sufficient in general (a uniform T=4 design
+#   has adversarial dead-ends) and (b) cannot be built here anyway, since each
+#   team is dealt independently when it registers its course, before the final
+#   team count is known. So instead of banning the dead-end we remove its
+#   consequence: place as many pooled students as possible, then top up any
+#   shortfall from a team's un-dealt canonical pool (always >= 15 available).
+#   This keeps the exclusion rule, no in-team duplicates, no new characters, and
+#   no re-picking. A released student with nowhere valid to go simply transfers
+#   out (is not placed) rather than blocking the game.
+# ===========================================================================
+REASSIGN_COUNT = DEALT_COUNT - ROSTER_COUNT   # 5 released / 5 incoming
+
+
+def ensure_dealt(team):
+    """Phase 1: give the team 15 distinct students from the canonical 30, once.
+    Independent per team (characters may recur across teams). Idempotent: a
+    refresh never redeals because the stored deal is returned unchanged."""
+    if not team.get("dealt"):
+        team["dealt"] = random.sample(STUDENTS, DEALT_COUNT)
+        team["deal_version"] = 2
+    return team["dealt"]
+
+
+def _maxflow_reassignment(released_by_team, dealt_by_team):
+    """Phase 3 matching. Returns a list (one per team) of UP TO REASSIGN_COUNT
+    labels drawn from the shared released pool, placing as many as the exclusion
+    and no-duplicate rules allow (a MAXIMUM matching). The caller tops up any
+    team left short from that team's un-dealt canonical pool, so a live game can
+    never dead-end (see attempt_reassignment and the feasibility analysis in the
+    module header).
+
+    Every label a team gets here honors both hard rules: it is not in that team's
+    own deal, and no character is repeated within a team. Modeled as integer
+    max-flow: Source -> character (cap = #released instances) -> team (cap 1, only
+    if not in that team's deal) -> Sink (cap REASSIGN_COUNT). Neighbour order is
+    randomized so the matching (and thus any shortfall) is random, not biased to
+    the last team."""
+    T = len(released_by_team)
+    need = REASSIGN_COUNT
+    supply = {}
+    for released in released_by_team:
+        for lab in released:
+            supply[lab] = supply.get(lab, 0) + 1
+    dealt_sets = [set(d) for d in dealt_by_team]
+
+    S, K = "__S__", "__K__"
+    cap = {}
+
+    def add(u, v, c):
+        du = cap.setdefault(u, {})
+        du[v] = du.get(v, 0) + c
+        cap.setdefault(v, {}).setdefault(u, 0)
+
+    for lab, c in supply.items():
+        add(S, ("c", lab), c)
+    for i in range(T):
+        for lab in supply:
+            if lab not in dealt_sets[i]:
+                add(("c", lab), ("t", i), 1)
+        add(("t", i), K, need)
+
+    def augment():
+        parent = {S: None}
+        queue = [S]
+        while queue:
+            u = queue.pop(0)
+            nbrs = [v for v, c in cap.get(u, {}).items() if c > 0 and v not in parent]
+            random.shuffle(nbrs)
+            for v in nbrs:
+                parent[v] = u
+                if v == K:
+                    # Walk back, push 1 unit (every edge on any S->K path is >=1).
+                    node = K
+                    while parent[node] is not None:
+                        p = parent[node]
+                        cap[p][node] -= 1
+                        cap[node][p] = cap[node].get(p, 0) + 1
+                        node = p
+                    return True
+                queue.append(v)
+        return False
+
+    while augment():
+        pass
+
+    # Best-effort: whatever the maximum matching placed (each team gets 0..need).
+    assign = []
+    for i in range(T):
+        labs = [lab for lab in supply
+                if lab not in dealt_sets[i] and cap[("c", lab)].get(("t", i), 0) == 0]
+        assign.append(labs)
+    return assign
+
+
+def finalize_team_placement(team, pooled, backfill):
+    """Phase 4: build the 15-student final class and score it as a whole.
+
+    `pooled` are students reassigned from the shared rejection pool (other teams'
+    referrals); `backfill` are administrative placements from the team's un-dealt
+    canonical pool. Their order (pool first) is preserved so the final class and
+    the Canvas roster can label each student's origin. starting_roster stays the
+    10 retained (narrative cast is drawn from it); active_roster is the full 15
+    and stays visible all semester; late_adds holds the 5 reassigned so the shell
+    and CP2 intake label them as transfers (display only, never a score)."""
+    pooled = list(pooled)
+    backfill = list(backfill)
+    reassigned = pooled + backfill
+    retained = list(team["starting_roster"])
+    final_roster = retained + reassigned
+    team["reassigned"] = reassigned
+    team["reassigned_pool"] = pooled
+    team["reassigned_backfill"] = backfill
+    team["final_roster"] = final_roster
+    team["active_roster"] = list(final_roster)
+    team["late_adds"] = list(reassigned)
+
+    scores, statuses, overall = compute_scores(final_roster)
+    team["resources"] = dict(scores)
+    team["start_resources"] = dict(scores)
+    team["statuses"] = statuses
+    team["overall"] = overall
+    team["start_overall"] = overall
+
+
+def reassignment_ready(game):
+    """All teams in the game have locked their retain/release decision."""
+    teams = game.get("teams", [])
+    return bool(teams) and all(t.get("roster_confirmed") for t in teams)
+
+
+def attempt_reassignment(game_code):
+    """Phase 3 trigger. Runs once, atomically, when every team is finalized.
+    Validates feasibility before mutating any team; on failure it records a
+    safe error and leaves all state untouched (never invents students, never
+    bypasses the exclusion rule)."""
+    game = games[game_code]
+    if game.get("reassignment_done"):
+        return
+    teams = game["teams"]
+    if not reassignment_ready(game):
+        return
+
+    if len(teams) == 1:
+        # Single-team test mode: there is no other table to pool from, so the
+        # only released students are this team's own -- all excluded by the
+        # rule. We draw the 5 replacements from the canonical characters this
+        # team was NOT originally dealt (15 are available). This invents no new
+        # characters and still honors the exclusion rule.
+        t = teams[0]
+        pool = [s for s in STUDENTS if s not in set(t["dealt"])]
+        # No other table to pool from: all five are administrative placements.
+        finalize_team_placement(t, [], random.sample(pool, REASSIGN_COUNT))
+        t["reassignment_mode"] = "single_team_pool"
+        game["reassignment_done"] = True
+        game["reassignment_error"] = None
+        return
+
+    assign = _maxflow_reassignment([t["released"] for t in teams],
+                                   [t["dealt"] for t in teams])
+    # Place as many pooled students as the rules allow, then top up any team the
+    # shared pool could not fully cover from that team's un-dealt canonical pool.
+    # Because a team excludes only its own 15, at least 30-15=15 characters are
+    # always available to it, so 5 can always be reached: a live game can never
+    # dead-end. Backfill honors both hard rules (not in the team's deal; no
+    # duplicate character) and invents no new characters. See the module header
+    # analysis for why no deal-generation scheme can avoid this for odd team
+    # counts (and why even counts cannot be guaranteed in the live, independent
+    # deal flow either).
+    for t, pooled in zip(teams, assign):
+        pooled = list(pooled)
+        backfill = []
+        if len(pooled) < REASSIGN_COUNT:
+            excluded = set(t["dealt"]) | set(pooled)
+            backfill_pool = [s for s in STUDENTS if s not in excluded]
+            backfill = random.sample(backfill_pool, REASSIGN_COUNT - len(pooled))
+            t["reassignment_mode"] = "shared_pool_plus_backfill"
+        else:
+            t["reassignment_mode"] = "shared_pool"
+        finalize_team_placement(t, pooled, backfill)
+    game["reassignment_done"] = True
+    game["reassignment_error"] = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 + 2 screen: review the 15 dealt students, retain 10, refer 5.
+# ---------------------------------------------------------------------------
+def roster_decision_screen(game_code, team_index, team, error_message="",
+                           checked=None, rationale=""):
+    ensure_dealt(team)
+    dealt = team["dealt"]
+    error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
+    grid = ("<div class='tilegrid'>"
+            + "".join(student_mini_card(s, selectable=True, checked=(checked and s in checked))
+                      for s in dealt)
+            + "</div>")
+    body = (
+        "<div class='card'><h2>Placement Review &mdash; " + e(team["name"]) + "</h2>"
+        "<p>Course: <strong>" + e(team["course"]) + "</strong></p>"
+        "<p>An administrative placement review requires every team to <strong>retain "
+        + str(ROSTER_COUNT) + "</strong> of its " + str(DEALT_COUNT) + " assigned students and "
+        "<strong>refer " + str(REASSIGN_COUNT) + "</strong> for reassignment. Referred students "
+        "join a shared pool and are redistributed to other teams; you will receive "
+        + str(REASSIGN_COUNT) + " students in return.</p>" + error_html +
+        "<form method='post' action='/team/retain' id='selform'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        + selection_bar(ROSTER_COUNT)
+        + grid
+        + "<p><label>Briefly, why did your team keep these " + str(ROSTER_COUNT)
+        + " and refer the others? (team rationale)<br>"
+        "<textarea name='rationale' rows='3' style='width:100%'>" + e(rationale) + "</textarea></label></p>"
+        "<p><button type='submit'>Review Decision</button></p></form>"
+        + selection_script(ROSTER_COUNT) + "</div>")
+    return page("Placement Review - " + team["name"], body)
+
+
+def retain_confirm_screen(game_code, team_index, team, retain, release, rationale):
+    retained = "".join(student_mini_card(s, badge="Retain") for s in retain)
+    released = "".join(student_mini_card(s, badge="Refer") for s in release)
+    hidden = ("<input type='hidden' name='game_code' value='" + game_code + "'>"
+              "<input type='hidden' name='team_index' value='" + str(team_index) + "'>")
+    body = (
+        "<div class='card'><h2>Confirm Placement &mdash; " + e(team["name"]) + "</h2>"
+        "<p>Review carefully. <strong>After you confirm, this decision locks.</strong></p>"
+        "<h3>Retain (" + str(len(retain)) + ")</h3><div style='text-align:center'>" + retained + "</div>"
+        "<h3>Refer for reassignment (" + str(len(release)) + ")</h3>"
+        "<div style='text-align:center'>" + released + "</div>"
+        "<p><strong>Your rationale:</strong> " + e(rationale) + "</p>"
+        "<form method='post' action='/team/retain/confirm' style='display:inline'>" + hidden
+        + "<button type='submit'>Confirm &amp; Lock</button></form> "
+        "<form method='post' action='/team/retain/edit' style='display:inline'>" + hidden
+        + "<button class='secondary' type='submit'>Go Back</button></form></div>")
+    return page("Confirm Placement - " + team["name"], body)
+
+
+@app.route("/team/retain", methods=["POST"])
+def team_retain():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if team.get("roster_confirmed"):
+        return resume_screen(game_code, int(team_index), team)
+    dealt = team.get("dealt", [])
+    selected = selected_from_form(dealt)
+    rationale = request.form.get("rationale", "").strip()
+    if len(selected) != ROSTER_COUNT:
+        return roster_decision_screen(game_code, int(team_index), team,
+                                      "Please retain exactly " + str(ROSTER_COUNT) + ". You have "
+                                      + str(len(selected)) + ".", set(selected), rationale)
+    if not rationale:
+        return roster_decision_screen(game_code, int(team_index), team,
+                                      "Please add a brief rationale for your decision.",
+                                      set(selected), rationale)
+    retain = [s for s in dealt if s in selected]
+    release = [s for s in dealt if s not in selected]
+    # Hold the proposed decision until explicit confirmation (not yet locked).
+    team["retain_pending"] = retain
+    team["release_pending"] = release
+    team["retain_rationale"] = rationale
+    return retain_confirm_screen(game_code, int(team_index), team, retain, release, rationale)
+
+
+@app.route("/team/retain/edit", methods=["POST"])
+def team_retain_edit():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if team.get("roster_confirmed"):
+        return resume_screen(game_code, int(team_index), team)
+    return roster_decision_screen(game_code, int(team_index), team,
+                                  checked=set(team.get("retain_pending", [])),
+                                  rationale=team.get("retain_rationale", ""))
+
+
+@app.route("/team/retain/confirm", methods=["POST"])
+def team_retain_confirm():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if team.get("roster_confirmed"):
+        return resume_screen(game_code, int(team_index), team)
+    retain = team.get("retain_pending")
+    release = team.get("release_pending")
+    if not retain or not release or len(retain) != ROSTER_COUNT or len(release) != REASSIGN_COUNT:
+        # Nothing valid to confirm; send them back to choose.
+        return roster_decision_screen(game_code, int(team_index), team)
+    team["starting_roster"] = list(retain)
+    team["released"] = list(release)
+    team["rejected_students"] = list(release)   # legacy field kept in sync
+    team["roster_confirmed"] = True
+    # Distribution is a deliberate GM action (the GM confirms every team has both
+    # joined AND finalized before pooling), so we do not auto-run it here. See
+    # /gm/reassign and the GM "Student Reassignment" readiness panel.
+    return resume_screen(game_code, int(team_index), team)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3/4 screen: waiting for all teams, then the final 15-student class.
+# ---------------------------------------------------------------------------
+def reassignment_screen(game_code, team_index, team):
+    game = games[game_code]
+    teams = game["teams"]
+    refresh = team_footer(game_code, team_index)
+
+    if not team.get("reassigned"):
+        ready = sum(1 for t in teams if t.get("roster_confirmed"))
+        total = len(teams)
+        if game.get("reassignment_error"):
+            body = ("<div class='card'><h2>Reassignment Paused</h2>"
+                    "<p class='err'>" + e(game["reassignment_error"]) + "</p>"
+                    "<p class='muted'>No students were moved. Please wait for the Game Master.</p></div>")
+        else:
+            body = ("<div class='card'><h2>Placement Locked &mdash; Awaiting Reassignment</h2>"
+                    "<p>Your retain/refer decision is locked. Replacements are distributed once "
+                    "<strong>all</strong> teams have finalized.</p>"
+                    "<p class='muted'>" + str(ready) + " of " + str(total)
+                    + " teams finalized.</p></div>")
+        return page("Reassignment - " + team["name"], body + refresh)
+
+    # Reassigned: show the final 15-student class with clear labels.
+    retained = team["starting_roster"]
+    reassigned = team["reassigned"]
+    note = ""
+    if team.get("reassignment_mode") == "single_team_pool":
+        note = ("<p class='muted'>Single-team practice game: with no other table to pool from, your "
+                + str(REASSIGN_COUNT) + " replacements were drawn from canonical students you were not "
+                "originally dealt. No student your team had was returned to you.</p>")
+    elif team.get("reassignment_mode") == "shared_pool_plus_backfill":
+        note = ("<p class='muted'>Some replacements came from the pool of students other teams referred; "
+                "the rest were assigned from students you had not worked with, because no remaining "
+                "referred student could join you without repeating a character already in your class. "
+                "No student from your original 15 was returned to you.</p>")
+    pool_in = team.get("reassigned_pool", [])
+    backfill_in = team.get("reassigned_backfill", [])
+    cards_ret = "".join(student_mini_card(s, badge="Retained") for s in retained)
+    pool_section = ""
+    if pool_in:
+        pool_section = ("<h3>Reassigned from the shared pool (" + str(len(pool_in)) + ")</h3>"
+                        "<div style='text-align:center'>"
+                        + "".join(student_mini_card(s, badge="Shared pool") for s in pool_in)
+                        + "</div>")
+    backfill_section = ""
+    if backfill_in:
+        backfill_section = ("<h3>Administrative placement (" + str(len(backfill_in)) + ")</h3>"
+                            "<p class='muted'>Students you had not worked with, placed because the "
+                            "shared pool could not supply an eligible match.</p>"
+                            "<div style='text-align:center'>"
+                            + "".join(student_mini_card(s, badge="Administrative") for s in backfill_in)
+                            + "</div>")
+    body = (
+        "<div class='card'><h2>Your Final Class (" + str(len(retained) + len(reassigned)) + ") &mdash; "
+        + e(team["name"]) + "</h2>" + note
+        + "<h3>Retained (" + str(len(retained)) + ")</h3>"
+        "<div style='text-align:center'>" + cards_ret + "</div>"
+        + pool_section + backfill_section + "</div>"
+        + resource_meters(team["resources"], team["statuses"])
+        + "<div class='card'><p><strong>Overall Course Score: " + str(team["overall"]) + "</strong></p>"
+        "<form method='post' action='/team/placement/ack'>"
+        "<input type='hidden' name='game_code' value='" + game_code + "'>"
+        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+        "<button type='submit'>Continue</button></form></div>")
+    return page("Final Class - " + team["name"], body)
+
+
+@app.route("/team/placement/ack", methods=["POST"])
+def team_placement_ack():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if team.get("reassigned"):
+        team["placement_acked"] = True
+    return resume_screen(game_code, int(team_index), team)
 
 
 # ===========================================================================

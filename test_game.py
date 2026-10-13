@@ -102,10 +102,27 @@ def register_course(client, code, idx, course_name):
 
 
 def deal_and_draft(client, code, idx, dealt_labels, roster_labels):
-    client.post("/team/pool", data={"game_code": code, "team_index": str(idx),
-                                     "students": dealt_labels})
-    client.post("/team/roster", data={"game_code": code, "team_index": str(idx),
-                                       "students": roster_labels})
+    """Thunderflunked 2.0 placement. Overrides the automatic 15-student deal with
+    the given labels (for deterministic, feasible test setups), retains the given
+    10, refers the other 5, and confirms (locking the decision). Central
+    reassignment auto-runs once every team in the game has confirmed."""
+    team = game.get_team(code, idx)
+    team["dealt"] = list(dealt_labels)
+    team["deal_version"] = 2
+    client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
+                                      "students": list(roster_labels),
+                                      "rationale": "strongest fit for the course"})
+    client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
+
+
+def finish_reassignment(client, code):
+    """Trigger the GM-controlled central reassignment (distributes once every
+    team has finalized), then acknowledge each team's final 15-student class."""
+    client.post("/gm/reassign", data={})
+    for i, t in enumerate(game.games[code]["teams"]):
+        if t.get("reassigned") and not t.get("placement_acked"):
+            client.post("/team/placement/ack",
+                        data={"game_code": code, "team_index": str(i)})
 
 
 def run_private_check(client, code, idx, team, cp, claim_missions=False,
@@ -233,31 +250,29 @@ def test_full_two_team_game():
     C.check("course registered A after close", teamA["course"] == game.COURSE_NAMES[0])
     C.check("course registered B after close", teamB["course"] == game.COURSE_NAMES[5])
 
-    # Deal 15 / draft 10 for each. Use the full first-15 and first-10.
+    # Phases 1-4: deal 15 / retain 10 / refer 5, then central reassignment into a
+    # 15-student final class. Disjoint deals keep the exclusion rule satisfiable
+    # (A and B must swap their referred fives).
     dealtA = game.STUDENTS[:15]
     rosterA = dealtA[:10]
     deal_and_draft(client, code, idxA, dealtA, rosterA)
-    dealtB = game.STUDENTS[10:25]
+    dealtB = game.STUDENTS[15:30]
     rosterB = dealtB[:10]
     deal_and_draft(client, code, idxB, dealtB, rosterB)
-    C.check("roster A is 10", len(teamA["starting_roster"]) == 10)
-    C.check("rejected A is 5", len(teamA["rejected_students"]) == 5)
-    C.check("roster B is 10", len(teamB["starting_roster"]) == 10)
-    C.check("starting resources floored >=40 A",
+    finish_reassignment(client, code)
+    C.check("retained A is 10", len(teamA["starting_roster"]) == 10)
+    C.check("referred A is 5", len(teamA["released"]) == 5)
+    C.check("final class A is 15", len(teamA["active_roster"]) == 15)
+    C.check("final class A has no duplicate characters", len(set(teamA["active_roster"])) == 15)
+    C.check("A was reassigned none of its own original 15",
+            all(s not in set(dealtA) for s in teamA["reassigned"]))
+    C.check("A received B's referred five", set(teamA["reassigned"]) == set(teamB["released"]))
+    C.check("B received A's referred five", set(teamB["reassigned"]) == set(teamA["released"]))
+    C.check("starting resources (scored on 15) floored >=40 A",
             all(teamA["resources"][n] >= 40 for n in game.RESOURCE_NAMES))
     C.check("starting resources floored >=40 B",
             all(teamB["resources"][n] >= 40 for n in game.RESOURCE_NAMES))
     startA = dict(teamA["resources"])
-
-    # Handoff (circular: A passes to B, B passes to A for 2 teams).
-    client.post("/team/handoff/pass", data={"game_code": code, "team_index": str(idxA)})
-    client.post("/team/handoff/pass", data={"game_code": code, "team_index": str(idxB)})
-    client.post("/team/handoff/receive", data={"game_code": code, "team_index": str(idxA)})
-    client.post("/team/handoff/receive", data={"game_code": code, "team_index": str(idxB)})
-    C.check("handoff done A", game.handoff_done(teamA))
-    C.check("handoff done B", game.handoff_done(teamB))
-    C.check("A received B's rejected", teamA["handoff"]["received"] == teamB["rejected_students"])
-    C.check("handoff did not change starting resources", teamA["resources"] == startA)
 
     # ---- CP1 ----
     gm_open(client)
@@ -284,8 +299,9 @@ def test_full_two_team_game():
     gm_open(client)
     cp2A = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idxA)}))
     C.check("CP2 shows New Student Intake", "New Student Intake" in cp2A)
-    C.check("late adds 2-4 A", 2 <= len(teamA["late_adds"]) <= 4)
-    C.check("late adds come from received A", all(s in teamA["handoff"]["received"] for s in teamA["late_adds"]))
+    C.check("CP2 late adds are the 5 reassigned students A", teamA["late_adds"] == teamA["reassigned"])
+    C.check("CP2 late adds excluded from original deal A",
+            all(s not in set(dealtA) for s in teamA["late_adds"]))
     # Late adds themselves cause no immediate movement (only the decision does).
     client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idxA),
                                          "cp": "1", "actions": ["start_here", "pathway"]})
@@ -425,11 +441,20 @@ def test_single_team_mode():
     client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[4])  # async online
     deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
-    # Handoff test mode.
-    hs = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
-    C.check("single-team handoff test-mode notice", "Test mode" in hs)
-    client.post("/team/handoff/testmode", data={"game_code": code, "team_index": str(idx)})
-    C.check("handoff done (test mode)", game.handoff_done(team))
+    # Before the GM distributes, the team waits.
+    waiting = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
+    C.check("single-team awaits reassignment", "Awaiting Reassignment" in waiting)
+    # GM distributes: with no other table to pool from, replacements are drawn
+    # from canonical students this team was not dealt (exclusion still honored;
+    # no new characters invented).
+    client.post("/gm/reassign", data={})
+    final = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
+    C.check("single-team reassignment note shown", "Single-team practice game" in final)
+    finish_reassignment(client, code)
+    C.check("single-team reassigned exactly 5", len(team["reassigned"]) == 5)
+    C.check("single-team final class is 15", len(team["active_roster"]) == 15)
+    C.check("single-team reassigned excluded from its own deal",
+            all(s not in set(team["dealt"]) for s in team["reassigned"]))
 
     # CP2 late adds must still work with no received cards (fallback).
     client.post("/gm/open")  # CP1
@@ -439,8 +464,8 @@ def test_single_team_mode():
     client.post("/gm/lock"); client.post("/gm/advance")
     client.post("/gm/open")  # CP2
     client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)})
-    C.check("single-team late adds fallback 2-3", 2 <= len(team["late_adds"]) <= 3)
-    C.check("late adds not in starting roster", all(s not in team["starting_roster"] for s in team["late_adds"]))
+    C.check("single-team late adds are the 5 reassigned", team["late_adds"] == team["reassigned"])
+    C.check("late adds not in retained roster", all(s not in team["starting_roster"] for s in team["late_adds"]))
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +506,13 @@ def test_invalid_submissions():
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[0])
 
-    # Wrong pool count.
-    r = text(client.post("/team/pool", data={"game_code": code, "team_index": str(idx),
-                                             "students": game.STUDENTS[:10]}))
-    C.check("pool rejects wrong count", "exactly 15" in r)
-    C.check("pool not set after invalid", team.get("draft_pool") is None)
+    # Wrong retain count (digital placement flow).
+    team["dealt"] = game.STUDENTS[:15]
+    team["deal_version"] = 2
+    r = text(client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
+                                               "students": game.STUDENTS[:8], "rationale": "x"}))
+    C.check("retain rejects wrong count", "retain exactly 10" in r)
+    C.check("retain not locked after invalid", not team.get("roster_confirmed"))
 
     # Bad game code join.
     bad = text(client.post("/team/join", data={"game_code": "ZZZZZ", "team_name": "X"}))
@@ -500,11 +527,10 @@ def test_invalid_submissions():
                                              "player_3": "C", "player_4": "D"}))
     C.check("empty player name rejected", "required" in r2)
 
-    # Valid pool then invalid roster count.
-    client.post("/team/pool", data={"game_code": code, "team_index": str(idx), "students": game.STUDENTS[:15]})
-    r3 = text(client.post("/team/roster", data={"game_code": code, "team_index": str(idx),
-                                               "students": game.STUDENTS[:12]}))
-    C.check("roster rejects wrong count", "exactly 10" in r3)
+    # Missing rationale on the placement decision.
+    r3 = text(client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
+                                               "students": game.STUDENTS[:10]}))
+    C.check("retain requires a rationale", "rationale" in r3)
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +594,7 @@ def test_private_flow_browser_fidelity():
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[0])
     deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
-    client.post("/team/handoff/testmode", data={"game_code": code, "team_index": str(idx)})
+    finish_reassignment(client, code)
     client.post("/gm/open")
     client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idx), "cp": "0", "actions": ["clarify"]})
     base = {"game_code": code, "team_index": str(idx), "cp": "0"}
@@ -617,16 +643,16 @@ def test_number_entry_selection():
     assign_roles(client, code, idx, team)
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[0])
-    # Deal via the numbers box only (no 'students' checkboxes) using a range + list.
-    client.post("/team/pool", data={"game_code": code, "team_index": str(idx),
-                                    "numbers": "1-10 11 12 13 14 15"})
-    C.check("number-entry deal recorded 15", len(team.get("draft_pool", [])) == 15)
-    C.check("number-entry deal is #01..#15", team["draft_pool"] == game.STUDENTS[:15])
-    # Draft via numbers box only.
-    client.post("/team/roster", data={"game_code": code, "team_index": str(idx),
-                                      "numbers": "1,2,3,4,5,6,7,8,9,10"})
-    C.check("number-entry roster recorded 10", len(team.get("starting_roster", [])) == 10)
-    # Mixing checkbox + numbers unions without duplicates.
+    # Deal is automatic; pin it for determinism, then retain via the numbers box.
+    team["dealt"] = game.STUDENTS[:15]
+    team["deal_version"] = 2
+    client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
+                                      "numbers": "1-5 6 7 8 9 10", "rationale": "nums"})
+    C.check("number-entry retain recorded 10", len(team.get("retain_pending", [])) == 10)
+    C.check("number-entry retain is #01..#10", team["retain_pending"] == game.STUDENTS[:10])
+    client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
+    C.check("confirmed retained roster is #01..#10", team["starting_roster"] == game.STUDENTS[:10])
+    # Mixing checkbox + numbers unions to exactly 10 without duplicates.
     client2 = fresh_client()
     code2 = create_game(client2)
     i2 = register_team(client2, code2, "Mix", ["A", "B", "C", "D"])
@@ -634,9 +660,12 @@ def test_number_entry_selection():
     assign_roles(client2, code2, i2, t2)
     client2.post("/gm/course/open"); client2.post("/gm/course/close")
     register_course(client2, code2, i2, game.COURSE_NAMES[0])
-    client2.post("/team/pool", data={"game_code": code2, "team_index": str(i2),
-                                     "students": game.STUDENTS[:8], "numbers": "8 9 10 11 12 13 14 15"})
-    C.check("union dedups overlap to 15", len(t2.get("draft_pool", [])) == 15)
+    t2["dealt"] = game.STUDENTS[:15]
+    t2["deal_version"] = 2
+    client2.post("/team/retain", data={"game_code": code2, "team_index": str(i2),
+                                       "students": game.STUDENTS[:5], "numbers": "5 6 7 8 9 10",
+                                       "rationale": "mix"})
+    C.check("union dedups overlap to 10", len(t2.get("retain_pending", [])) == 10)
 
 
 def test_course_shell():
@@ -649,7 +678,7 @@ def test_course_shell():
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[5])  # async online (alignment-relevant)
     deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
-    client.post("/team/handoff/testmode", data={"game_code": code, "team_index": str(idx)})
+    finish_reassignment(client, code)
 
     tabs = [t[0] for t in game.SHELL_TABS]
     # Every tab renders at every checkpoint, start to finish, with no secret leaks.
@@ -823,11 +852,8 @@ def _build_midgame(client):
     register_course(client, code, idxA, game.COURSE_NAMES[0])
     register_course(client, code, idxB, game.COURSE_NAMES[5])
     deal_and_draft(client, code, idxA, game.STUDENTS[:15], game.STUDENTS[:10])
-    deal_and_draft(client, code, idxB, game.STUDENTS[10:25], game.STUDENTS[10:20])
-    for i in (idxA, idxB):
-        client.post("/team/handoff/pass", data={"game_code": code, "team_index": str(i)})
-    for i in (idxA, idxB):
-        client.post("/team/handoff/receive", data={"game_code": code, "team_index": str(i)})
+    deal_and_draft(client, code, idxB, game.STUDENTS[15:30], game.STUDENTS[15:25])
+    finish_reassignment(client, code)
     # CP1
     gm_open(client)
     client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idxA),
@@ -916,6 +942,11 @@ def test_persistence_and_restart():
         C.check("sabotage-used flag preserved B", teamB["sabotage"]["used"] is True)
         C.check("missions preserved A", len(teamA["missions_complete"]) >= 1)
         C.check("votes preserved A", len(game.private_round(teamA, 2)["votes"]) == 4)
+        # Digital placement state survives a restart intact.
+        C.check("reassigned 5 preserved A", len(teamA["reassigned"]) == 5)
+        C.check("final 15-student class preserved A", len(teamA["active_roster"]) == 15)
+        C.check("reassignment exclusion still holds after restart A",
+                all(s not in set(teamA["dealt"]) for s in teamA["reassigned"]))
 
         # Re-entry by Game Code + Team Name lands on the live resume screen, and
         # the game CONTINUES from where it left off (advance to CP4 and submit).
@@ -999,6 +1030,251 @@ def test_gm_open_without_password():
     C.check("health check works", client.get("/healthz").status_code == 200)
 
 
+def _setup_to_course(client, code, name, players, course_i=0):
+    """Register a team and advance it to just-after course registration (which
+    auto-deals 15 students). Returns (idx, team)."""
+    idx = register_team(client, code, name, players)
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    return idx, team
+
+
+def _retain_confirm(client, code, idx, dealt, retain):
+    """Override the deal for determinism, then retain/refer/confirm."""
+    team = game.get_team(code, idx)
+    team["dealt"] = list(dealt)
+    team["deal_version"] = 2
+    client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
+                                      "students": list(retain), "rationale": "fit"})
+    client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
+
+
+def test_digital_student_placement():
+    """Thunderflunked 2.0 automatic deal + central constrained reassignment:
+    auto-deal, independent deals, refresh persistence, retain 10 / refer 5,
+    confirmation lock, multi-team reassignment with full exclusion and no final
+    duplicates, single-team special case, infeasibility safe-reporting, atomic
+    idempotence, and the various supported player counts."""
+    print("\n=== Digital student placement + reassignment ===")
+    S = game.STUDENTS
+
+    def status(client, code, idx):
+        return text(client.get("/team/status",
+                    query_string={"game_code": code, "team_index": str(idx)}))
+
+    # --- Phase 1: automatic deal of 15 distinct, shown with art + stats --------
+    client = fresh_client()
+    code = create_game(client)
+    idx, team = _setup_to_course(client, code, "Deal", ["A", "B", "C", "D"])
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    C.check("auto-deal is 15", len(team.get("dealt", [])) == 15)
+    C.check("auto-deal is distinct", len(set(team["dealt"])) == 15)
+    C.check("auto-deal from canonical 30", all(s in S for s in team["dealt"]))
+    screen = status(client, code, idx)
+    C.check("placement screen shows student artwork", "/static/art/students/student_" in screen)
+    C.check("placement screen shows stats", "/5)" in screen)
+
+    # --- Phase 1: refresh never redeals ---------------------------------------
+    before = list(team["dealt"])
+    status(client, code, idx); status(client, code, idx)
+    C.check("refresh does not redeal", team["dealt"] == before)
+
+    # --- Phase 2: independent deals (characters may recur across teams) --------
+    multi = fresh_client()
+    mcode = create_game(multi)
+    deals = []
+    for k in range(3):
+        mi, mt = _setup_to_course(multi, mcode, "Ind%d" % k, ["A", "B", "C", "D"])
+        multi.post("/gm/course/open"); multi.post("/gm/course/close")
+        register_course(multi, mcode, mi, game.COURSE_NAMES[0])
+        deals.append(list(mt["dealt"]))
+    C.check("each team's deal is a valid 15-subset", all(len(set(d)) == 15 for d in deals))
+    all_dealt = [s for d in deals for s in d]
+    C.check("characters recur across independent deals", len(set(all_dealt)) < len(all_dealt))
+
+    # --- Phases 2-4: 3-team reassignment with full exclusion, no final dups ---
+    # Cyclic blocks of 5 make the exclusion rule satisfiable with a forced swap.
+    client = fresh_client()
+    code = create_game(client)
+    specs = [
+        ("T0", S[0:15],            S[0:10]),             # release S[10:15]
+        ("T1", S[10:25],           S[10:20]),            # release S[20:25]
+        ("T2", S[20:30] + S[0:5],  S[20:30]),            # release S[0:5]
+    ]
+    idxs = []
+    for nm, dealt, retain in specs:
+        i, _ = _setup_to_course(client, code, nm, ["A", "B", "C", "D"])
+        client.post("/gm/course/open"); client.post("/gm/course/close")
+        register_course(client, code, i, game.COURSE_NAMES[0])
+        _retain_confirm(client, code, i, dealt, retain)
+        idxs.append(i)
+    teams = [game.get_team(code, i) for i in idxs]
+    finish_reassignment(client, code)
+    for n, t in enumerate(teams):
+        C.check("[T%d] retained 10" % n, len(t["starting_roster"]) == 10)
+        C.check("[T%d] reassigned 5" % n, len(t["reassigned"]) == 5)
+        C.check("[T%d] final class 15" % n, len(t["active_roster"]) == 15)
+        C.check("[T%d] no duplicate characters in final class" % n, len(set(t["active_roster"])) == 15)
+        C.check("[T%d] reassigned excludes ALL original 15 (incl. released)" % n,
+                all(s not in set(t["dealt"]) for s in t["reassigned"]))
+        C.check("[T%d] final = retained + reassigned" % n,
+                set(t["active_roster"]) == set(t["starting_roster"]) | set(t["reassigned"]))
+        C.check("[T%d] resources scored on 15, floored >=40" % n,
+                all(t["resources"][nm] >= 40 for nm in game.RESOURCE_NAMES))
+    # Every released instance was placed exactly once (supply == demand).
+    released_pool = sorted(s for t in teams for s in t["released"])
+    reassigned_all = sorted(s for t in teams for s in t["reassigned"])
+    C.check("every released student was placed", released_pool == reassigned_all)
+
+    # --- Atomic + idempotent: re-running distribution changes nothing ----------
+    snap = [list(t["reassigned"]) for t in teams]
+    client.post("/gm/reassign", data={})
+    C.check("reassignment is idempotent", [list(t["reassigned"]) for t in teams] == snap)
+    # Refresh persistence of the final class.
+    status(client, code, idxs[0])
+    C.check("final class stable across refresh", teams[0]["reassigned"] == snap[0])
+
+    # --- Confirmation lock: a locked team cannot silently re-pick --------------
+    locked = teams[0]
+    before_lock = list(locked["starting_roster"])
+    client.post("/team/retain", data={"game_code": code, "team_index": str(idxs[0]),
+                                      "students": locked["dealt"][:10], "rationale": "x"})
+    C.check("locked placement is not editable", locked["starting_roster"] == before_lock)
+
+    # --- Single-team special case: 5 from un-dealt canonical, exclusion honored -
+    for n in (4, 5, 6):
+        solo = fresh_client()
+        scode = create_game(solo)
+        si, st = _setup_to_course(solo, scode, "Solo%d" % n, ["P%d" % j for j in range(n)])
+        solo.post("/gm/course/open"); solo.post("/gm/course/close")
+        register_course(solo, scode, si, game.COURSE_NAMES[0])
+        _retain_confirm(solo, scode, si, S[0:15], S[0:10])
+        finish_reassignment(solo, scode)
+        C.check("[solo n=%d] final class 15" % n, len(st["active_roster"]) == 15)
+        C.check("[solo n=%d] reassigned 5 from un-dealt" % n,
+                len(st["reassigned"]) == 5 and all(s not in set(st["dealt"]) for s in st["reassigned"]))
+        C.check("[solo n=%d] invented no new characters" % n, all(s in S for s in st["reassigned"]))
+
+    # --- No dead end when the shared pool cannot cover a team (backfill) -------
+    # Two identical deals releasing the same five: nothing in the pool is legal
+    # for either team, so every replacement is backfilled from un-dealt canonical
+    # students. The game still completes, and both hard rules still hold.
+    bad = fresh_client()
+    bcode = create_game(bad)
+    bidx = []
+    for nm in ("X0", "X1"):
+        i, _ = _setup_to_course(bad, bcode, nm, ["A", "B", "C", "D"])
+        bad.post("/gm/course/open"); bad.post("/gm/course/close")
+        register_course(bad, bcode, i, game.COURSE_NAMES[0])
+        _retain_confirm(bad, bcode, i, S[0:15], S[0:10])   # identical deals + releases
+        bidx.append(i)
+    bad.post("/gm/reassign", data={})
+    bteams = [game.get_team(bcode, i) for i in bidx]
+    C.check("backfill: reassignment completed (no dead end)", game.games[bcode].get("reassignment_done"))
+    C.check("backfill: no error state", not game.games[bcode].get("reassignment_error"))
+    for n, t in enumerate(bteams):
+        C.check("[backfill X%d] got exactly 5" % n, len(t.get("reassigned", [])) == 5)
+        C.check("[backfill X%d] final class 15, no duplicates" % n,
+                len(t["active_roster"]) == 15 and len(set(t["active_roster"])) == 15)
+        C.check("[backfill X%d] none from own original 15" % n,
+                all(s not in set(t["dealt"]) for s in t["reassigned"]))
+        C.check("[backfill X%d] used the backfill path" % n,
+                t.get("reassignment_mode") == "shared_pool_plus_backfill")
+
+    # --- Guaranteed no dead end for 2..6 teams on real (random) deals ----------
+    # Covers odd team counts (3, 5), which are provably impossible to guarantee
+    # by deal design alone; backfill removes the dead end regardless.
+    for T in (2, 3, 4, 5, 6):
+        cl = fresh_client()
+        cc = create_game(cl)
+        ids = [_setup_to_course(cl, cc, "N%d_%d" % (T, k), ["A", "B", "C", "D"])[0]
+               for k in range(T)]
+        cl.post("/gm/course/open"); cl.post("/gm/course/close")
+        for i in ids:
+            register_course(cl, cc, i, game.COURSE_NAMES[0])
+            tt = game.get_team(cc, i)
+            cl.post("/team/retain", data={"game_code": cc, "team_index": str(i),
+                                          "students": tt["dealt"][:10], "rationale": "auto"})
+            cl.post("/team/retain/confirm", data={"game_code": cc, "team_index": str(i)})
+        cl.post("/gm/reassign", data={})
+        C.check("[T=%d] reassignment completed (no dead end)" % T,
+                game.games[cc].get("reassignment_done"))
+        for i in ids:
+            t = game.get_team(cc, i)
+            C.check("[T=%d] team received exactly 5" % T, len(t["reassigned"]) == 5)
+            C.check("[T=%d] final class is 15 distinct" % T,
+                    len(t["active_roster"]) == 15 and len(set(t["active_roster"])) == 15)
+            C.check("[T=%d] exclusion of all original 15 holds" % T,
+                    all(s not in set(t["dealt"]) for s in t["reassigned"]))
+
+
+def test_reassignment_pool_vs_backfill():
+    """Pool-first maximization, backfill correctness, per-student origin labels
+    with privacy, GM summary counts, and 15 students in the Canvas roster."""
+    print("\n=== Reassignment: pool vs. administrative backfill ===")
+    S = game.STUDENTS
+    client = fresh_client()
+    code = create_game(client)
+    iA, _ = _setup_to_course(client, code, "Alpha", ["A", "B", "C", "D"])
+    iB, _ = _setup_to_course(client, code, "Bravo", ["A", "B", "C", "D"])
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, iA, game.COURSE_NAMES[0])
+    register_course(client, code, iB, game.COURSE_NAMES[0])
+    # Deals chosen so the pool can cover Alpha fully but Bravo not at all:
+    #   Alpha deal S[0:15], refers S[10:15]  (lands nowhere: in both deals)
+    #   Bravo deal S[5:20], refers S[15:20]  (eligible for Alpha, excluded for Bravo)
+    _retain_confirm(client, code, iA, S[0:15], S[0:10])
+    _retain_confirm(client, code, iB, S[5:20], S[5:15])
+    client.post("/gm/reassign", data={})
+    tA = game.get_team(code, iA)
+    tB = game.get_team(code, iB)
+
+    # Req 1: pool placements are maximized before backfill. Only 5 of the 10
+    # referred students are placeable at all (Alpha's referrals sit in both
+    # deals), and all 5 go to Alpha from the shared pool.
+    C.check("Alpha filled entirely from shared pool",
+            set(tA["reassigned_pool"]) == set(S[15:20]) and tA["reassigned_backfill"] == [])
+    C.check("Alpha mode is shared_pool", tA["reassignment_mode"] == "shared_pool")
+    C.check("Bravo got nothing placeable from the pool", tB["reassigned_pool"] == [])
+    C.check("pool placement is maximized (5 of 10 referred are placeable)",
+            len(tA["reassigned_pool"]) + len(tB["reassigned_pool"]) == 5)
+
+    # Req 2: backfill is canonical, excludes the team's own 15, no final duplicates.
+    C.check("Bravo backfilled exactly 5", len(tB["reassigned_backfill"]) == 5)
+    C.check("Bravo backfill uses only canonical students", all(s in S for s in tB["reassigned_backfill"]))
+    C.check("Bravo backfill excludes its own original 15",
+            all(s not in set(tB["dealt"]) for s in tB["reassigned_backfill"]))
+    C.check("Bravo final class is 15 distinct", len(set(tB["active_roster"])) == 15)
+    C.check("Bravo mode is shared_pool_plus_backfill",
+            tB["reassignment_mode"] == "shared_pool_plus_backfill")
+
+    # Req 3: the final class distinguishes origin, without naming the source team.
+    scrA = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}))
+    C.check("Alpha final class labels shared-pool arrivals", "Shared pool" in scrA)
+    C.check("Alpha final class does not expose the source team", "Bravo" not in scrA)
+    scrB = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iB)}))
+    C.check("Bravo final class labels administrative placements", "Administrative" in scrB)
+    C.check("Bravo final class does not expose any source team", "Alpha" not in scrB)
+
+    # Req 4: GM sees a simple pool-vs-backfill summary without managing anything.
+    dash = text(client.get("/gm"))
+    C.check("GM per-team split: Alpha 5 pool / 0 backfill", "5 from shared pool, 0 administrative" in dash)
+    C.check("GM per-team split: Bravo 0 pool / 5 backfill", "0 from shared pool, 5 administrative" in dash)
+    C.check("GM game-level distribution total shown", "Replacements distributed:" in dash)
+
+    # Req 5: all 15 students appear in the final class and the Canvas roster.
+    C.check("Alpha final class is 15", len(tA["active_roster"]) == 15)
+    finish_reassignment(client, code)   # acknowledge both teams
+    client.post("/gm/open")             # open CP1 so the shell is reachable
+    roster = text(client.get("/team/shell",
+                  query_string={"game_code": code, "team_index": str(iA), "tab": "roster"}))
+    C.check("Canvas roster shows all 15 of Alpha's final class",
+            all(s in roster for s in tA["active_roster"]))
+    C.check("Canvas roster marks the 5 reassigned students",
+            roster.count("late add") == 5 or roster.lower().count("reassign") >= 1)
+
+
 def test_gm_reset_reveal():
     """GM-only per-player reset of 'allegiance seen': authorization, scoped reset,
     privacy, mid-game recovery via the same pass-the-computer flow, and
@@ -1019,7 +1295,7 @@ def test_gm_reset_reveal():
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[0])
     deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
-    client.post("/team/handoff/testmode", data={"game_code": code, "team_index": str(idx)})
+    finish_reassignment(client, code)
     client.post("/gm/open")
     C.check("precondition: all players viewed after setup", len(team["allegiance_seen"]) == 4)
     C.check("precondition: team is in play (not on reveal)", "Private Allegiance" not in status(client, code, idx))
@@ -1259,7 +1535,7 @@ def test_digital_setup():
     client.post("/gm/course/open"); client.post("/gm/course/close")
     register_course(client, code, idx, game.COURSE_NAMES[0])
     deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
-    client.post("/team/handoff/testmode", data=base)
+    finish_reassignment(client, code)
     client.post("/gm/open")
     work = status(client, code, idx)
     C.check("workspace shows roles panel", "Your Table's Public Roles" in work)
@@ -1278,6 +1554,8 @@ def main():
     test_private_flow_browser_fidelity()
     test_digital_setup()
     test_number_entry_selection()
+    test_digital_student_placement()
+    test_reassignment_pool_vs_backfill()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
     test_persistence_and_restart()
