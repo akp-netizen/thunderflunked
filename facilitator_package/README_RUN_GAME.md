@@ -111,7 +111,7 @@ is case-insensitive).
 | "That game code was not found" | The code is wrong, or the server was restarted (which wipes games). Create a new game and share the new code. |
 | A team's screen looks stale | Press the **Refresh** button on their screen. The app does not auto-update. |
 | A checkpoint won't open for teams | On `/gm`, make sure you clicked **Open Checkpoint**. Teams only see content while the checkpoint is OPEN. |
-| A team can't register their course | Course registration is blocked until you **Close Course Trading** on the GM screen. |
+| A team's course won't lock | Courses lock automatically when you **Close Course Selection** on the GM screen; until then teams are still reviewing/trading. |
 | A team is stuck waiting at handoff | The team they receive from must click **Cards Passed** first. Check handoff status on the GM screen. |
 | Accidentally created an extra game | The most recently created game is the active one. Just create one more clean game and use that code. |
 | Server restarted mid-game | In-memory state is gone. This cannot be recovered; start a new game. Avoid `FACULTY_GAME_DEBUG=1` during live play, which auto-restarts on file changes. |

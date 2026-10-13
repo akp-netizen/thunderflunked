@@ -939,7 +939,7 @@ SABOTAGE_WINDOW = {2, 3}
 # sabotage-only) targeting ~60 min. Used only for the GM's on-screen pacing
 # panel; it does not affect gameplay.
 PACING = [
-    ("setup", "Setup / roles / trading / draft / handoff", 0, 12),
+    ("setup", "Setup / roles / course selection / student placement", 0, 12),
     ("cp1", "Checkpoint 1: First Week (+ full private)", 12, 21),
     ("cp2", "Checkpoint 2: Early Semester (no private)", 21, 28),
     ("cp3", "Checkpoint 3: First Major Assessment (+ full private)", 28, 39),
@@ -1055,6 +1055,32 @@ ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 #selcount.count-ok{color:var(--good);} #selcount.count-no{color:var(--warn);}
 .selbar label{display:inline;}
 .selbar input[type=text]{width:220px;max-width:60vw;}
+/* Artwork-based Student Card tiles (the card art carries name + all six stats) */
+.cardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin:14px 0;}
+.student-tile{padding:6px;display:block;}
+.student-tile img,.scard img{width:100%;height:auto;display:block;border-radius:8px;}
+.student-tile img{transition:opacity .12s;opacity:.9;}
+.student-tile:has(input:checked) img{opacity:1;}
+.student-tile .check{top:12px;left:12px;right:auto;font-size:.85rem;padding:3px 10px;}
+.scard{position:relative;border:1px solid var(--line);border-radius:10px;padding:6px;background:#fff;}
+.scard-badge{position:absolute;top:10px;left:10px;background:var(--red);color:#fff;font-weight:700;}
+/* Persistent selection counter for the placement screen */
+.selcount-bar{position:sticky;top:0;z-index:5;background:var(--card);border:2px solid var(--line);
+  border-radius:10px;padding:12px 16px;margin:12px 0;font-size:1.15rem;font-weight:700;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+.selcount-bar.ok{border-color:var(--good);background:#eef7f1;}
+.selcount-bar .n{color:var(--warn);}
+.selcount-bar.ok .n{color:var(--good);}
+/* Course Cards + trading (fully in-app) */
+.course-art{max-width:340px;width:100%;height:auto;display:block;border-radius:10px;margin:8px auto;}
+.course-art.sm{max-width:180px;margin:6px 0;}
+.trade-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;border:1px solid var(--line);
+  border-radius:10px;padding:12px;margin:10px 0;background:#fff;}
+.trade-row img{flex:0 0 auto;}
+.trade-row .tr-body{flex:1;min-width:180px;}
+.trade-row form{display:inline;}
+.offer-in{border-left:5px solid var(--good);}
+.offer-wait{border-left:5px solid var(--warn);}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -1166,6 +1192,19 @@ def student_image_tag(label, width=150):
             + "px;height:auto;border-radius:8px;display:block'>")
 
 
+def course_image_src(course_name):
+    """Static path to the original Course Card art for a canonical course. The two
+    printed copies (course_<CODE>_1.png / _2.png) are identical, so the digital
+    card always uses copy 1. Course code 'BIOL 215' -> 'course_BIOL215_1.png'."""
+    code = COURSE_BY_NAME[course_name]["code"].replace(" ", "")
+    return "/static/art/courses/course_" + code + "_1.png"
+
+
+def course_image_tag(course_name, cls="course-art"):
+    return ("<img src='" + course_image_src(course_name) + "' alt='" + e(course_name)
+            + " Course Card' class='" + cls + "' loading='lazy'>")
+
+
 def student_card_html(label):
     """A physical-card-style readout: original artwork, name, all six stats,
     context, strengths, challenges."""
@@ -1183,20 +1222,23 @@ def student_card_html(label):
 
 
 def student_mini_card(label, selectable=False, checked=False, badge=""):
-    """Compact art + name + six stats tile. Used for the placement grid and the
-    final-class display. `badge` (e.g. 'Retained'/'Reassigned') labels the card."""
+    """Compact Student-Card tile built from the original card artwork, which
+    already prints the student's name, number, and all six stats legibly -- so we
+    never repeat a stat table beside it. `badge` (e.g. 'Retained'/'Refer') labels
+    the card's game state; when `selectable`, the whole card is a keyboard- and
+    tap-accessible checkbox with a visible selected state and checkmark."""
     num = int(label[1:3])
-    name = e(label[4:])
-    badge_html = ("<span class='pill'>" + e(badge) + "</span>") if badge else ""
-    inner = (student_image_tag(label, 130)
-             + "<p style='margin:.3em 0 .1em'><strong>#%02d</strong> " % num + name + " " + badge_html + "</p>"
-             + student_stat_table(label))
+    alt = e(label) + " Student Card (shows name, number, and all six stats)"
+    img = ("<img src='" + student_image_src(label) + "' alt='" + alt
+           + "' loading='lazy'>")
     if selectable:
         ck = " checked" if checked else ""
         return ("<label class='tile student-tile'><input type='checkbox' name='students' value='"
                 + e(label) + "' data-num='" + str(num) + "'" + ck + ">"
-                "<span class='check'>Retained</span>" + inner + "</label>")
-    return "<div class='card' style='display:inline-block;vertical-align:top;max-width:220px;margin:.3em'>" + inner + "</div>"
+                "<span class='check' aria-hidden='true'>&#10003; Selected</span>"
+                + img + "</label>")
+    badge_html = ("<span class='pill scard-badge'>" + e(badge) + "</span>") if badge else ""
+    return "<div class='scard'>" + img + badge_html + "</div>"
 
 
 # ===========================================================================
@@ -1220,12 +1262,16 @@ def home():
 def course_control_html(game):
     phase = game.get("course_trading", "closed")
     if phase == "not_open":
-        return ("<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: NOT OPEN</strong></p>"
-                "<form method='post' action='/gm/course/open'><button type='submit'>Open Course Trading</button></form></div>")
+        return ("<div class='card'><h2>Course Selection</h2><p><strong>COURSE SELECTION: NOT OPEN</strong></p>"
+                "<p class='muted'>Opening deals each team a Course Card and lets teams propose one-for-one "
+                "trades on their own screens.</p>"
+                "<form method='post' action='/gm/course/open'><button type='submit'>Open Course Selection</button></form></div>")
     if phase == "open":
-        return ("<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: OPEN</strong></p>"
-                "<form method='post' action='/gm/course/close'><button type='submit'>Close Course Trading</button></form></div>")
-    return "<div class='card'><h2>Course Trading</h2><p><strong>COURSE TRADING: CLOSED</strong></p></div>"
+        return ("<div class='card'><h2>Course Selection</h2><p><strong>COURSE SELECTION: OPEN</strong></p>"
+                "<p class='muted'>Teams may trade one-for-one in the app. Closing locks each team's held "
+                "course and begins student placement.</p>"
+                "<form method='post' action='/gm/course/close'><button type='submit'>Close Course Selection</button></form></div>")
+    return "<div class='card'><h2>Course Selection</h2><p><strong>COURSE SELECTION: CLOSED</strong></p></div>"
 
 
 def game_control_html(code, game):
@@ -1347,15 +1393,23 @@ def gm_team_block(code, game, team_i, team):
                 "acknowledged without reading. They will privately view it again on the team device; "
                 "no allegiance or role changes.</p><ul class='clean'>" + items + "</ul>")
 
-    out += "<p><strong>Course:</strong> " + (e(team.get("course")) if team.get("course") else "(not chosen yet)") + "</p>"
+    if team.get("course"):
+        out += "<p><strong>Course:</strong> " + e(team["course"]) + " <span class='muted'>(locked)</span></p>"
+    elif team.get("course_held"):
+        phase = game.get("course_trading", "closed")
+        tag = "held, selection open" if phase == "open" else "dealt"
+        out += "<p><strong>Course:</strong> " + e(team["course_held"]) + " <span class='muted'>(" + tag + ")</span></p>"
+        pend = [o for o in game.get("course_offers", []) if team_i in (o["frm"], o["to"])]
+        if pend:
+            out += "<p class='muted'>Pending trade offers: " + str(len(pend)) + "</p>"
+    else:
+        out += "<p><strong>Course:</strong> (not dealt yet)</p>"
 
     if team.get("deal_version") == 2:
         # Digital placement (2.0).
         if team.get("roster_confirmed"):
             out += ("<p><strong>Retained (10):</strong> " + ", ".join(e(s) for s in team.get("starting_roster", [])) + "</p>"
                     "<p><strong>Referred (5):</strong> " + ", ".join(e(s) for s in team.get("released", [])) + "</p>")
-            if team.get("retain_rationale"):
-                out += "<p class='muted'><strong>Rationale:</strong> " + e(team["retain_rationale"]) + "</p>"
         if team.get("reassigned"):
             n_pool = len(team.get("reassigned_pool", []))
             n_back = len(team.get("reassigned_backfill", []))
@@ -1629,14 +1683,25 @@ def gm_final():
 @app.route("/gm/course/open", methods=["POST"])
 def gm_course_open():
     if active_code is not None and games[active_code].get("course_trading") == "not_open":
-        games[active_code]["course_trading"] = "open"
+        game = games[active_code]
+        game["course_trading"] = "open"
+        # Deal every team its Course Card now, so the GM and teams can see all
+        # holdings and trading can begin. Idempotent; late joiners deal on view.
+        for t in game["teams"]:
+            ensure_course_dealt(game, t)
     return redirect(url_for("gm"))
 
 
 @app.route("/gm/course/close", methods=["POST"])
 def gm_course_close():
     if active_code is not None and games[active_code].get("course_trading") == "open":
-        games[active_code]["course_trading"] = "closed"
+        game = games[active_code]
+        game["course_trading"] = "closed"
+        # Lock each team's held course as its course for the semester and enter
+        # the digital student-placement flow. Pending trade offers are void.
+        game["course_offers"] = []
+        for t in game["teams"]:
+            lock_team_course(game, t)
     return redirect(url_for("gm"))
 
 
@@ -1737,10 +1802,7 @@ def resume_screen(game_code, team_index, team):
     elif not team.get("assignments"):
         return role_form(game_code, team_index, team)
     if not team.get("course"):
-        phase = game.get("course_trading", "closed")
-        if phase != "closed":
-            return trade_window_screen(game_code, team_index, team)
-        return course_registration_screen(game_code, team_index, team)
+        return course_trade_screen(game_code, team_index, team)
     if team.get("deal_version") == 2:
         # Thunderflunked 2.0 digital placement: auto-deal 15 -> retain 10/refer 5
         # -> central reassignment -> final 15-student class.
@@ -2170,73 +2232,238 @@ def team_roles_panel(team):
 
 
 # ---------------------------------------------------------------------------
-# Course trading / registration
+# Digital Course Cards: deal, one-for-one trade, and lock-on-close.
+#
+# A faithful digital version of the original paper flow. Each team is dealt one
+# Course Card from a deck of the 10 canonical courses with two copies each (so
+# two teams can hold the same course, exactly as the printed deck allowed). While
+# the GM has course selection OPEN, any two teams may swap their held courses
+# one-for-one -- but only if BOTH agree: one team proposes, the other accepts.
+# When the GM CLOSES selection, every team's held course locks in as its course
+# for the semester (see gm_course_close). The software now records the deal and
+# every trade end to end; nothing is drawn, exchanged, or registered on paper.
 # ---------------------------------------------------------------------------
-def course_form(game_code, team_index, team):
-    options = "<option value=''>-- choose your Course Card --</option>"
-    for c in COURSE_NAMES:
-        options += "<option value='" + e(c) + "'>" + e(c) + "</option>"
-    return (
-        "<div class='card'><h3>Register your Course Card</h3>"
-        "<p>Select the course that matches the physical Course Card now in front of your team.</p>"
-        "<form method='post' action='/team/course'>"
-        "<input type='hidden' name='game_code' value='" + game_code + "'>"
-        "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
-        "<select name='course'>" + options + "</select> "
-        "<button type='submit'>Save Course</button></form></div>"
-    )
+def ensure_course_dealt(game, team):
+    """Deal this team one Course Card from the shared deck (10 courses x 2 copies),
+    once. Idempotent: a refresh never re-deals. If the deck is somehow exhausted
+    (more than 20 teams), fall back to a random course so a live game never
+    dead-ends."""
+    if team.get("course_held"):
+        return team["course_held"]
+    deck = game.get("course_deck")
+    if deck is None:
+        deck = [c["name"] for c in COURSES] * 2
+        random.shuffle(deck)
+        game["course_deck"] = deck
+    team["course_held"] = deck.pop() if deck else random.choice(COURSE_NAMES)
+    return team["course_held"]
 
 
-def trade_window_screen(game_code, team_index, team):
-    phase = games[game_code].get("course_trading", "closed")
-    refresh = ("<p class='footer'><a class='btn secondary' href='" + status_url(game_code, team_index)
-               + "'>Refresh</a> <a href='/'>Home</a></p>")
-    if phase == "open":
-        body = (
-            "<div class='card'><h2>Course Trading Is Open</h2>"
-            "<p>You may negotiate a one-for-one Course Card trade with another team. Both teams must agree.</p>"
-            "<p>You may inspect Course Cards before agreeing. The software does not track trades &mdash; "
-            "exchange the physical cards.</p>"
-            "<p>Keep the Course Card your team will teach in front of you. Do not register your course yet.</p>"
-            "<p class='muted'>Waiting for the Game Master to close Course Trading.</p></div>"
-        )
+def lock_team_course(game, team):
+    """Lock a team's held course as its course for the semester and enter the
+    digital student-placement flow. Idempotent."""
+    if team.get("course"):
+        return
+    team["course"] = ensure_course_dealt(game, team)
+    ensure_dealt(team)
+
+
+def _course_offers(game):
+    return game.setdefault("course_offers", [])
+
+
+def _cancel_offers_touching(game, *indices):
+    idx = set(indices)
+    game["course_offers"] = [o for o in _course_offers(game)
+                             if o["frm"] not in idx and o["to"] not in idx]
+
+
+def _course_hidden(game_code, team_index, name, value):
+    return ("<input type='hidden' name='game_code' value='" + game_code + "'>"
+            "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+            "<input type='hidden' name='" + name + "' value='" + e(str(value)) + "'>")
+
+
+def course_card_block(course_name, cls="course-art"):
+    c = COURSE_BY_NAME[course_name]
+    return (course_image_tag(course_name, cls)
+            + "<p class='center'><strong>" + e(course_name) + "</strong> &mdash; "
+            + e(c["code"]) + " &middot; " + e(c["modality"]) + "</p>")
+
+
+def course_trade_screen(game_code, team_index, team):
+    """The whole digital course-selection/trading experience on one screen:
+    shows the team's dealt Course Card, a clear waiting state when selection is
+    not open or already closed, and -- while open -- one-for-one trade controls
+    with explicit 'your move' / 'waiting on them' states."""
+    game = games[game_code]
+    phase = game.get("course_trading", "closed")
+
+    # Selection already closed: lock whatever this team holds and move on. Normal
+    # games lock every team at close; this covers a team that arrives afterward.
+    if phase == "closed":
+        lock_team_course(game, team)
+        return resume_screen(game_code, team_index, team)
+
+    ensure_course_dealt(game, team)
+    refresh = team_footer(game_code, team_index)
+    your_card = ("<div class='card'><h2>Your Course</h2>"
+                 + course_card_block(team["course_held"]) + "</div>")
+
+    if phase == "not_open":
+        body = (your_card
+                + "<div class='card'><p>This is the course your team has been dealt. Review it while "
+                "you wait.</p>"
+                "<p class='muted'>Course selection has not opened yet. When the Game Master opens it, "
+                "you will be able to propose a one-for-one trade with another team.</p></div>")
+        return page("Your Course - " + team["name"], body + refresh)
+
+    # phase == "open": trade controls.
+    teams = game["teams"]
+    offers = _course_offers(game)
+    my_outgoing = next((o for o in offers if o["frm"] == team_index), None)
+    incoming = [o for o in offers if o["to"] == team_index]
+    sections = [your_card]
+
+    # Incoming offers to respond to (your move).
+    if incoming:
+        rows = ""
+        for o in incoming:
+            frm = teams[o["frm"]]
+            rows += (
+                "<div class='trade-row offer-in'>"
+                + course_image_tag(frm["course_held"], "course-art sm")
+                + "<div class='tr-body'><p><strong>" + e(frm["name"]) + "</strong> offers their "
+                "<strong>" + e(frm["course_held"]) + "</strong> for your <strong>"
+                + e(team["course_held"]) + "</strong>.</p>"
+                "<form method='post' action='/team/course/accept'>"
+                + _course_hidden(game_code, team_index, "offer_id", o["id"])
+                + "<button type='submit'>Accept trade</button></form> "
+                "<form method='post' action='/team/course/decline'>"
+                + _course_hidden(game_code, team_index, "offer_id", o["id"])
+                + "<button class='secondary' type='submit'>Decline</button></form></div></div>")
+        sections.append("<div class='card'><h3>Trade offers for you</h3>"
+                        "<p class='muted'>Your move: accept to swap courses, or decline.</p>"
+                        + rows + "</div>")
+
+    # Your own outgoing offer (waiting on them) OR the list of teams to offer to.
+    if my_outgoing is not None:
+        dest = teams[my_outgoing["to"]]
+        sections.append(
+            "<div class='card'><h3>Trade proposed</h3>"
+            "<div class='trade-row offer-wait'>"
+            + course_image_tag(dest["course_held"], "course-art sm")
+            + "<div class='tr-body'><p>You offered your <strong>" + e(team["course_held"])
+            + "</strong> for <strong>" + e(dest["name"]) + "</strong>'s <strong>"
+            + e(dest["course_held"]) + "</strong>.</p>"
+            "<p class='muted'>Waiting for " + e(dest["name"]) + " to accept or decline.</p>"
+            "<form method='post' action='/team/course/cancel'>"
+            + _course_hidden(game_code, team_index, "offer_id", my_outgoing["id"])
+            + "<button class='secondary' type='submit'>Cancel offer</button></form></div></div></div>")
     else:
-        body = (
-            "<div class='card'><h2>Course Assignment</h2>"
-            "<p>Draw one physical Course Card for your team.</p>"
-            "<p>Course trading has not opened yet. Keep the card your team drew in front of you.</p>"
-            "<p class='muted'>Waiting for the Game Master to open Course Trading.</p></div>"
-        )
-    return page("Course Trading - " + team["name"], body + refresh)
+        others = [(i, t) for i, t in enumerate(teams) if i != team_index and t.get("course_held")]
+        if others:
+            rows = ""
+            for i, t in others:
+                rows += (
+                    "<div class='trade-row'>"
+                    + course_image_tag(t["course_held"], "course-art sm")
+                    + "<div class='tr-body'><p><strong>" + e(t["name"]) + "</strong> &mdash; "
+                    + e(t["course_held"]) + "</p>"
+                    "<form method='post' action='/team/course/propose'>"
+                    + _course_hidden(game_code, team_index, "target", i)
+                    + "<button type='submit'>Propose trade</button></form></div></div>")
+            sections.append("<div class='card'><h3>Trade with another team</h3>"
+                            "<p>Propose a one-for-one swap. The other team must accept for the trade "
+                            "to happen. You can only have one offer out at a time.</p>" + rows + "</div>")
+        else:
+            sections.append("<div class='card'><h3>Trade with another team</h3>"
+                            "<p class='muted'>No other team has a course yet. You can keep the course "
+                            "you were dealt.</p></div>")
+
+    sections.append("<div class='card'><p class='muted'>Course selection is open. When the Game Master "
+                    "closes it, the course you currently hold becomes your course for the semester.</p></div>")
+    return page("Course Selection - " + team["name"], "".join(sections) + refresh)
 
 
-def course_registration_screen(game_code, team_index, team):
-    body = ("<div class='card'><h2>Trading Closed</h2>"
-            "<p>The Course Card now in front of your team is your course for the semester.</p></div>"
-            + course_form(game_code, team_index, team))
-    return page("Register Course - " + team["name"], body)
-
-
-@app.route("/team/course", methods=["POST"])
-def team_course():
+@app.route("/team/course/propose", methods=["POST"])
+def team_course_propose():
     game_code = request.form.get("game_code", "").strip().upper()
     team_index = request.form.get("team_index", "")
-    course = request.form.get("course", "")
+    target = request.form.get("target", "")
     if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
         return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    game = games[game_code]
+    team = get_team(game_code, ti)
+    teams = game["teams"]
+    if (game.get("course_trading") == "open" and not team.get("course")
+            and target.isdigit()):
+        tj = int(target)
+        if (0 <= tj < len(teams) and tj != ti
+                and teams[tj].get("course_held") and team.get("course_held")):
+            offers = _course_offers(game)
+            # One outgoing offer at a time: replace any prior offer from this team.
+            offers[:] = [o for o in offers if o["frm"] != ti]
+            oid = game.get("offer_seq", 0) + 1
+            game["offer_seq"] = oid
+            offers.append({"id": oid, "frm": ti, "to": tj})
+    return resume_screen(game_code, ti, team)
 
-    team = get_team(game_code, int(team_index))
-    if not team.get("course"):
-        phase = games[game_code].get("course_trading", "closed")
-        if phase != "closed":
-            return trade_window_screen(game_code, int(team_index), team)
-    if course not in COURSE_NAMES:
-        return error_page("Please choose a Course Card from the list.")
-    team["course"] = course
-    # Phase 1: deal 15 immediately (in this POST, so a later refresh never
-    # redeals) and enter the digital placement flow.
-    ensure_dealt(team)
-    return resume_screen(game_code, int(team_index), team)
+
+@app.route("/team/course/accept", methods=["POST"])
+def team_course_accept():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    offer_id = request.form.get("offer_id", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    game = games[game_code]
+    team = get_team(game_code, ti)
+    if game.get("course_trading") == "open" and offer_id.isdigit():
+        o = next((x for x in _course_offers(game)
+                  if x["id"] == int(offer_id) and x["to"] == ti), None)
+        if o is not None:
+            a, b = o["frm"], ti
+            teams = game["teams"]
+            teams[a]["course_held"], teams[b]["course_held"] = (
+                teams[b]["course_held"], teams[a]["course_held"])
+            # Both teams' holdings changed; any offer touching either is now stale.
+            _cancel_offers_touching(game, a, b)
+    return resume_screen(game_code, ti, team)
+
+
+@app.route("/team/course/decline", methods=["POST"])
+def team_course_decline():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    offer_id = request.form.get("offer_id", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    game = games[game_code]
+    team = get_team(game_code, ti)
+    if offer_id.isdigit():
+        game["course_offers"] = [x for x in _course_offers(game)
+                                 if not (x["id"] == int(offer_id) and x["to"] == ti)]
+    return resume_screen(game_code, ti, team)
+
+
+@app.route("/team/course/cancel", methods=["POST"])
+def team_course_cancel():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    offer_id = request.form.get("offer_id", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    game = games[game_code]
+    team = get_team(game_code, ti)
+    if offer_id.isdigit():
+        game["course_offers"] = [x for x in _course_offers(game)
+                                 if not (x["id"] == int(offer_id) and x["frm"] == ti)]
+    return resume_screen(game_code, ti, team)
 
 
 # ---------------------------------------------------------------------------
@@ -2682,7 +2909,7 @@ def received_students(team):
 # ===========================================================================
 # Thunderflunked 2.0 digital student placement
 #   Phase 1  Auto-deal 15 distinct students per team (independent deals).
-#   Phase 2  Retain 10, refer 5 for reassignment, with a team rationale; lock.
+#   Phase 2  Keep 10, refer 5 for reassignment (tap/click to select); lock.
 #   Phase 3  Pool every team's 5 released, then redistribute 5 to each team so
 #            that no team receives any character from its own original 15, using
 #            a randomized max-flow matching that never strands the last team.
@@ -2883,52 +3110,82 @@ def attempt_reassignment(game_code):
 # ---------------------------------------------------------------------------
 # Phase 1 + 2 screen: review the 15 dealt students, retain 10, refer 5.
 # ---------------------------------------------------------------------------
+def placement_count_bar(target):
+    """A persistent, high-visibility 'X of N students selected' counter. Live JS
+    is progressive enhancement only -- with JavaScript off the server still
+    validates the exact count on submit."""
+    return ("<div class='selcount-bar' id='selcount-bar'>"
+            "<span><span class='n' id='selcount-n'>0</span> of " + str(target)
+            + " students selected</span>"
+            "<span class='muted' style='font-size:.85rem;font-weight:400'>"
+            "Tap or click a card to keep that student; the other "
+            + str(DEALT_COUNT - target) + " are referred automatically. "
+            "Keyboard: Tab to a card, then Space to toggle.</span></div>")
+
+
+def placement_select_script(target):
+    """Live counter + double-submit guard. The submit button is enabled only once
+    exactly `target` cards are selected and is disabled on submit so a double tap
+    cannot send the decision twice. All optional -- selection itself is native
+    checkbox behavior that needs no JavaScript."""
+    return (
+        "<script>(function(){var f=document.getElementById('selform');if(!f)return;"
+        "var t=" + str(target) + ";var boxes=f.querySelectorAll('input[name=\"students\"]');"
+        "var n=document.getElementById('selcount-n');var bar=document.getElementById('selcount-bar');"
+        "var btn=document.getElementById('placement-submit');"
+        "function up(){var c=0;boxes.forEach(function(b){if(b.checked)c++;});"
+        "if(n)n.textContent=c;if(bar)bar.className='selcount-bar'+(c===t?' ok':'');"
+        "if(btn)btn.disabled=(c!==t);}"
+        "boxes.forEach(function(b){b.addEventListener('change',up);});up();"
+        "f.addEventListener('submit',function(){if(btn){btn.disabled=true;btn.textContent='Saving\\u2026';}});"
+        "})();</script>")
+
+
 def roster_decision_screen(game_code, team_index, team, error_message="",
-                           checked=None, rationale=""):
+                           checked=None):
     ensure_dealt(team)
     dealt = team["dealt"]
     error_html = "<p class='err'>" + e(error_message) + "</p>" if error_message else ""
-    grid = ("<div class='tilegrid'>"
-            + "".join(student_mini_card(s, selectable=True, checked=(checked and s in checked))
+    grid = ("<div class='cardgrid'>"
+            + "".join(student_mini_card(s, selectable=True, checked=bool(checked and s in checked))
                       for s in dealt)
             + "</div>")
     body = (
         "<div class='card'><h2>Placement Review &mdash; " + e(team["name"]) + "</h2>"
         "<p>Course: <strong>" + e(team["course"]) + "</strong></p>"
-        "<p>An administrative placement review requires every team to <strong>retain "
-        + str(ROSTER_COUNT) + "</strong> of its " + str(DEALT_COUNT) + " assigned students and "
-        "<strong>refer " + str(REASSIGN_COUNT) + "</strong> for reassignment. Referred students "
-        "join a shared pool and are redistributed to other teams; you will receive "
+        "<p>You were dealt <strong>" + str(DEALT_COUNT) + "</strong> students. Keep exactly "
+        "<strong>" + str(ROSTER_COUNT) + "</strong> &mdash; the other <strong>"
+        + str(REASSIGN_COUNT) + "</strong> are automatically referred for reassignment. Referred "
+        "students join a shared pool and are redistributed to other teams; you will receive "
         + str(REASSIGN_COUNT) + " students in return.</p>" + error_html +
         "<form method='post' action='/team/retain' id='selform'>"
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
         "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
-        + selection_bar(ROSTER_COUNT)
+        + placement_count_bar(ROSTER_COUNT)
         + grid
-        + "<p><label>Briefly, why did your team keep these " + str(ROSTER_COUNT)
-        + " and refer the others? (team rationale)<br>"
-        "<textarea name='rationale' rows='3' style='width:100%'>" + e(rationale) + "</textarea></label></p>"
-        "<p><button type='submit'>Review Decision</button></p></form>"
-        + selection_script(ROSTER_COUNT) + "</div>")
+        + "<p><button type='submit' id='placement-submit'>Review selection</button></p></form>"
+        + placement_select_script(ROSTER_COUNT) + "</div>")
     return page("Placement Review - " + team["name"], body)
 
 
-def retain_confirm_screen(game_code, team_index, team, retain, release, rationale):
-    retained = "".join(student_mini_card(s, badge="Retain") for s in retain)
+def retain_confirm_screen(game_code, team_index, team, retain, release):
+    retained = "".join(student_mini_card(s, badge="Keep") for s in retain)
     released = "".join(student_mini_card(s, badge="Refer") for s in release)
     hidden = ("<input type='hidden' name='game_code' value='" + game_code + "'>"
               "<input type='hidden' name='team_index' value='" + str(team_index) + "'>")
     body = (
         "<div class='card'><h2>Confirm Placement &mdash; " + e(team["name"]) + "</h2>"
         "<p>Review carefully. <strong>After you confirm, this decision locks.</strong></p>"
-        "<h3>Retain (" + str(len(retain)) + ")</h3><div style='text-align:center'>" + retained + "</div>"
+        "<h3>Keep (" + str(len(retain)) + ")</h3><div class='cardgrid'>" + retained + "</div>"
         "<h3>Refer for reassignment (" + str(len(release)) + ")</h3>"
-        "<div style='text-align:center'>" + released + "</div>"
-        "<p><strong>Your rationale:</strong> " + e(rationale) + "</p>"
-        "<form method='post' action='/team/retain/confirm' style='display:inline'>" + hidden
-        + "<button type='submit'>Confirm &amp; Lock</button></form> "
+        "<div class='cardgrid'>" + released + "</div>"
+        "<form method='post' action='/team/retain/confirm' style='display:inline' id='lockform'>" + hidden
+        + "<button type='submit' id='lockbtn'>Confirm &amp; Lock</button></form> "
         "<form method='post' action='/team/retain/edit' style='display:inline'>" + hidden
-        + "<button class='secondary' type='submit'>Go Back</button></form></div>")
+        + "<button class='secondary' type='submit'>Go Back</button></form></div>"
+        "<script>(function(){var f=document.getElementById('lockform');if(!f)return;"
+        "f.addEventListener('submit',function(){var b=document.getElementById('lockbtn');"
+        "if(b){b.disabled=true;b.textContent='Locking\\u2026';}});})();</script>")
     return page("Confirm Placement - " + team["name"], body)
 
 
@@ -2943,22 +3200,16 @@ def team_retain():
         return resume_screen(game_code, int(team_index), team)
     dealt = team.get("dealt", [])
     selected = selected_from_form(dealt)
-    rationale = request.form.get("rationale", "").strip()
     if len(selected) != ROSTER_COUNT:
         return roster_decision_screen(game_code, int(team_index), team,
-                                      "Please retain exactly " + str(ROSTER_COUNT) + ". You have "
-                                      + str(len(selected)) + ".", set(selected), rationale)
-    if not rationale:
-        return roster_decision_screen(game_code, int(team_index), team,
-                                      "Please add a brief rationale for your decision.",
-                                      set(selected), rationale)
+                                      "Please keep exactly " + str(ROSTER_COUNT) + ". You have "
+                                      + str(len(selected)) + ".", set(selected))
     retain = [s for s in dealt if s in selected]
     release = [s for s in dealt if s not in selected]
     # Hold the proposed decision until explicit confirmation (not yet locked).
     team["retain_pending"] = retain
     team["release_pending"] = release
-    team["retain_rationale"] = rationale
-    return retain_confirm_screen(game_code, int(team_index), team, retain, release, rationale)
+    return retain_confirm_screen(game_code, int(team_index), team, retain, release)
 
 
 @app.route("/team/retain/edit", methods=["POST"])
@@ -2971,8 +3222,7 @@ def team_retain_edit():
     if team.get("roster_confirmed"):
         return resume_screen(game_code, int(team_index), team)
     return roster_decision_screen(game_code, int(team_index), team,
-                                  checked=set(team.get("retain_pending", [])),
-                                  rationale=team.get("retain_rationale", ""))
+                                  checked=set(team.get("retain_pending", [])))
 
 
 @app.route("/team/retain/confirm", methods=["POST"])
@@ -5138,11 +5388,12 @@ def projector():
     if game.get("final_open"):
         banner = "<div class='card'><h2>Final: Accusations &amp; Outcomes</h2></div>"
     elif phase == "not_open":
-        banner = "<div class='card'><h2>Course Assignments</h2><p>Draw one Course Card for your team.</p></div>"
+        banner = ("<div class='card'><h2>Course Assignments</h2>"
+                  "<p>Each team has been dealt a course on its own screen. Course selection opens shortly.</p></div>")
     elif phase == "open":
-        banner = ("<div class='card'><h2>Course Trading Is Open</h2>"
-                  "<p>Negotiate a one-for-one trade with another team. Both teams must agree. "
-                  "Physically exchange Course Cards.</p></div>")
+        banner = ("<div class='card'><h2>Course Selection Is Open</h2>"
+                  "<p>On your team screen, you may propose a one-for-one course trade with another team. "
+                  "Both teams must agree in the app.</p></div>")
     else:
         cp_index = game["checkpoint_index"]
         cp_status = "OPEN" if game["checkpoint_open"] else "LOCKED"

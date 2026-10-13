@@ -43,15 +43,18 @@ checkpoints.
   Check (after Checkpoint 1). Hand out the physical Thunderstruck / Thunderflunked
   cards at that point, or let the on-screen reveal stand on its own.
 
-## 0:06–0:12 — Course draw, trading, registration (≈6 min)
+## 0:06–0:12 — Course selection & trading (≈6 min)
 
-- [TABLE] Each team draws one physical **Course Card**. Read it — modality,
+- [GM] Click **Open Course Selection**. The app deals each team one **Course
+  Card** and [PROJECTOR] shows "Course Selection Is Open."
+- [TABLE] Each team reviews its dealt Course Card on screen — modality,
   assessment pattern, and the two Course Realities differ by course.
-- [GM] Click **Open Course Trading**. [PROJECTOR] shows "Course Trading Is Open."
-- [TABLE] Teams may negotiate one-for-one physical trades. The software does not
-  track trades. (Skip entirely for a single table.)
-- [GM] Click **Close Course Trading** when done (about 2 minutes).
-- [TABLE] Each team registers the course now in front of them on their device.
+- [TABLE] Teams may propose a **one-for-one** trade with another team *in the
+  app*: one team taps **Propose trade**, the other taps **Accept** (both must
+  agree). The app records the swap. (Single table: nothing to trade — skip.)
+- [GM] Click **Close Course Selection** when done (about 2 minutes). Each team's
+  held course locks in automatically and student placement begins — no separate
+  registration step.
 
 ## 0:12–0:18 — Student deal, draft, starting conditions, handoff (≈6 min)
 
@@ -174,7 +177,8 @@ end-of-game bonus and does not decide the winner.
 
 Preserve the learning arc with these exact cuts (see also the report's §9):
 
-1. **Skip Course Trading** — draw and register courses directly (saves ~4 min).
+1. **Skip Course Trading** — open and immediately close Course Selection so each
+   team simply keeps the course the app dealt it (saves ~4 min).
 2. **Pre-deal rosters** — hand each team a pre-sorted 15; still draft 10 (saves ~3 min).
 3. **Run the full private round only at CP1, CP3, and CP5** — at CP2 and CP4 skip
    the vote/mission pass (the Thunderflunked can still save sabotage for CP3)

@@ -22,7 +22,7 @@ complete simulated game and covers:
 | Two-team full game | 4-player + 6-player team in one game, played start to finish. |
 | Allegiance | Exactly one Thunderflunked per team; every player privately sees allegiance. |
 | Roles | Assignment and Unrepresented Perspectives. |
-| Course trading | Cannot register a course while trading is OPEN; can register after CLOSE. |
+| Course selection | App deals a card per team on OPEN; one-for-one trades need both teams' consent; courses lock on CLOSE. |
 | Deal / draft | Exactly 15 dealt, 10 roster, 5 rejected. |
 | Handoff | Circular pass; receiver gets the sender's exact rejected set; starting resources unchanged by handoff. |
 | CP1-CP5 | Each checkpoint's evidence renders; decisions submit once and apply resource deltas once. |
@@ -43,7 +43,7 @@ Use two browser windows for two teams plus a projector tab. This mirrors the liv
 flow without needing other devices.
 
 1. **Smoke test / single team** - Create game; join one team (4 players); assign
-   roles; open+close trading; register a course; deal 15 / draft 10; confirm
+   roles; open+close Course Selection (course locks automatically); keep 10 of 15; confirm
    Starting Conditions show meters and a roster-pattern note; complete handoff
    test mode; play CP1 through the outcome. Confirm no error pages.
 2. **Two-team test** - Join a second team (6 players) in the same game before
@@ -51,10 +51,13 @@ flow without needing other devices.
    handoff names each team's send/receive partner correctly.
 3. **4-player and 6-player** - Covered by teams above; confirm private checks run
    the right number of player turns (4 and 6).
-4. **Course trading** - With trading OPEN, confirm a team's screen says trading is
-   open and will not register a course; after CLOSE, confirm it registers.
-5. **Draft** - Try to submit 14 and 16 dealt cards and 9 and 11 roster cards;
-   confirm each is rejected with a clear message.
+4. **Course selection** - With selection OPEN, confirm each team is shown a dealt
+   Course Card and can propose a one-for-one trade that only completes when the
+   other team accepts; confirm a team's course stays unlocked until CLOSE, then
+   locks automatically.
+5. **Placement** - On the placement screen (15 dealt), try to confirm with 9 and
+   11 kept; confirm each is rejected with a clear message. Confirm keeping exactly
+   10 auto-refers the other 5 and that no written rationale is required.
 6. **Handoff** - Confirm a receiver cannot confirm before the sender passes; GM
    screen shows passed/received status.
 7. **Re-entry** - Mid-setup and mid-checkpoint, close the team tab and re-join

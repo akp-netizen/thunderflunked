@@ -52,13 +52,15 @@ responsible for bringing into decisions. Roles not drawn at a table are shown as
 
 ## Course Cards
 
-Ten unique courses, two physical copies each: four lecture-style, two
+Ten unique courses, two copies each (20-card deck): four lecture-style, two
 asynchronous online, four CTE/hands-on. Each has a believable code, credits,
 modality, catalog description, meeting/assessment pattern, prerequisite, and
 **two Course Realities** — neutral structural facts (e.g., fixed lab dates,
 sequential competencies, feedback-heavy grading). Realities do **not** change
 starting scores, but they can change how a later action plays out. The team
-screen prompts "Before deciding, review your Course Card" where it matters.
+screen shows each team's Course Card (the original card artwork) and prompts
+"Before deciding, review your Course Card" where it matters. Course selection is
+fully in the app — nothing is drawn or exchanged on paper.
 
 ## Student Cards
 
@@ -70,13 +72,16 @@ conversation?" while *Help-Seeking* is "will this student start that conversatio
 when needed?" (Silent SOS communicates well once approached but almost never
 initiates.)
 
-## Course Trading (physical only)
+## Course Selection & Trading (fully in the app)
 
-The software never records trades. Flow: players registered → Role Cards drawn →
-Course Card drawn → GM **opens** trading → teams inspect and negotiate one-for-one
-physical trades → GM **closes** trading → teams register the course now in front
-of them → student draft begins. Teams cannot register a course until trading
-closes.
+The app deals, trades, and records courses end to end. Flow: players registered →
+Role Cards drawn → **the app deals each team one Course Card** from the 20-card
+deck → GM **opens** course selection → teams review their card and may propose
+**one-for-one** trades with another team *in the app* (one team proposes, the
+other accepts; both must agree) → GM **closes** selection → each team's held
+course locks in and the student placement begins. A team's course is not locked
+until the GM closes selection. Because the deck has two copies of each course,
+two teams can hold the same course.
 
 ## Student Draft & Rejected-Student Handoff
 

@@ -23,8 +23,13 @@ Statuses used in play: Normal 60+, Strained 30-59, Critical below 30.
 
 ## 1. Course Cards
 
-Print two physical copies of each course (20 cards total). The two **Course
-Realities** are neutral structural facts; do not label which one will matter.
+Course selection, trading, and registration are now handled entirely in the app:
+it deals each team a Course Card (two copies of each course in the deck, so two
+teams can share a course), lets teams trade one-for-one on screen, and records
+the result. You do **not** need to print, draw, distribute, or exchange physical
+Course Cards. These card texts remain the canonical reference and an optional
+printout. The two **Course Realities** are neutral structural facts; do not label
+which one will matter.
 
 ### Advanced Competitive Napping
 
@@ -443,10 +448,12 @@ A keepsake players take with them.
 
 Keep one per table.
 
-> **Flow:** Join -> register players -> draw Role Cards + Secret Missions -> draw
-> Course Card -> trade (physical, optional) -> register course -> deal 15 -> draft
-> 10 (5 become Rejected) -> hand off 5 to the next team, receive 5 -> CP1 -> CP2 ->
-> CP3 -> CP4 -> CP5 -> Final Accusation -> Outcome -> Debrief.
+> **Flow:** Join -> register players -> draw Role Cards + Secret Missions -> app
+> deals each team a Course Card -> trade one-for-one in the app (optional; both
+> teams must agree) -> GM closes selection (course locks) -> app deals 15 students
+> -> keep 10 (the other 5 are referred for reassignment) -> app redistributes the
+> referred students into each team's final class of 15 -> CP1 -> CP2 -> CP3 -> CP4
+> -> CP5 -> Final Accusation -> Outcome -> Debrief.
 >
 > **Resources (0-100):** Student Success, Course Quality, Faculty Capacity,
 > Time/Resources. Normal 60+, Strained 30-59, Critical below 30.

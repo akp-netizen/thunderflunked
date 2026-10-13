@@ -97,21 +97,28 @@ def assign_roles(client, code, idx, team):
 
 
 def register_course(client, code, idx, course_name):
-    client.post("/team/course", data={"game_code": code, "team_index": str(idx),
-                                       "course": course_name})
+    """Force a team's course deterministically in the fully-digital flow. The real
+    UI deals a random Course Card and locks it when the GM closes selection; for
+    deterministic tests we pin both the held and the locked course and ensure the
+    15-student deal has happened, exactly as lock_team_course does on close."""
+    g = game.games[code]
+    team = game.get_team(code, idx)
+    team["course_held"] = course_name
+    team["course"] = course_name
+    game.ensure_dealt(team)
 
 
 def deal_and_draft(client, code, idx, dealt_labels, roster_labels):
     """Thunderflunked 2.0 placement. Overrides the automatic 15-student deal with
-    the given labels (for deterministic, feasible test setups), retains the given
+    the given labels (for deterministic, feasible test setups), keeps the given
     10, refers the other 5, and confirms (locking the decision). Central
-    reassignment auto-runs once every team in the game has confirmed."""
+    reassignment auto-runs once every team in the game has confirmed. No written
+    rationale is required by the redesigned placement screen."""
     team = game.get_team(code, idx)
     team["dealt"] = list(dealt_labels)
     team["deal_version"] = 2
     client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
-                                      "students": list(roster_labels),
-                                      "rationale": "strongest fit for the course"})
+                                      "students": list(roster_labels)})
     client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
 
 
@@ -240,15 +247,17 @@ def test_full_two_team_game():
     C.check("roles assigned A", len(teamA["assignments"]) == 4)
     C.check("unrepresented perspectives A", len(teamA["unrepresented"]) == 2)
 
-    # Course trading: teams cannot register until trading closes.
+    # Course selection (fully digital): opening deals every team a Course Card;
+    # a team's course is not LOCKED until the GM closes selection.
     client.post("/gm/course/open")
-    r = register_course_attempt(client, code, idxA, game.COURSE_NAMES[0])
-    C.check("cannot register course while trading open", teamA.get("course") is None)
+    C.check("team dealt a Course Card on open", teamA.get("course_held") in game.COURSE_NAMES)
+    C.check("course not locked while selection open", teamA.get("course") is None)
+    # Pin deterministic held courses, then close to lock them in.
+    teamA["course_held"] = game.COURSE_NAMES[0]
+    teamB["course_held"] = game.COURSE_NAMES[5]
     client.post("/gm/course/close")
-    register_course(client, code, idxA, game.COURSE_NAMES[0])
-    register_course(client, code, idxB, game.COURSE_NAMES[5])
-    C.check("course registered A after close", teamA["course"] == game.COURSE_NAMES[0])
-    C.check("course registered B after close", teamB["course"] == game.COURSE_NAMES[5])
+    C.check("course locked A after close", teamA["course"] == game.COURSE_NAMES[0])
+    C.check("course locked B after close", teamB["course"] == game.COURSE_NAMES[5])
 
     # Phases 1-4: deal 15 / retain 10 / refer 5, then central reassignment into a
     # 15-student final class. Disjoint deals keep the exclusion rule satisfiable
@@ -410,11 +419,6 @@ def test_full_two_team_game():
     print("  (two-team game complete)")
 
 
-def register_course_attempt(client, code, idx, course_name):
-    return client.post("/team/course", data={"game_code": code, "team_index": str(idx),
-                                              "course": course_name})
-
-
 def invalid_cp4_same(client, code, idx):
     """Submitting the same priority and supporting should be rejected."""
     team = game.get_team(code, idx)
@@ -488,7 +492,8 @@ def test_reentry():
     assign_roles(client, code, idx, team)
     client.post("/gm/course/open")
     resume = text(client.post("/team/join", data={"game_code": code, "team_name": "Reenter"}))
-    C.check("re-entry after roles during trading -> trade window", "Course Trading Is Open" in resume or "Course Assignment" in resume)
+    C.check("re-entry after roles during selection -> course screen",
+            "Your Course" in resume or "Course selection is open" in resume)
     # Re-entry must not duplicate the team.
     C.check("re-entry does not duplicate team", len(game.games[code]["teams"]) == 1)
 
@@ -510,8 +515,8 @@ def test_invalid_submissions():
     team["dealt"] = game.STUDENTS[:15]
     team["deal_version"] = 2
     r = text(client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
-                                               "students": game.STUDENTS[:8], "rationale": "x"}))
-    C.check("retain rejects wrong count", "retain exactly 10" in r)
+                                               "students": game.STUDENTS[:8]}))
+    C.check("retain rejects wrong count", "keep exactly 10" in r)
     C.check("retain not locked after invalid", not team.get("roster_confirmed"))
 
     # Bad game code join.
@@ -527,10 +532,12 @@ def test_invalid_submissions():
                                              "player_3": "C", "player_4": "D"}))
     C.check("empty player name rejected", "required" in r2)
 
-    # Missing rationale on the placement decision.
+    # No written rationale is required: keeping exactly 10 (no rationale field)
+    # advances straight to the Confirm & Lock review.
     r3 = text(client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
                                                "students": game.STUDENTS[:10]}))
-    C.check("retain requires a rationale", "rationale" in r3)
+    C.check("no rationale required -> advances to Confirm & Lock", "Confirm" in r3 and "Lock" in r3)
+    C.check("no rationale prompt anywhere in placement flow", "rationale" not in r3.lower())
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +654,7 @@ def test_number_entry_selection():
     team["dealt"] = game.STUDENTS[:15]
     team["deal_version"] = 2
     client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
-                                      "numbers": "1-5 6 7 8 9 10", "rationale": "nums"})
+                                      "numbers": "1-5 6 7 8 9 10"})
     C.check("number-entry retain recorded 10", len(team.get("retain_pending", [])) == 10)
     C.check("number-entry retain is #01..#10", team["retain_pending"] == game.STUDENTS[:10])
     client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
@@ -663,9 +670,199 @@ def test_number_entry_selection():
     t2["dealt"] = game.STUDENTS[:15]
     t2["deal_version"] = 2
     client2.post("/team/retain", data={"game_code": code2, "team_index": str(i2),
-                                       "students": game.STUDENTS[:5], "numbers": "5 6 7 8 9 10",
-                                       "rationale": "mix"})
+                                       "students": game.STUDENTS[:5], "numbers": "5 6 7 8 9 10"})
     C.check("union dedups overlap to 10", len(t2.get("retain_pending", [])) == 10)
+
+
+def test_digital_course_selection_and_trading():
+    """Part A: fully-digital Course Cards. Deck of 10 courses x 2 identical
+    printed copies, dealt digitally; one-for-one mutual trades (propose / accept /
+    decline / cancel) with clear turn/waiting states; lock on close. No physical
+    draw, exchange, or dropdown registration anywhere in the flow."""
+    print("\n=== Digital course selection + trading ===")
+    import os
+    from collections import Counter
+
+    # --- Original artwork mapping for all 10 canonical courses -----------------
+    app_dir = os.path.dirname(game.__file__)
+    for c in game.COURSES:
+        nospace = c["code"].replace(" ", "")
+        src = game.course_image_src(c["name"])
+        C.check("course art maps %s -> _%s_1.png" % (c["code"], nospace),
+                src == "/static/art/courses/course_" + nospace + "_1.png")
+        path = os.path.join(app_dir, src.lstrip("/").replace("/", os.sep))
+        C.check("course art file exists for %s" % c["code"], os.path.exists(path))
+    C.check("all 10 courses map to distinct artwork",
+            len({game.course_image_src(c["name"]) for c in game.COURSES}) == 10)
+
+    # --- Setup two teams, both past role setup ---------------------------------
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Alpha", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+    assign_roles(client, code, iA, tA)
+    iB = register_team(client, code, "Bravo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+    assign_roles(client, code, iB, tB)
+
+    def scr(idx):
+        return text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
+
+    # --- The legacy manual registration route is gone --------------------------
+    r404 = client.post("/team/course", data={"game_code": code, "team_index": str(iA),
+                                             "course": game.COURSE_NAMES[0]})
+    C.check("legacy /team/course registration route removed", r404.status_code == 404)
+
+    # --- Not open: the team is dealt a card digitally; waiting state; no paper --
+    s = scr(iA)
+    C.check("not-open: team already dealt a Course Card", tA.get("course_held") in game.COURSE_NAMES)
+    C.check("not-open: course not locked yet", tA.get("course") is None)
+    C.check("not-open: shows a waiting state", "has not opened yet" in s)
+    C.check("not-open: shows the dealt Course Card artwork", "/static/art/courses/course_" in s)
+    for paper in ["Draw one", "physical", "exchange", "in front of your team", "Select the course"]:
+        C.check("course screen has no paper instruction '%s'" % paper, paper.lower() not in s.lower())
+
+    # --- Open: deck is 10 courses x 2 copies = 20; every team holds one ---------
+    client.post("/gm/course/open")
+    g = game.games[code]
+    allcards = list(g["course_deck"]) + [t["course_held"] for t in g["teams"]]
+    C.check("deck is 10 courses x 2 copies (20 cards total)", len(allcards) == 20)
+    cnt = Counter(allcards)
+    C.check("each canonical course appears exactly twice in the deck",
+            all(cnt[c["name"]] == 2 for c in game.COURSES))
+    C.check("two copies allow duplicates (<=2 of any course held)",
+            all(v <= 2 for v in Counter(t["course_held"] for t in g["teams"]).values()))
+
+    # Pin deterministic holdings for the trade assertions.
+    tA["course_held"] = game.COURSE_NAMES[0]
+    tB["course_held"] = game.COURSE_NAMES[1]
+
+    # --- Propose A->B: proposer waits, recipient has the move ------------------
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    offers = g["course_offers"]
+    C.check("propose creates exactly one pending offer",
+            len(offers) == 1 and offers[0]["frm"] == iA and offers[0]["to"] == iB)
+    sA, sB = scr(iA), scr(iB)
+    C.check("proposer sees 'waiting on them' + Cancel", "Waiting for" in sA and "Cancel offer" in sA)
+    C.check("recipient sees 'your move' Accept + Decline", "Accept trade" in sB and "Decline" in sB)
+
+    # --- Decline: offer cleared, no swap ---------------------------------------
+    oid = offers[0]["id"]
+    client.post("/team/course/decline",
+                data={"game_code": code, "team_index": str(iB), "offer_id": str(oid)})
+    C.check("decline clears the offer", len(g["course_offers"]) == 0)
+    C.check("decline does not swap courses",
+            tA["course_held"] == game.COURSE_NAMES[0] and tB["course_held"] == game.COURSE_NAMES[1])
+
+    # --- Proposer cannot self-accept (both must agree) -------------------------
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    oid = g["course_offers"][0]["id"]
+    before = (tA["course_held"], tB["course_held"])
+    client.post("/team/course/accept",
+                data={"game_code": code, "team_index": str(iA), "offer_id": str(oid)})
+    C.check("proposer cannot accept own offer (mutual consent required)",
+            (tA["course_held"], tB["course_held"]) == before and len(g["course_offers"]) == 1)
+
+    # --- One outgoing offer at a time ------------------------------------------
+    first = g["course_offers"][0]["id"]
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    C.check("re-proposing replaces the prior outgoing offer (one at a time)",
+            len(g["course_offers"]) == 1 and g["course_offers"][0]["id"] != first)
+
+    # --- Cancel own offer ------------------------------------------------------
+    client.post("/team/course/cancel",
+                data={"game_code": code, "team_index": str(iA), "offer_id": str(g["course_offers"][0]["id"])})
+    C.check("proposer can cancel own offer", len(g["course_offers"]) == 0)
+
+    # --- Accept: one-for-one swap, both agree, offers cleared ------------------
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    oid = g["course_offers"][0]["id"]
+    client.post("/team/course/accept",
+                data={"game_code": code, "team_index": str(iB), "offer_id": str(oid)})
+    C.check("accept swaps courses one-for-one",
+            tA["course_held"] == game.COURSE_NAMES[1] and tB["course_held"] == game.COURSE_NAMES[0])
+    C.check("accept clears all offers", len(g["course_offers"]) == 0)
+
+    # --- Close: lock each held course, deal students, void offers --------------
+    tA["course_held"] = game.COURSE_NAMES[0]
+    tB["course_held"] = game.COURSE_NAMES[5]
+    # a stale offer existing at close must be voided
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    client.post("/gm/course/close")
+    C.check("close locks A's held course", tA["course"] == game.COURSE_NAMES[0])
+    C.check("close locks B's held course", tB["course"] == game.COURSE_NAMES[5])
+    C.check("close voids pending offers", g["course_offers"] == [])
+    C.check("close deals the 15-student placement to A", len(tA.get("dealt", [])) == 15)
+    C.check("close deals the 15-student placement to B", len(tB.get("dealt", [])) == 15)
+
+    # --- No trading after close ------------------------------------------------
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iA), "target": str(iB)})
+    C.check("no new trade offers after selection closes", g["course_offers"] == [])
+    C.check("locked course is unchanged after a late propose", tA["course"] == game.COURSE_NAMES[0])
+
+    # --- GM dashboard reflects status, adds no manual course step --------------
+    gmp = text(client.get("/gm"))
+    C.check("GM shows locked course A", game.COURSE_NAMES[0] in gmp and "locked" in gmp)
+    C.check("GM has no physical course-draw instruction",
+            "Draw one Course Card" not in gmp)
+
+
+def test_placement_screen_redesign():
+    """Part B: the student placement screen is a responsive artwork grid with a
+    persistent counter, clickable/keyboard-accessible selection, no rationale and
+    no required typing, exactly 10-of-15 kept with 5 auto-referred, and a single
+    Confirm & Lock with double-submit protection."""
+    print("\n=== Placement screen redesign ===")
+    client = fresh_client()
+    code = create_game(client)
+    idx = register_team(client, code, "Pick", ["A", "B", "C", "D"])
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    client.post("/gm/course/open")
+    team["course_held"] = game.COURSE_NAMES[0]
+    client.post("/gm/course/close")
+    team["dealt"] = game.STUDENTS[:15]
+    team["deal_version"] = 2
+
+    s = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
+    C.check("persistent 'X of 10 students selected' counter", "of 10 students selected" in s)
+    C.check("responsive artwork grid of the 15 dealt students",
+            "cardgrid" in s and s.count("/static/art/students/student_") >= 15)
+    C.check("no repeated six-stat table (stats are on the card art)", "/5)" not in s)
+    C.check("no written rationale field", "textarea" not in s and "rationale" not in s.lower())
+    C.check("no required card-number / quick-entry typing", "Quick entry" not in s)
+    C.check("cards are checkboxes inside labels (tap + keyboard accessible)",
+            "<label class='tile student-tile'>" in s and "type='checkbox'" in s)
+    C.check("visible selected checkmark on each card", "&#10003; Selected" in s)
+    C.check("keyboard hint present", "Space to toggle" in s)
+
+    # Validation: wrong count is rejected, nothing locked.
+    r8 = text(client.post("/team/retain",
+                          data={"game_code": code, "team_index": str(idx), "students": game.STUDENTS[:8]}))
+    C.check("keeping != 10 is rejected", "keep exactly 10" in r8)
+    C.check("wrong count does not lock", not team.get("roster_confirmed"))
+
+    # Keep exactly 10 -> single Confirm & Lock review with a double-submit guard.
+    r = text(client.post("/team/retain",
+                         data={"game_code": code, "team_index": str(idx), "students": game.STUDENTS[:10]}))
+    C.check("review offers exactly one Confirm & Lock", r.count("Confirm &amp; Lock") == 1)
+    C.check("Confirm & Lock has a double-submit guard", "b.disabled=true" in r)
+    C.check("10 kept held pending", len(team["retain_pending"]) == 10)
+    C.check("the other 5 are automatically referred",
+            len(team["release_pending"]) == 5
+            and set(team["retain_pending"]) | set(team["release_pending"]) == set(game.STUDENTS[:15]))
+
+    # Lock, then confirm is idempotent against accidental double submission.
+    client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
+    C.check("locked starting roster is 10", len(team["starting_roster"]) == 10)
+    C.check("locked referred is 5", len(team["released"]) == 5)
+    locked = list(team["starting_roster"])
+    client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
+    C.check("double Confirm & Lock is idempotent", team["starting_roster"] == locked)
 
 
 def test_course_shell():
@@ -940,6 +1137,7 @@ def test_persistence_and_restart():
         teamB = game.get_team(code, idxB)
         C.check("allegiance (Thunderflunked) preserved A", isinstance(teamA["thunderflunked"], int))
         C.check("sabotage-used flag preserved B", teamB["sabotage"]["used"] is True)
+        C.check("locked course persisted across restart A", teamA.get("course") in game.COURSE_NAMES)
         C.check("missions preserved A", len(teamA["missions_complete"]) >= 1)
         C.check("votes preserved A", len(game.private_round(teamA, 2)["votes"]) == 4)
         # Digital placement state survives a restart intact.
@@ -1048,7 +1246,7 @@ def _retain_confirm(client, code, idx, dealt, retain):
     team["dealt"] = list(dealt)
     team["deal_version"] = 2
     client.post("/team/retain", data={"game_code": code, "team_index": str(idx),
-                                      "students": list(retain), "rationale": "fit"})
+                                      "students": list(retain)})
     client.post("/team/retain/confirm", data={"game_code": code, "team_index": str(idx)})
 
 
@@ -1076,7 +1274,10 @@ def test_digital_student_placement():
     C.check("auto-deal from canonical 30", all(s in S for s in team["dealt"]))
     screen = status(client, code, idx)
     C.check("placement screen shows student artwork", "/static/art/students/student_" in screen)
-    C.check("placement screen shows stats", "/5)" in screen)
+    # Stats live on the card artwork now; the redundant dot-stat table is gone.
+    C.check("placement screen does not repeat a stat table", "/5)" not in screen)
+    C.check("placement screen shows the 'of 10 students selected' counter",
+            "of 10 students selected" in screen)
 
     # --- Phase 1: refresh never redeals ---------------------------------------
     before = list(team["dealt"])
@@ -1874,6 +2075,8 @@ def main():
     test_private_flow_browser_fidelity()
     test_digital_setup()
     test_number_entry_selection()
+    test_digital_course_selection_and_trading()
+    test_placement_screen_redesign()
     test_digital_student_placement()
     test_reassignment_pool_vs_backfill()
     test_resources_drawer()
