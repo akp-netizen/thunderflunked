@@ -1072,15 +1072,37 @@ ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 .selcount-bar .n{color:var(--warn);}
 .selcount-bar.ok .n{color:var(--good);}
 /* Course Cards + trading (fully in-app) */
-.course-art{max-width:340px;width:100%;height:auto;display:block;border-radius:10px;margin:8px auto;}
-.course-art.sm{max-width:180px;margin:6px 0;}
-.trade-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;border:1px solid var(--line);
-  border-radius:10px;padding:12px;margin:10px 0;background:#fff;}
-.trade-row img{flex:0 0 auto;}
-.trade-row .tr-body{flex:1;min-width:180px;}
+/* Your-course hero: large readable artwork beside full HTML course details */
+.course-hero{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start;}
+.course-hero-art{flex:0 0 auto;max-width:100%;}
+.course-hero-text{flex:1 1 320px;min-width:0;}
+.course-name{margin-top:0;}
+.course-meta{color:var(--gray);font-weight:600;margin:.2em 0 .7em;}
+.course-realities{margin:.3em 0 0;padding-left:1.2em;}
+.course-realities li{margin:.25em 0;}
+.trade-row{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;border:1px solid var(--line);
+  border-radius:10px;padding:14px;margin:12px 0;background:#fff;}
+.trade-art{flex:0 0 auto;max-width:100%;}
+.trade-row .tr-body{flex:1 1 280px;min-width:0;}
 .trade-row form{display:inline;}
 .offer-in{border-left:5px solid var(--good);}
 .offer-wait{border-left:5px solid var(--warn);}
+/* Click/tap-to-enlarge Course Card (pure CSS; keyboard accessible, no JS needed) */
+.zoom{display:inline-block;max-width:100%;}
+.zoom-cb{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);}
+.zoom-thumb{display:inline-block;cursor:zoom-in;margin:0;text-align:center;}
+.zoom-thumb img{width:100%;height:auto;display:block;border-radius:10px;border:1px solid var(--line);}
+.zoom-lg .zoom-thumb img{max-width:440px;}
+.zoom-md .zoom-thumb img{max-width:260px;}
+.zoom-hint{display:block;font-size:.8rem;color:var(--gray);margin-top:5px;}
+.zoom-cb:focus-visible+.zoom-thumb{outline:3px solid #000;outline-offset:2px;}
+.zoom-cb:focus-visible+.zoom-thumb .zoom-hint{text-decoration:underline;}
+.zoom-overlay{display:none;}
+.zoom-cb:checked~.zoom-overlay{display:flex;position:fixed;inset:0;z-index:60;cursor:zoom-out;
+  background:rgba(0,0,0,.88);padding:16px;flex-direction:column;align-items:center;overflow:auto;}
+.zoom-overlay img{max-width:min(96vw,780px);width:100%;height:auto;border-radius:8px;margin:auto;}
+.zoom-close{align-self:center;position:sticky;top:0;margin:0 0 12px;background:#fff;color:var(--ink);
+  border-radius:8px;padding:9px 20px;font-weight:700;cursor:pointer;}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -1198,11 +1220,6 @@ def course_image_src(course_name):
     card always uses copy 1. Course code 'BIOL 215' -> 'course_BIOL215_1.png'."""
     code = COURSE_BY_NAME[course_name]["code"].replace(" ", "")
     return "/static/art/courses/course_" + code + "_1.png"
-
-
-def course_image_tag(course_name, cls="course-art"):
-    return ("<img src='" + course_image_src(course_name) + "' alt='" + e(course_name)
-            + " Course Card' class='" + cls + "' loading='lazy'>")
 
 
 def student_card_html(label):
@@ -2284,11 +2301,57 @@ def _course_hidden(game_code, team_index, name, value):
             "<input type='hidden' name='" + name + "' value='" + e(str(value)) + "'>")
 
 
-def course_card_block(course_name, cls="course-art"):
+def course_details_html(course_name, compact=False):
+    """All faculty-facing canonical course information rendered as readable HTML
+    text (never relying on the artwork being legible). Compact mode drops the
+    prerequisite/pattern/assessment lines for trade rows but keeps the facts that
+    drive a trade decision. No hidden scoring is ever exposed -- COURSES carries
+    none; resource weighting lives elsewhere and is not read here."""
     c = COURSE_BY_NAME[course_name]
-    return (course_image_tag(course_name, cls)
-            + "<p class='center'><strong>" + e(course_name) + "</strong> &mdash; "
-            + e(c["code"]) + " &middot; " + e(c["modality"]) + "</p>")
+    realities = "".join("<li>" + e(r) + "</li>" for r in c["realities"])
+    meta = (e(c["code"]) + " &middot; " + e(c["modality"]) + " &middot; "
+            + str(c["credits"]) + " credits")
+    parts = ["<h3 class='course-name'>" + e(course_name) + "</h3>",
+             "<p class='course-meta'>" + meta + "</p>",
+             "<p>" + e(c["desc"]) + "</p>"]
+    if not compact:
+        parts.append("<p><strong>Prerequisite:</strong> " + e(c["prereq"]) + "</p>")
+        parts.append("<p><strong>Meeting / learning pattern:</strong> " + e(c["pattern"]) + "</p>")
+        parts.append("<p><strong>Assessment pattern:</strong> " + e(c["assessment"]) + "</p>")
+    parts.append("<p><strong>Course Realities</strong> &mdash; neutral structural facts that can "
+                 "shape how a later decision plays out:</p>"
+                 "<ul class='course-realities'>" + realities + "</ul>")
+    return "".join(parts)
+
+
+def course_figure(course_name, zoom_id, size="md"):
+    """Click/tap-to-enlarge Course Card artwork. Pure CSS (checkbox hack): the
+    hidden checkbox is the focusable control (Space toggles), its label is the
+    tappable thumbnail, and a second label is the full-screen overlay with an
+    obvious Close control. Works with JavaScript disabled."""
+    src = e(course_image_src(course_name))
+    thumb_alt = e(course_name) + " Course Card - activate to enlarge"
+    big_alt = e(course_name) + " Course Card, enlarged"
+    return (
+        "<span class='zoom zoom-" + size + "'>"
+        "<input type='checkbox' id='" + zoom_id + "' class='zoom-cb'>"
+        "<label for='" + zoom_id + "' class='zoom-thumb'>"
+        "<img src='" + src + "' alt='" + thumb_alt + "' loading='lazy'>"
+        "<span class='zoom-hint'>Tap or press Space to enlarge</span></label>"
+        "<label for='" + zoom_id + "' class='zoom-overlay'>"
+        "<span class='zoom-close'>Close &#10005;</span>"
+        "<img src='" + src + "' alt='" + big_alt + "'></label>"
+        "</span>")
+
+
+def course_hero(course_name):
+    """The team's own course as the visual focus: large enlargeable artwork beside
+    the complete course information as readable HTML text."""
+    return ("<div class='card'><h2>Your Course</h2>"
+            "<div class='course-hero'>"
+            "<div class='course-hero-art'>" + course_figure(course_name, "zoom-your", "lg") + "</div>"
+            "<div class='course-hero-text'>" + course_details_html(course_name) + "</div>"
+            "</div></div>")
 
 
 def course_trade_screen(game_code, team_index, team):
@@ -2307,13 +2370,14 @@ def course_trade_screen(game_code, team_index, team):
 
     ensure_course_dealt(game, team)
     refresh = team_footer(game_code, team_index)
-    your_card = ("<div class='card'><h2>Your Course</h2>"
-                 + course_card_block(team["course_held"]) + "</div>")
+    # The full course card (large artwork + complete readable details) is the focus
+    # of every state, including the waiting states below.
+    hero = course_hero(team["course_held"])
 
     if phase == "not_open":
-        body = (your_card
-                + "<div class='card'><p>This is the course your team has been dealt. Review it while "
-                "you wait.</p>"
+        body = (hero
+                + "<div class='card'><p>This is the course your team has been dealt &mdash; review it "
+                "in full above while you wait.</p>"
                 "<p class='muted'>Course selection has not opened yet. When the Game Master opens it, "
                 "you will be able to propose a one-for-one trade with another team.</p></div>")
         return page("Your Course - " + team["name"], body + refresh)
@@ -2323,18 +2387,23 @@ def course_trade_screen(game_code, team_index, team):
     offers = _course_offers(game)
     my_outgoing = next((o for o in offers if o["frm"] == team_index), None)
     incoming = [o for o in offers if o["to"] == team_index]
-    sections = [your_card]
+    sections = [hero]
 
-    # Incoming offers to respond to (your move).
+    # Incoming offers to respond to (your move). The offered course is shown at a
+    # readable size with its full-text details so faculty can inspect before
+    # accepting.
     if incoming:
         rows = ""
         for o in incoming:
             frm = teams[o["frm"]]
             rows += (
                 "<div class='trade-row offer-in'>"
-                + course_image_tag(frm["course_held"], "course-art sm")
-                + "<div class='tr-body'><p><strong>" + e(frm["name"]) + "</strong> offers their "
-                "<strong>" + e(frm["course_held"]) + "</strong> for your <strong>"
+                "<div class='trade-art'>"
+                + course_figure(frm["course_held"], "zoom-in-" + str(o["id"]), "md")
+                + "</div><div class='tr-body'>"
+                "<p><strong>" + e(frm["name"]) + "</strong> offers you this course:</p>"
+                + course_details_html(frm["course_held"], compact=True)
+                + "<p class='muted'>If you accept, you give up your current course, <strong>"
                 + e(team["course_held"]) + "</strong>.</p>"
                 "<form method='post' action='/team/course/accept'>"
                 + _course_hidden(game_code, team_index, "offer_id", o["id"])
@@ -2343,8 +2412,8 @@ def course_trade_screen(game_code, team_index, team):
                 + _course_hidden(game_code, team_index, "offer_id", o["id"])
                 + "<button class='secondary' type='submit'>Decline</button></form></div></div>")
         sections.append("<div class='card'><h3>Trade offers for you</h3>"
-                        "<p class='muted'>Your move: accept to swap courses, or decline.</p>"
-                        + rows + "</div>")
+                        "<p class='muted'>Your move: inspect the offered course, then accept to swap "
+                        "or decline.</p>" + rows + "</div>")
 
     # Your own outgoing offer (waiting on them) OR the list of teams to offer to.
     if my_outgoing is not None:
@@ -2352,11 +2421,13 @@ def course_trade_screen(game_code, team_index, team):
         sections.append(
             "<div class='card'><h3>Trade proposed</h3>"
             "<div class='trade-row offer-wait'>"
-            + course_image_tag(dest["course_held"], "course-art sm")
-            + "<div class='tr-body'><p>You offered your <strong>" + e(team["course_held"])
-            + "</strong> for <strong>" + e(dest["name"]) + "</strong>'s <strong>"
-            + e(dest["course_held"]) + "</strong>.</p>"
-            "<p class='muted'>Waiting for " + e(dest["name"]) + " to accept or decline.</p>"
+            "<div class='trade-art'>"
+            + course_figure(dest["course_held"], "zoom-wait-" + str(my_outgoing["id"]), "md")
+            + "</div><div class='tr-body'>"
+            "<p>You offered your <strong>" + e(team["course_held"]) + "</strong> for <strong>"
+            + e(dest["name"]) + "</strong>'s course below:</p>"
+            + course_details_html(dest["course_held"], compact=True)
+            + "<p class='muted'>Waiting for " + e(dest["name"]) + " to accept or decline.</p>"
             "<form method='post' action='/team/course/cancel'>"
             + _course_hidden(game_code, team_index, "offer_id", my_outgoing["id"])
             + "<button class='secondary' type='submit'>Cancel offer</button></form></div></div></div>")
@@ -2367,19 +2438,22 @@ def course_trade_screen(game_code, team_index, team):
             for i, t in others:
                 rows += (
                     "<div class='trade-row'>"
-                    + course_image_tag(t["course_held"], "course-art sm")
-                    + "<div class='tr-body'><p><strong>" + e(t["name"]) + "</strong> &mdash; "
-                    + e(t["course_held"]) + "</p>"
-                    "<form method='post' action='/team/course/propose'>"
+                    "<div class='trade-art'>"
+                    + course_figure(t["course_held"], "zoom-team-" + str(i), "md")
+                    + "</div><div class='tr-body'>"
+                    "<p class='muted'>Held by <strong>" + e(t["name"]) + "</strong></p>"
+                    + course_details_html(t["course_held"], compact=True)
+                    + "<form method='post' action='/team/course/propose'>"
                     + _course_hidden(game_code, team_index, "target", i)
                     + "<button type='submit'>Propose trade</button></form></div></div>")
             sections.append("<div class='card'><h3>Trade with another team</h3>"
-                            "<p>Propose a one-for-one swap. The other team must accept for the trade "
-                            "to happen. You can only have one offer out at a time.</p>" + rows + "</div>")
+                            "<p>Inspect another team's course below, then propose a one-for-one swap. "
+                            "The other team must accept for the trade to happen. You can only have one "
+                            "offer out at a time.</p>" + rows + "</div>")
         else:
             sections.append("<div class='card'><h3>Trade with another team</h3>"
                             "<p class='muted'>No other team has a course yet. You can keep the course "
-                            "you were dealt.</p></div>")
+                            "you were dealt (shown in full above).</p></div>")
 
     sections.append("<div class='card'><p class='muted'>Course selection is open. When the Game Master "
                     "closes it, the course you currently hold becomes your course for the semester.</p></div>")

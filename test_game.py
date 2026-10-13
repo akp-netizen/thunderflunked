@@ -811,6 +811,91 @@ def test_digital_course_selection_and_trading():
             "Draw one Course Card" not in gmp)
 
 
+def test_course_card_readability():
+    """The digital Course Card is readable: large, enlargeable artwork plus the
+    full canonical course information as HTML text; other teams' courses and trade
+    offers are inspectable before trading; waiting states keep the full card; no
+    secrets or scoring internals leak."""
+    print("\n=== Course card readability ===")
+
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Alpha", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+    assign_roles(client, code, iA, tA)
+    iB = register_team(client, code, "Bravo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+    assign_roles(client, code, iB, tB)
+
+    def scr(idx):
+        return text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
+
+    # Pin deterministic, distinct courses for both teams.
+    tA["course_held"] = game.COURSE_NAMES[1]   # Bigfoot Field Research (BIOL 215)
+    tB["course_held"] = game.COURSE_NAMES[6]   # Industrial Snack Automation (MFGT 165)
+    mine = game.COURSE_BY_NAME[game.COURSE_NAMES[1]]
+    theirs = game.COURSE_BY_NAME[game.COURSE_NAMES[6]]
+
+    # --- Not-open waiting state: full card present, not a mostly-empty message --
+    s = scr(iA)
+    C.check("waiting state shows the large hero card", "course-hero" in s and "zoom-lg" in s)
+    for label, val in [("name", game.COURSE_NAMES[1]), ("code", mine["code"]),
+                       ("modality", mine["modality"]), ("credits", str(mine["credits"]) + " credits"),
+                       ("description", mine["desc"]), ("prerequisite", mine["prereq"]),
+                       ("meeting pattern", mine["pattern"]), ("assessment", mine["assessment"]),
+                       ("reality A", mine["realities"][0]), ("reality B", mine["realities"][1])]:
+        C.check("waiting state shows canonical %s as readable text" % label, val in s)
+    C.check("waiting state is not a bare message (keeps full details)",
+            mine["desc"] in s and "Course Realities" in s)
+
+    # --- Enlargement control: pure-CSS checkbox + overlay + obvious close -------
+    C.check("card has an enlarge control (checkbox-driven)",
+            "class='zoom-cb'" in s and "id='zoom-your'" in s and "for='zoom-your'" in s)
+    C.check("enlarge uses a real focusable checkbox (keyboard accessible)",
+            "type='checkbox'" in s)
+    C.check("enlarged overlay + obvious Close control present",
+            "zoom-overlay" in s and "zoom-close" in s and "Close" in s)
+    C.check("enlarge works with no JavaScript (CSS :checked drives the overlay)",
+            ".zoom-cb:checked~.zoom-overlay" in game.BASE_CSS)
+    C.check("enlarge control has a visible keyboard-focus style",
+            ".zoom-cb:focus-visible+.zoom-thumb" in game.BASE_CSS)
+
+    # --- No secrets, no scoring internals on the course screen ------------------
+    for secret in ["Thunderflunked", "allegiance", "Secret Mission", "Suspicion"]:
+        C.check("course screen hides '%s'" % secret, secret.lower() not in s.lower())
+    C.check("course screen does not expose the overall score", "Overall Course Score" not in s)
+    for rn in game.RESOURCE_NAMES:
+        C.check("course screen hides resource '%s'" % rn, rn not in s)
+    C.check("course screen renders no resource meters", "class='meter'" not in s)
+
+    # --- Open: an incoming offer's course is inspectable before accepting -------
+    client.post("/gm/course/open")
+    client.post("/team/course/propose",
+                data={"game_code": code, "team_index": str(iB), "target": str(iA)})
+    so = scr(iA)
+    C.check("offered course name readable before accepting", game.COURSE_NAMES[6] in so)
+    C.check("offered course modality readable", theirs["modality"] in so)
+    C.check("offered course description readable", theirs["desc"] in so)
+    C.check("offered course realities readable", theirs["realities"][0] in so)
+    C.check("offered course is enlargeable too", "zoom-in-" in so)
+    C.check("own course still shown in full alongside the offer", mine["desc"] in so and "course-hero" in so)
+    C.check("accept/decline controls present", "Accept trade" in so and "Decline" in so)
+
+    # --- Other team's course inspectable before PROPOSING (A has no offer out) --
+    # A received an offer but has not proposed one, so A also sees the propose list.
+    C.check("propose list renders other team's course enlargeable", "zoom-team-" in so)
+    C.check("propose list shows the other team's canonical details before proposing",
+            theirs["modality"] in so and theirs["desc"] in so)
+
+    # --- Outgoing-offer WAITING state (B proposed to A) keeps full course info --
+    sb = scr(iB)
+    C.check("proposer sees the waiting state", "Waiting for" in sb and "Cancel offer" in sb)
+    C.check("proposer keeps its own full hero card", "course-hero" in sb and theirs["desc"] in sb)
+    C.check("proposer can still inspect the course it offered for (readable text)",
+            mine["desc"] in sb and mine["realities"][0] in sb)
+    C.check("proposer waiting state keeps an enlargeable offered card", "zoom-wait-" in sb)
+    C.check("proposer waiting state is not a bare message",
+            sb.count("Course Realities") >= 1 and theirs["modality"] in sb)
+
+
 def test_placement_screen_redesign():
     """Part B: the student placement screen is a responsive artwork grid with a
     persistent counter, clickable/keyboard-accessible selection, no rationale and
@@ -2076,6 +2161,7 @@ def main():
     test_digital_setup()
     test_number_entry_selection()
     test_digital_course_selection_and_trading()
+    test_course_card_readability()
     test_placement_screen_redesign()
     test_digital_student_placement()
     test_reassignment_pool_vs_backfill()
