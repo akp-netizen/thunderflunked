@@ -241,6 +241,18 @@ ROLE_PERSPECTIVES = {
     "Professional Buzzkill": "Watch for consequences: what does this decision cost us later that it does not cost us now?",
 }
 
+
+def role_image_src(role):
+    """Static path to the printed Role Card art for a public role (e.g.
+    "Student Whisperer" -> /static/art/roles/role_student_whisperer.png)."""
+    return "/static/art/roles/role_" + role.lower().replace(" ", "_") + ".png"
+
+
+def allegiance_image_src(is_thunderflunked):
+    """Static path to the printed Allegiance Card art."""
+    name = "thunderflunked" if is_thunderflunked else "thunderstruck"
+    return "/static/art/allegiance/allegiance_" + name + ".png"
+
 # ---------------------------------------------------------------------------
 # The 30 Student Cards.
 # Visible stats (1-5 each): Readiness, Motivation, Communication,
@@ -1212,6 +1224,26 @@ def gm_team_block(code, game, team_i, team):
     else:
         out += "<p class='muted'>(no players registered yet)</p>"
 
+    # Private allegiance reveal status + per-player reset (GM only). Shows only
+    # whether each player has viewed their reveal yet -- never which allegiance.
+    # Resetting makes that one player privately re-view on the team device;
+    # it changes nobody's allegiance, role, or setup progress.
+    if team.get("setup_version") == 2 and team.get("roles_confirmed") and team.get("players"):
+        seen = set(team.get("allegiance_seen", []))
+        items = ""
+        for pi, pname in enumerate(team["players"]):
+            if pi in seen:
+                items += ("<li>" + e(pname) + " &mdash; <span class='muted'>viewed</span> "
+                          "<form method='post' action='/gm/reset_reveal' style='display:inline'>"
+                          "<input type='hidden' name='team_index' value='" + str(team_i) + "'>"
+                          "<input type='hidden' name='player' value='" + str(pi) + "'>"
+                          "<button class='secondary' type='submit'>Reset reveal</button></form></li>")
+            else:
+                items += ("<li>" + e(pname) + " &mdash; <span class='status-Strained'>not yet viewed</span></li>")
+        out += ("<p><strong>Private Allegiance Reveal (GM only):</strong> reset a player only if they "
+                "acknowledged without reading. They will privately view it again on the team device; "
+                "no allegiance or role changes.</p><ul class='clean'>" + items + "</ul>")
+
     out += "<p><strong>Course:</strong> " + (e(team.get("course")) if team.get("course") else "(not chosen yet)") + "</p>"
 
     if team.get("starting_roster"):
@@ -1389,6 +1421,31 @@ def gm_lock():
     return redirect(url_for("gm"))
 
 
+@app.route("/gm/reset_reveal", methods=["POST"])
+def gm_reset_reveal():
+    """GM-only: clear ONE player's 'allegiance seen' flag so they privately view
+    their reveal again (e.g. they acknowledged without reading). This endpoint is
+    under /gm/, so the standard GM login requirement applies. It touches only
+    team["allegiance_seen"] -- never the assigned allegiance, the public role, or
+    any other player. The v2 setup gate in resume_screen then routes just that
+    player back through the same pass-the-computer reveal, even mid-game, without
+    repeating setup for the team or restarting the game."""
+    if active_code is None:
+        return redirect(url_for("gm"))
+    team_index = request.form.get("team_index", "")
+    player = request.form.get("player", "")
+    if not team_index.isdigit():
+        return redirect(url_for("gm"))
+    team = get_team(active_code, int(team_index))
+    if team is None:
+        return redirect(url_for("gm"))
+    if player.isdigit() and int(player) < len(team.get("players", [])):
+        seen = team.get("allegiance_seen", [])
+        if int(player) in seen:
+            seen.remove(int(player))
+    return redirect(url_for("gm"))
+
+
 @app.route("/gm/advance", methods=["POST"])
 def gm_advance():
     if active_code is not None:
@@ -1507,7 +1564,17 @@ def resume_screen(game_code, team_index, team):
     game = games[game_code]
     if not team.get("players"):
         return count_form(game_code, team_index, team["name"])
-    if not team.get("assignments"):
+    if team.get("setup_version") == 2:
+        # Guided digital setup: shuffle roles -> private allegiance reveal ->
+        # team overview. Each step is gated on its own persisted flag so a page
+        # refresh always lands on the same screen and never re-randomizes.
+        if not team.get("roles_confirmed"):
+            return roles_setup_screen(game_code, team_index, team)
+        if len(team.get("allegiance_seen", [])) < len(team["players"]):
+            return reveal_roster_screen(game_code, team_index, team)
+        if not team.get("setup_overview_done"):
+            return setup_overview_screen(game_code, team_index, team)
+    elif not team.get("assignments"):
         return role_form(game_code, team_index, team)
     if not team.get("course"):
         phase = game.get("course_trading", "closed")
@@ -1582,8 +1649,14 @@ def team_save():
         team["missions_complete"] = []
         team["sabotage"] = {"used": False, "cp": None, "label": None, "prompted": {}}
         team["private"] = {}
+    # Thunderflunked 2.0: guided digital setup replaces the physical Role Cards
+    # and the in-person Allegiance Card deal. setup_version marks a team that
+    # goes through the shuffle -> private reveal -> overview sequence. Legacy
+    # teams (no setup_version) keep the original manual role_form path.
+    team["setup_version"] = 2
+    team.setdefault("roles_confirmed", False)
 
-    return role_form(game_code, int(team_index), team)
+    return resume_screen(game_code, int(team_index), team)
 
 
 def role_option_tags(selected=""):
@@ -1648,6 +1721,283 @@ def team_roles():
     team["assignments"] = [{"role": r, "player": p} for r, p in zip(picked_roles, names)]
     team["unrepresented"] = [r for r in PUBLIC_ROLES if r not in picked_roles]
     return resume_screen(game_code, int(team_index), team)
+
+
+# ===========================================================================
+# Thunderflunked 2.0 digital setup
+#   Step 1  Shuffle Roles   (unique public role per player, confirm to lock)
+#   Step 2  Private Reveal  (pass-the-computer allegiance reveal, one at a time)
+#   Step 3  Team Overview   (public roles + focus; never allegiances)
+# These screens replace the physical Role Cards and the in-person Allegiance
+# deal. They produce the same team["assignments"] / team["allegiance_seen"]
+# the existing engine already consumes, so checkpoints, missions, sabotage, and
+# suspicion voting are untouched.
+# ===========================================================================
+def setup_progress(step):
+    """Small 'Step N of 3' indicator for the guided setup screens."""
+    labels = ["Assign Roles", "Private Allegiance", "Team Overview"]
+    cells = ""
+    for i, label in enumerate(labels, start=1):
+        state = "done" if i < step else ("now" if i == step else "todo")
+        mark = "&#10003; " if state == "done" else (str(i) + ". ")
+        style = ("font-weight:700;" if state == "now"
+                 else ("opacity:.55;" if state == "todo" else "opacity:.8;"))
+        cells += "<span style='margin-right:1.2em;" + style + "'>" + mark + label + "</span>"
+    return ("<p class='muted' style='font-size:.9rem;margin-bottom:.4em'>Team Setup &mdash; Step "
+            + str(step) + " of 3</p><p style='margin-top:0'>" + cells + "</p>")
+
+
+def role_card_html(role, player=None, show_image=True, img_width=200):
+    """Card-style readout of one public role: art, name, focus, optional player."""
+    img = ("<img src='" + role_image_src(role) + "' alt='" + e(role)
+           + " Role Card' style='width:100%;max-width:" + str(img_width)
+           + "px;height:auto;border-radius:8px;display:block;margin:0 auto .5em'>") if show_image else ""
+    who = ("<p style='margin:.2em 0'><strong>" + e(player) + "</strong></p>") if player else ""
+    return ("<div class='card' style='display:inline-block;vertical-align:top;max-width:260px;margin:.4em'>"
+            + img + who
+            + "<p style='margin:.2em 0'><strong>" + e(role) + "</strong></p>"
+            + "<p class='muted' style='font-size:.9rem'>" + ROLE_PERSPECTIVES[role] + "</p></div>")
+
+
+def _setup_hidden(game_code, team_index):
+    return ("<input type='hidden' name='game_code' value='" + game_code + "'>"
+            "<input type='hidden' name='team_index' value='" + str(team_index) + "'>")
+
+
+def roles_setup_screen(game_code, team_index, team):
+    """Step 1. Shuffle unique public roles, review, and confirm to lock."""
+    hidden = _setup_hidden(game_code, team_index)
+    perspectives = "".join(
+        "<li><strong>" + r + ":</strong> " + ROLE_PERSPECTIVES[r] + "</li>" for r in PUBLIC_ROLES
+    )
+    intro = (
+        "<div class='card'>" + setup_progress(1) + "<h2>Assign Public Roles</h2>"
+        "<p>Your Role is the perspective you are responsible for bringing into team "
+        "decisions. It is not a special power &mdash; use it to speak up when that part of "
+        "the course is being overlooked. Each role is given to one person.</p>"
+        "<ul>" + perspectives + "</ul></div>"
+    )
+    if not team.get("assignments"):
+        # Not shuffled yet: one obvious action.
+        body = intro + (
+            "<div class='card'><p>When everyone is registered, shuffle to deal each player a role.</p>"
+            "<form method='post' action='/team/roles/shuffle'>" + hidden
+            + "<button type='submit'>Shuffle Roles</button></form></div>"
+        )
+        return page("Assign Roles - " + team["name"], body)
+
+    # Shuffled but not confirmed: show the deal, allow reshuffle or confirm.
+    cards = "".join(role_card_html(a["role"], a["player"]) for a in team["assignments"])
+    body = intro + (
+        "<div class='card'><h3>Roles dealt</h3>"
+        "<div style='text-align:center'>" + cards + "</div>"
+        "<p class='muted'>Review the assignments. You can reshuffle until you confirm.</p>"
+        "<form method='post' action='/team/roles/confirm' style='display:inline'>" + hidden
+        + "<button type='submit'>Confirm Roles</button></form> "
+        "<form method='post' action='/team/roles/shuffle' style='display:inline'>" + hidden
+        + "<button class='secondary' type='submit'>Reshuffle</button></form></div>"
+    )
+    return page("Assign Roles - " + team["name"], body)
+
+
+@app.route("/team/roles/shuffle", methods=["POST"])
+def team_roles_shuffle():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    # Once roles are confirmed, ignore any further shuffle (e.g. a stale tab or
+    # back button) so a confirmed assignment can never be silently replaced.
+    if team.get("roles_confirmed"):
+        return resume_screen(game_code, int(team_index), team)
+    names = team.get("players", [])
+    if not names:
+        return error_page("Something went wrong finding your team. Please start again.")
+    roles = random.sample(PUBLIC_ROLES, len(names))
+    team["assignments"] = [{"role": r, "player": p} for r, p in zip(roles, names)]
+    team["unrepresented"] = [r for r in PUBLIC_ROLES if r not in roles]
+    return roles_setup_screen(game_code, int(team_index), team)
+
+
+@app.route("/team/roles/confirm", methods=["POST"])
+def team_roles_confirm():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if not team.get("assignments"):
+        # Nothing to confirm yet; send them back to shuffle.
+        return roles_setup_screen(game_code, int(team_index), team)
+    team["roles_confirmed"] = True
+    return resume_screen(game_code, int(team_index), team)
+
+
+# ---------------------------------------------------------------------------
+# Step 2. Private pass-the-computer allegiance reveal.
+#   roster  -> select name -> neutral privacy screen -> reveal (with art) ->
+#   acknowledge -> back to neutral roster. Exactly one Thunderflunked per team
+#   was assigned at registration (team["thunderflunked"]); everyone else is
+#   Thunderstruck. Allegiance is never listed, never placed in a GET/URL, and
+#   only ever rendered for the single acting player.
+# ---------------------------------------------------------------------------
+def reveal_roster_screen(game_code, team_index, team):
+    hidden = _setup_hidden(game_code, team_index)
+    seen = set(team.get("allegiance_seen", []))
+    rows = ""
+    for i, pname in enumerate(team["players"]):
+        if i in seen:
+            rows += ("<li style='margin:.3em 0'>&#10003; <strong>" + e(pname)
+                     + "</strong> <span class='muted'>&mdash; done</span></li>")
+        else:
+            rows += ("<li style='margin:.3em 0'><form method='post' "
+                     "action='/team/setup/reveal/select' style='display:inline'>" + hidden
+                     + "<input type='hidden' name='player' value='" + str(i) + "'>"
+                     "<button type='submit'>" + e(pname) + "</button></li>")
+    remaining = len(team["players"]) - len(seen)
+    body = ("<div class='card'>" + setup_progress(2) + "<h2>Private Allegiance</h2>"
+            "<p>One at a time, each player views their secret allegiance on this shared "
+            "computer. Pick your name, look while others look away, then pass it on.</p>"
+            "<p class='muted'>" + str(len(seen)) + " of " + str(len(team["players"]))
+            + " viewed &middot; " + str(remaining) + " to go.</p>"
+            "<ul class='clean'>" + rows + "</ul></div>")
+    return page("Private Allegiance - " + team["name"], body, "private")
+
+
+@app.route("/team/setup/reveal/select", methods=["POST"])
+def team_setup_reveal_select():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    player = request.form.get("player", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if not (team.get("setup_version") == 2 and team.get("roles_confirmed")):
+        return resume_screen(game_code, int(team_index), team)
+    if not player.isdigit() or int(player) >= len(team["players"]):
+        return reveal_roster_screen(game_code, int(team_index), team)
+    if int(player) in set(team.get("allegiance_seen", [])):
+        # Already viewed; do not allow a second look during setup.
+        return reveal_roster_screen(game_code, int(team_index), team)
+    # Neutral privacy hand-off screen. No allegiance data here.
+    hidden = _setup_hidden(game_code, team_index)
+    pname = team["players"][int(player)]
+    body = ("<div class='card'><h2>Pass the computer to " + e(pname) + "</h2>"
+            "<p>Everyone else, please look away.</p>"
+            "<p><strong>" + e(pname) + "</strong>, when you are ready and no one else can see "
+            "the screen, reveal your allegiance.</p>"
+            "<form method='post' action='/team/setup/reveal/show' style='display:inline'>" + hidden
+            + "<input type='hidden' name='player' value='" + str(int(player)) + "'>"
+            "<button type='submit'>Reveal My Allegiance</button></form> "
+            "<form method='post' action='/team/setup/reveal/back' style='display:inline'>" + hidden
+            + "<button class='secondary' type='submit'>Not me &mdash; go back</button></form></div>")
+    return page("Private Allegiance - " + team["name"], body, "private")
+
+
+@app.route("/team/setup/reveal/show", methods=["POST"])
+def team_setup_reveal_show():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    player = request.form.get("player", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if not (team.get("setup_version") == 2 and team.get("roles_confirmed")):
+        return resume_screen(game_code, int(team_index), team)
+    if not player.isdigit() or int(player) >= len(team["players"]):
+        return reveal_roster_screen(game_code, int(team_index), team)
+    if int(player) in set(team.get("allegiance_seen", [])):
+        return reveal_roster_screen(game_code, int(team_index), team)
+    p = int(player)
+    is_tf = (p == team["thunderflunked"])
+    hidden = _setup_hidden(game_code, team_index)
+    img = ("<img src='" + allegiance_image_src(is_tf) + "' alt='Allegiance Card' "
+           "style='width:100%;max-width:300px;height:auto;border-radius:10px;"
+           "display:block;margin:.4em auto'>")
+    if is_tf:
+        text_html = ("<h3>You are THUNDERFLUNKED</h3>"
+                     "<p>You're here to make sure they don't get the students and course through the semester.</p>"
+                     "<p>You are the only Thunderflunked person at this table. Sabotage mainly through persuasion: "
+                     "push reasonable ideas too far, favor individual fixes over scalable ones, spend capacity on "
+                     "low-priority issues. Occasionally support good ideas to stay unsuspected.</p>")
+    else:
+        text_html = ("<h3>You are THUNDERSTRUCK</h3>"
+                     "<p>You're here to get your students and course through the semester.</p>"
+                     "<p>Someone at your table is Thunderflunked. You do not know who.</p>")
+    body = ("<div class='card'><h2>" + e(team["players"][p]) + " &mdash; keep this secret</h2>"
+            "<div class='card'>" + img + text_html + "</div>"
+            "<form method='post' action='/team/setup/reveal/ack'>" + hidden
+            + "<input type='hidden' name='player' value='" + str(p) + "'>"
+            "<button type='submit'>I have seen it &mdash; hide and pass on</button></form></div>")
+    return page("Private Allegiance - " + team["name"], body, "private")
+
+
+@app.route("/team/setup/reveal/ack", methods=["POST"])
+def team_setup_reveal_ack():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    player = request.form.get("player", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    if player.isdigit() and int(player) < len(team["players"]):
+        if int(player) not in team["allegiance_seen"]:
+            team["allegiance_seen"].append(int(player))
+    # Always return to the neutral roster (never another player's reveal).
+    return resume_screen(game_code, int(team_index), team)
+
+
+@app.route("/team/setup/reveal/back", methods=["POST"])
+def team_setup_reveal_back():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    return resume_screen(game_code, int(team_index), team)
+
+
+# ---------------------------------------------------------------------------
+# Step 3. Team overview: public roles + focus only. No allegiances.
+# ---------------------------------------------------------------------------
+def setup_overview_screen(game_code, team_index, team):
+    hidden = _setup_hidden(game_code, team_index)
+    cards = "".join(role_card_html(a["role"], a["player"], img_width=160)
+                    for a in team.get("assignments", []))
+    body = ("<div class='card'>" + setup_progress(3) + "<h2>Your Table's Public Roles</h2>"
+            "<p>Everyone has privately seen their allegiance. Here is who is watching which "
+            "perspective during the semester. (Allegiances stay secret.)</p>"
+            "<div style='text-align:center'>" + cards + "</div>"
+            "<form method='post' action='/team/setup/overview/continue'>" + hidden
+            + "<button type='submit'>Continue to Course Registration</button></form></div>")
+    return page("Team Overview - " + team["name"], body)
+
+
+@app.route("/team/setup/overview/continue", methods=["POST"])
+def team_setup_overview_continue():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        return error_page("Something went wrong finding your team. Please start again.")
+    team = get_team(game_code, int(team_index))
+    team["setup_overview_done"] = True
+    return resume_screen(game_code, int(team_index), team)
+
+
+def team_roles_panel(team):
+    """Compact, always-available readout of the table's public roles and focus
+    for the team workspace. Public information only; never shows allegiance."""
+    assignments = team.get("assignments")
+    if not assignments:
+        return ""
+    rows = "".join(
+        "<li><strong>" + e(a["player"]) + "</strong> &mdash; " + a["role"]
+        + ": <span class='muted'>" + ROLE_PERSPECTIVES[a["role"]] + "</span></li>"
+        for a in assignments
+    )
+    return ("<details class='card'><summary><strong>Your Table's Public Roles &amp; Focus</strong></summary>"
+            "<ul class='clean'>" + rows + "</ul></details>")
 
 
 # ---------------------------------------------------------------------------
@@ -1926,7 +2276,8 @@ def status_screen(game_code, team_index, team):
                 "<p>Checkpoint " + str(number) + " (" + name + ") has not been opened yet.</p></div>")
     body = ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
             "<p>" + open_course_button(game_code, team_index) + "</p></div>"
-            + resource_meters(team["resources"], team["statuses"]) + body)
+            + resource_meters(team["resources"], team["statuses"])
+            + team_roles_panel(team) + body)
     return page("Team Screen - " + team["name"], body + team_footer(game_code, team_index))
 
 
@@ -2300,7 +2651,8 @@ def open_course_button(game_code, team_index):
 def cp_header(game_code, team_index, team, index):
     return ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
             "<p>" + open_course_button(game_code, team_index) + "</p></div>"
-            + resource_meters(team["resources"], team["statuses"]))
+            + resource_meters(team["resources"], team["statuses"])
+            + team_roles_panel(team))
 
 
 def multiselect_form(game_code, team_index, index, error_message=""):

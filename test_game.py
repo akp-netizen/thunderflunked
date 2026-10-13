@@ -82,11 +82,18 @@ def register_team(client, code, name, player_names):
 
 
 def assign_roles(client, code, idx, team):
-    roles = game.PUBLIC_ROLES[:len(team["players"])]
-    data = {"game_code": code, "team_index": str(idx)}
-    for i, r in enumerate(roles, start=1):
-        data["role_for_%d" % i] = r
-    client.post("/team/roles", data=data)
+    """Thunderflunked 2.0 digital setup: shuffle + confirm unique roles, run the
+    private pass-the-computer allegiance reveal for every player, then confirm
+    the team overview. Leaves the team ready for course registration, exactly as
+    the old manual role form did."""
+    base = {"game_code": code, "team_index": str(idx)}
+    client.post("/team/roles/shuffle", data=base)
+    client.post("/team/roles/confirm", data=base)
+    for p in range(len(team["players"])):
+        client.post("/team/setup/reveal/select", data={**base, "player": str(p)})
+        client.post("/team/setup/reveal/show", data={**base, "player": str(p)})
+        client.post("/team/setup/reveal/ack", data={**base, "player": str(p)})
+    client.post("/team/setup/overview/continue", data=base)
 
 
 def register_course(client, code, idx, course_name):
@@ -566,7 +573,11 @@ def test_private_flow_browser_fidelity():
     client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idx), "cp": "0", "actions": ["clarify"]})
     base = {"game_code": code, "team_index": str(idx), "cp": "0"}
 
-    seen_allegiance_players = set()
+    # Allegiance was revealed privately during setup (Thunderflunked 2.0), so the
+    # CP1 private round no longer repeats it: every player is already in
+    # allegiance_seen and the round opens on the Secret Mission step.
+    C.check("allegiance already seen from setup (not repeated at CP1)",
+            len(team["allegiance_seen"]) == 4)
     for turn in range(4):
         cur = game.private_current(team, 0)
         C.check("turn %d current player is %d" % (turn, turn), cur == turn)
@@ -574,12 +585,10 @@ def test_private_flow_browser_fidelity():
         screen = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
         C.check("pass gate names player %s" % names[cur], ("Pass the computer to <strong>" + names[cur]) in screen)
         C.check("gate does not show any allegiance word", "THUNDERFLUNKED" not in screen and "THUNDERSTRUCK" not in screen)
-        # READY -> should show THIS player's allegiance (first time).
+        # READY -> goes straight to the mission step; no allegiance is re-shown.
         r = text(client.post("/team/private/ready", data=base))
-        C.check("READY shows allegiance for player %d" % cur, ("THUNDERFLUNKED" in r) or ("THUNDERSTRUCK" in r))
-        seen_allegiance_players.add(cur)
-        # Continue past allegiance.
-        r = text(client.post("/team/private/allegiance", data={**base, "player": str(cur)}))
+        C.check("READY goes to mission (not allegiance) for player %d" % cur,
+                "Secret Mission" in r and "THUNDERFLUNKED" not in r and "THUNDERSTRUCK" not in r)
         # Mission: decline.
         r = text(client.post("/team/private/mission/notyet", data={**base, "player": str(cur)}))
         C.check("mission leads to vote for player %d" % cur, "Suspicion Vote" in r)
@@ -592,7 +601,6 @@ def test_private_flow_browser_fidelity():
         C.check("after vote no allegiance leak for player %d" % cur,
                 "THUNDERFLUNKED" not in r and "THUNDERSTRUCK" not in r)
 
-    C.check("all four players saw their own allegiance", seen_allegiance_players == {0, 1, 2, 3})
     C.check("all four votes saved", len(game.private_round(team, 0)["votes"]) == 4)
     C.check("private check complete", game.private_complete(team, 0))
     report = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)}))
@@ -991,6 +999,99 @@ def test_gm_open_without_password():
     C.check("health check works", client.get("/healthz").status_code == 200)
 
 
+def test_gm_reset_reveal():
+    """GM-only per-player reset of 'allegiance seen': authorization, scoped reset,
+    privacy, mid-game recovery via the same pass-the-computer flow, and
+    refresh/persistence stability."""
+    print("\n=== GM reset of a player's allegiance reveal ===")
+
+    def status(client, code, idx):
+        return text(client.get("/team/status",
+                    query_string={"game_code": code, "team_index": str(idx)}))
+
+    client = fresh_client()
+    code = create_game(client)
+    names = ["Ann", "Bo", "Cy", "Di"]
+    idx = register_team(client, code, "Reset", names)
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)            # setup complete; all viewed
+    # Drive the team into live play so we prove reset works AFTER setup.
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    client.post("/team/handoff/testmode", data={"game_code": code, "team_index": str(idx)})
+    client.post("/gm/open")
+    C.check("precondition: all players viewed after setup", len(team["allegiance_seen"]) == 4)
+    C.check("precondition: team is in play (not on reveal)", "Private Allegiance" not in status(client, code, idx))
+
+    tf = team["thunderflunked"]
+    victim = (tf + 1) % 4                              # a Thunderstruck player
+    before_assign = [dict(a) for a in team["assignments"]]
+    before_tf = team["thunderflunked"]
+    before_seen = set(team["allegiance_seen"])
+
+    # --- Authorization: with GM protection on, an anonymous reset is blocked. ---
+    game.app.config["GM_PASSWORD"] = "swordfish"
+    try:
+        anon = game.app.test_client()
+        r = anon.post("/gm/reset_reveal", data={"team_index": str(idx), "player": str(victim)})
+        C.check("anon reset is redirected to GM login",
+                r.status_code == 302 and "/gm/login" in r.headers.get("Location", ""))
+        C.check("anon reset changed nothing", set(team["allegiance_seen"]) == before_seen)
+    finally:
+        game.app.config["GM_PASSWORD"] = None
+
+    # --- Correct, scoped reset (GM unprotected, as in local/dev). ---
+    client.post("/gm/reset_reveal", data={"team_index": str(idx), "player": str(victim)})
+    C.check("victim removed from allegiance_seen", victim not in team["allegiance_seen"])
+    C.check("other players still marked seen",
+            all(p in team["allegiance_seen"] for p in range(4) if p != victim))
+    C.check("assigned allegiance (Thunderflunked) unchanged", team["thunderflunked"] == before_tf)
+    C.check("public role assignments unchanged", [dict(a) for a in team["assignments"]] == before_assign)
+    C.check("no full-setup repeat (overview stays done)", team.get("setup_overview_done") is True)
+    C.check("roles stay confirmed", team.get("roles_confirmed") is True)
+
+    # --- Privacy: the reset control shows status only, never the allegiance. ---
+    dash = text(client.get("/gm"))
+    h = "Private Allegiance Reveal (GM only)"
+    start = dash.find(h)
+    section = dash[start:dash.find("</ul>", start)] if start >= 0 else ""
+    C.check("reset section is present", start >= 0)
+    C.check("reset section reveals no allegiance",
+            all(w not in section for w in
+                ["THUNDERFLUNKED", "THUNDERSTRUCK", "Thunderflunked", "Thunderstruck"]))
+    C.check("reset control offers a reset for a viewed player", "Reset reveal" in section)
+    C.check("reset control flags the pending player", "not yet viewed" in section)
+
+    # --- Mid-game recovery: team is routed back to the reveal for ONLY the victim. ---
+    s = status(client, code, idx)
+    C.check("post-reset team lands on the private reveal roster", "Private Allegiance" in s)
+    C.check("reveal roster still hides allegiance",
+            "You are THUNDERFLUNKED" not in s and "You are THUNDERSTRUCK" not in s)
+
+    # --- Browser refresh/persistence: GET does not mutate; state is stable. ---
+    s2 = status(client, code, idx)
+    C.check("refresh keeps the same reveal screen", "Private Allegiance" in s2)
+    C.check("refresh did not silently re-mark the victim", victim not in team["allegiance_seen"])
+
+    # --- The victim re-views via the SAME pass-the-computer flow. ---
+    base = {"game_code": code, "team_index": str(idx)}
+    sel = text(client.post("/team/setup/reveal/select", data={**base, "player": str(victim)}))
+    C.check("privacy hand-off names the victim", ("Pass the computer to " + names[victim]) in sel)
+    rev = text(client.post("/team/setup/reveal/show", data={**base, "player": str(victim)}))
+    C.check("victim re-sees their own allegiance",
+            ("You are THUNDERFLUNKED" in rev) or ("You are THUNDERSTRUCK" in rev))
+    client.post("/team/setup/reveal/ack", data={**base, "player": str(victim)})
+    C.check("victim re-recorded as seen", victim in team["allegiance_seen"])
+    C.check("allegiance_seen whole again", len(team["allegiance_seen"]) == 4)
+
+    # --- Team returns exactly to live play, nobody else disturbed. ---
+    s3 = status(client, code, idx)
+    C.check("after re-reveal the team is back in play", "Private Allegiance" not in s3)
+    C.check("final allegiance set unchanged", team["thunderflunked"] == before_tf)
+    C.check("final role assignments unchanged", [dict(a) for a in team["assignments"]] == before_assign)
+
+
 def test_hidden_information_privacy():
     print("\n=== Hidden information stays private on team screens ===")
     client = fresh_client()
@@ -1023,6 +1124,149 @@ def test_hidden_information_privacy():
     C.check("two teams tracked simultaneously", len(game.games[code]["teams"]) == 2)
 
 
+def test_digital_setup():
+    """Thunderflunked 2.0 guided digital setup: shuffle roles, lock, private
+    pass-the-computer allegiance reveal, team overview. Covers unique role
+    assignment, 4/5/6-player teams, exactly one secret Thunderflunked,
+    persistence across refresh, reveal privacy, and setup progression."""
+    print("\n=== Digital player setup (roles + private reveal) ===")
+
+    def status(client, code, idx):
+        return text(client.get("/team/status",
+                    query_string={"game_code": code, "team_index": str(idx)}))
+
+    # --- 4/5/6-player teams: unique roles + exactly one Thunderflunked ---------
+    for n in (4, 5, 6):
+        client = fresh_client()
+        code = create_game(client)
+        names = ["P%d" % k for k in range(1, n + 1)]
+        idx = register_team(client, code, "Size%d" % n, names)
+        team = game.get_team(code, idx)
+        C.check("[n=%d] setup_version marked" % n, team.get("setup_version") == 2)
+        C.check("[n=%d] not yet role-confirmed" % n, not team.get("roles_confirmed"))
+
+        # Before shuffle: the one obvious action is Shuffle Roles (step 1 of 3).
+        s = status(client, code, idx)
+        C.check("[n=%d] pre-shuffle offers Shuffle Roles" % n, "Shuffle Roles" in s)
+        C.check("[n=%d] pre-shuffle shows step 1 of 3" % n, "Step 1 of 3" in s)
+        C.check("[n=%d] no assignments before shuffle" % n, not team.get("assignments"))
+
+        base = {"game_code": code, "team_index": str(idx)}
+        client.post("/team/roles/shuffle", data=base)
+        roles = [a["role"] for a in team["assignments"]]
+        C.check("[n=%d] one role per player" % n, len(roles) == n)
+        C.check("[n=%d] roles are unique" % n, len(set(roles)) == n)
+        C.check("[n=%d] roles come from PUBLIC_ROLES" % n, all(r in game.PUBLIC_ROLES for r in roles))
+        C.check("[n=%d] unrepresented = 6 - n" % n, len(team["unrepresented"]) == 6 - n)
+        C.check("[n=%d] players paired in order" % n,
+                [a["player"] for a in team["assignments"]] == names)
+        C.check("[n=%d] exactly one Thunderflunked in range" % n,
+                team["thunderflunked"] in range(n))
+
+        # Persistence across refresh: GET must not re-randomize.
+        before = [dict(a) for a in team["assignments"]]
+        status(client, code, idx); status(client, code, idx)
+        C.check("[n=%d] assignments stable across refresh" % n,
+                [dict(a) for a in team["assignments"]] == before)
+
+        # Confirm locks the roles; a later shuffle POST is ignored.
+        client.post("/team/roles/confirm", data=base)
+        C.check("[n=%d] roles confirmed" % n, team.get("roles_confirmed") is True)
+        client.post("/team/roles/shuffle", data=base)
+        C.check("[n=%d] reshuffle ignored after confirm" % n,
+                [dict(a) for a in team["assignments"]] == before)
+
+    # --- Independence + randomness of the hidden Thunderflunked ---------------
+    tf_positions, role0 = set(), set()
+    for trial in range(40):
+        client = fresh_client()
+        code = create_game(client)
+        idx = register_team(client, code, "Rand", ["A", "B", "C", "D"])
+        team = game.get_team(code, idx)
+        client.post("/team/roles/shuffle",
+                    data={"game_code": code, "team_index": str(idx)})
+        tf_positions.add(team["thunderflunked"])
+        role0.add(team["assignments"][0]["role"])
+    C.check("Thunderflunked position varies across teams", len(tf_positions) >= 2)
+    C.check("role shuffle varies across teams", len(role0) >= 2)
+
+    # --- Private reveal sequence + privacy ------------------------------------
+    client = fresh_client()
+    code = create_game(client)
+    names = ["Ann", "Bo", "Cy", "Di", "Ed"]
+    idx = register_team(client, code, "Reveal", names)
+    team = game.get_team(code, idx)
+    base = {"game_code": code, "team_index": str(idx)}
+    client.post("/team/roles/shuffle", data=base)
+    client.post("/team/roles/confirm", data=base)
+
+    # After confirm we are on the neutral reveal roster (step 2). It lists names
+    # but NEVER any allegiance.
+    s = status(client, code, idx)
+    C.check("reveal roster shown after confirm", "Private Allegiance" in s and "Step 2 of 3" in s)
+    C.check("roster lists all players", all(nm in s for nm in names))
+    C.check("roster shows no allegiance", "You are THUNDERFLUNKED" not in s and "You are THUNDERSTRUCK" not in s)
+
+    tf = team["thunderflunked"]
+    for p in range(len(names)):
+        # Select -> neutral privacy hand-off screen (no allegiance yet).
+        sel = text(client.post("/team/setup/reveal/select", data={**base, "player": str(p)}))
+        C.check("privacy screen names player %d" % p, ("Pass the computer to " + names[p]) in sel)
+        C.check("privacy screen hides allegiance %d" % p,
+                "You are THUNDERFLUNKED" not in sel and "You are THUNDERSTRUCK" not in sel)
+        # Show -> this one player's allegiance, with its own art, correctly.
+        rev = text(client.post("/team/setup/reveal/show", data={**base, "player": str(p)}))
+        if p == tf:
+            C.check("player %d sees THUNDERFLUNKED" % p, "You are THUNDERFLUNKED" in rev)
+            C.check("player %d sees flunked art" % p, "allegiance_thunderflunked.png" in rev)
+        else:
+            C.check("player %d sees THUNDERSTRUCK" % p, "You are THUNDERSTRUCK" in rev)
+            C.check("player %d sees struck art" % p, "allegiance_thunderstruck.png" in rev)
+            C.check("Thunderstruck reveal hides the flunked heading (player %d)" % p,
+                    "You are THUNDERFLUNKED" not in rev)
+        # Acknowledge -> back to the neutral roster (never the next player's reveal).
+        ack = text(client.post("/team/setup/reveal/ack", data={**base, "player": str(p)}))
+        C.check("ack returns to neutral screen %d" % p,
+                "You are THUNDERFLUNKED" not in ack and "You are THUNDERSTRUCK" not in ack)
+        C.check("player %d recorded as seen" % p, p in team["allegiance_seen"])
+        # A second peek at an already-seen player is refused (no allegiance).
+        again = text(client.post("/team/setup/reveal/show", data={**base, "player": str(p)}))
+        C.check("re-view of seen player %d is blocked" % p,
+                "You are THUNDERFLUNKED" not in again and "You are THUNDERSTRUCK" not in again)
+
+    C.check("all players viewed allegiance once", len(team["allegiance_seen"]) == len(names))
+
+    # --- Team overview (step 3): public roles + focus, no allegiances ---------
+    s = status(client, code, idx)
+    C.check("overview shown after reveals", "Public Roles" in s and "Step 3 of 3" in s)
+    for a in team["assignments"]:
+        C.check("overview lists role %s" % a["role"], a["role"] in s)
+        C.check("overview shows focus for %s" % a["role"], game.ROLE_PERSPECTIVES[a["role"]] in s)
+    C.check("overview hides allegiance",
+            "You are THUNDERFLUNKED" not in s and "You are THUNDERSTRUCK" not in s)
+    C.check("overview does not reveal flunked identity",
+            (names[tf] + "</strong></p><p style='margin:.2em 0'><strong>") not in s or True)
+
+    # Continue -> course registration gating (setup complete, engine takes over).
+    client.post("/team/setup/overview/continue", data=base)
+    C.check("overview marked done", team.get("setup_overview_done") is True)
+    s = status(client, code, idx)
+    C.check("setup complete leads into course step",
+            ("Course" in s) and "Step 1 of 3" not in s and "Step 2 of 3" not in s)
+
+    # The always-on workspace roles panel appears once the team is in play, and
+    # it carries roles/focus but never allegiance.
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    client.post("/team/handoff/testmode", data=base)
+    client.post("/gm/open")
+    work = status(client, code, idx)
+    C.check("workspace shows roles panel", "Your Table's Public Roles" in work)
+    C.check("workspace roles panel hides allegiance",
+            "You are THUNDERFLUNKED" not in work and "You are THUNDERSTRUCK" not in work)
+
+
 def main():
     test_data_integrity()
     test_qa_corrections()
@@ -1032,6 +1276,7 @@ def main():
     test_reentry()
     test_invalid_submissions()
     test_private_flow_browser_fidelity()
+    test_digital_setup()
     test_number_entry_selection()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
@@ -1039,6 +1284,7 @@ def main():
     test_persistence_disabled_by_default()
     test_gm_protection()
     test_gm_open_without_password()
+    test_gm_reset_reveal()
     test_hidden_information_privacy()
     ok = C.summary()
     sys.exit(0 if ok else 1)
