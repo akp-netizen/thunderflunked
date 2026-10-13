@@ -1066,6 +1066,9 @@ body.shell{background:#fff;}
 .lms-course a{display:block;padding:9px 16px;color:#394B58;text-decoration:none;border-left:4px solid transparent;}
 .lms-course a:hover{background:#f2f4f5;}
 .lms-course a.active{color:#A4343A;font-weight:700;border-left-color:#A4343A;}
+.lms-course a.wx{background:#faf3f3;}
+.lms-course a.wx::before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;background:#A4343A;margin-right:7px;vertical-align:middle;}
+.nav-wx{display:block;font-size:.72rem;font-weight:600;color:#A4343A;margin:1px 0 0 15px;}
 .lms-content{flex:1;padding:18px 26px;min-width:0;}
 .lms-crumb{color:#A4343A;font-size:.85rem;margin-bottom:6px;}
 .lms-crumb a{color:#A4343A;text-decoration:none;}
@@ -4881,6 +4884,29 @@ COURSE_NAV = [
 ]
 NAV_LABEL = dict(COURSE_NAV)
 
+# ---------------------------------------------------------------------------
+# Contextual Canvas highlights (Step 13). For each checkpoint index we flag 1-3
+# course-navigation sections that hold genuinely relevant, current evidence for
+# that scenario -- a neutral "Worth exploring" nudge toward investigation, never
+# a hint at the correct decision. Keys are COURSE_NAV keys; every section stays
+# fully accessible whether or not it is flagged. Each entry is justified by the
+# actual section content at that checkpoint:
+#   CP1 (idx0): Grades (blank/missing cells), Syllabus (due-date mismatch notice),
+#               Inbox (the week-1 student messages).
+#   CP2 (idx1): People (the newly joined students, pilled), Modules (Start-Here /
+#               onboarding note for new students).
+#   CP3 (idx2): Grades (Major Assessment 1 + the category breakdown).
+#   CP4 (idx3): Grades (midterm backlog / scores), Inbox ("can't find your feedback").
+#   CP5 (idx4): Grades (final items, missing-as-blank), Announcements (end-of-term
+#               checklist: final grades timeline + Course Improvement Survey).
+CP_CANVAS_HIGHLIGHTS = {
+    0: ["gradebook", "syllabus", "inbox"],
+    1: ["roster", "modules"],
+    2: ["gradebook"],
+    3: ["gradebook", "inbox"],
+    4: ["gradebook", "announcements"],
+}
+
 # Minimal inline SVG icons for the decorative global nav rail (no emoji, no assets).
 _GI = {
     "account": "<circle cx='12' cy='8' r='4'/><path d='M4 21c0-4 4-6 8-6s8 2 8 6'/>",
@@ -4911,12 +4937,24 @@ def course_nav(game_code, team_index, active, course_code):
     # Keep the embed flag on in-pane Canvas navigation so tab clicks stay inside
     # the split's left pane (and keep their cross-pane chrome suppressed).
     suffix = "&embed=1" if _embedded() else ""
+    # Contextual highlights for the CURRENT checkpoint. Read-only: derived from the
+    # game's checkpoint_index, so a refresh shows the right highlights and never
+    # changes state, and advancing the checkpoint updates them automatically.
+    highlights = set(CP_CANVAS_HIGHLIGHTS.get(shell_cp_index(game_code), []))
     links = ""
     for key, label in COURSE_NAV:
-        cls = " class='active'" if key == active else ""
+        classes = (["active"] if key == active else []) + (["wx"] if key in highlights else [])
+        cls = (" class='" + " ".join(classes) + "'") if classes else ""
         cur = " aria-current='page'" if key == active else ""
-        links += ("<a" + cls + cur + " href='" + shell_url(game_code, team_index, key) + suffix + "'>"
-                  + label + "</a>")
+        if key in highlights:
+            # Neutral nudge: a dot (CSS) + a small visible/sr label. Never says
+            # "correct" or anything strategy-revealing.
+            inner = (label + "<span class='nav-wx'>Worth exploring</span>")
+            extra = " title='Worth exploring'"
+        else:
+            inner, extra = label, ""
+        links += ("<a" + cls + cur + extra + " href='"
+                  + shell_url(game_code, team_index, key) + suffix + "'>" + inner + "</a>")
     return ("<nav class='lms-course' aria-label='Course navigation'>"
             "<div class='ch'>" + course_code + "</div>" + links + "</nav>")
 

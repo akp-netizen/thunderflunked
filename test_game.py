@@ -1315,6 +1315,99 @@ def test_split_workspace():
             "ws-panes" not in early)
 
 
+def test_canvas_highlights():
+    """Contextual Canvas navigation highlights (Step 13): checkpoint->section
+    mapping, genuinely-relevant content, correct advancement, accessibility,
+    neutral language, privacy, and no exposure of scoring or correct answers."""
+    print("\n=== Contextual Canvas highlights ===")
+    client = fresh_client()
+    code = create_game(client)
+    idx = register_team(client, code, "Hi", ["A", "B", "C", "D"])
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    finish_reassignment(client, code)
+    qs = {"game_code": code, "team_index": str(idx)}
+
+    def nav():
+        return text(client.get("/team/shell", query_string={**qs, "tab": "home", "embed": "1"}))
+
+    def section(tab):
+        return text(client.get("/team/shell", query_string={**qs, "tab": tab, "embed": "1"}))
+
+    def highlighted(html):
+        return set(k for _cls, k in re.findall(r"class='([^']*wx[^']*)'[^>]*tab=(\w+)", html))
+
+    # One representative, genuinely-relevant content string per flagged section.
+    content = {
+        0: {"gradebook": "missing", "syllabus": "disagree", "inbox": "confusing"},
+        1: {"roster": "late add", "modules": "new students"},
+        2: {"gradebook": "major assessment 1"},
+        3: {"gradebook": "assignment 3", "inbox": "feedback"},
+        4: {"gradebook": "final", "announcements": "course improvement survey"},
+    }
+    seen = []
+    for cpn in range(5):
+        client.post("/gm/open")
+        n = nav()
+        hi = highlighted(n)
+        seen.append(frozenset(hi))
+        C.check("CP%d highlights match the explicit mapping" % (cpn + 1),
+                hi == set(game.CP_CANVAS_HIGHLIGHTS[cpn]))
+        C.check("CP%d flags 1-3 sections (not excessive)" % (cpn + 1), 1 <= len(hi) <= 3)
+        # Each flagged section actually contains current, relevant evidence.
+        for tab, needle in content[cpn].items():
+            C.check("CP%d: flagged '%s' holds relevant content" % (cpn + 1, tab),
+                    needle in section(tab).lower())
+        # Every section stays reachable whether or not it is flagged.
+        for key, _label in game.COURSE_NAV:
+            C.check("CP%d: nav keeps '%s' accessible" % (cpn + 1, key), ("tab=" + key) in n)
+        # Neutral language only; nothing that reveals the correct/best choice.
+        C.check("CP%d: uses neutral 'Worth exploring'" % (cpn + 1), "Worth exploring" in n)
+        for bad in ["Correct", "Best choice", "best choice", "correct answer",
+                    "Overall Course Score", "THUNDERFLUNKED"]:
+            C.check("CP%d: nav avoids '%s'" % (cpn + 1, bad), bad not in n)
+
+        if cpn == 0:
+            # Privacy: a private pass-the-computer screen carries no Canvas highlight.
+            client.post("/team/cp/submit", data={**qs, "cp": "0", "actions": ["clarify"]})
+            priv = text(client.post("/team/private/ready", data={**qs, "cp": "0"}))
+            # Highlights live only in the Canvas course nav, which private screens
+            # never render. (BASE_CSS defining .nav-wx is in every head; we check
+            # the rendered MARKUP, not the stylesheet.)
+            C.check("private screen renders no Canvas nav", "<nav class='lms-course'" not in priv)
+            C.check("private screen shows no 'Worth exploring' flag", "Worth exploring" not in priv)
+            C.check("private screen shows no highlight span", "<span class='nav-wx'>" not in priv)
+            # Refresh does not change game state.
+            before = game.games[code]["checkpoint_index"]
+            nav(); nav()
+            C.check("refreshing the shell does not change checkpoint state",
+                    game.games[code]["checkpoint_index"] == before)
+            run_private_check(client, code, idx, team, 0)
+        elif cpn == 1:
+            client.post("/team/cp/submit", data={**qs, "cp": "1", "actions": ["start_here"]})
+        elif cpn == 2:
+            client.post("/team/cp/submit", data={**qs, "cp": "2", "actions": ["aligned_practice"]})
+            run_private_check(client, code, idx, team, 2)
+        elif cpn == 3:
+            client.post("/team/cp4/submit", data={**qs, "priority": "scalable", "supporting": "tool"})
+        elif cpn == 4:
+            client.post("/team/cp5/submit", data={**qs, "protect": "grading",
+                                                  "repair": "gradebook", "not_add": "extra_credit"})
+        client.post("/gm/lock")
+        if cpn < 4:
+            client.post("/gm/advance")
+
+    C.check("highlights update as the GM advances (distinct sets across CPs)", len(set(seen)) >= 3)
+    # The mapping itself only names real nav keys and flags 1-3 per checkpoint.
+    navkeys = {k for k, _ in game.COURSE_NAV}
+    for i, keys in game.CP_CANVAS_HIGHLIGHTS.items():
+        C.check("mapping CP%d uses real nav keys, 1-3 of them" % (i + 1),
+                1 <= len(keys) <= 3 and all(k in navkeys for k in keys))
+
+
 def test_resources_drawer():
     """Always-available Resources drawer in the public Team Workspace: resource
     completeness, category + teaching-context filters, artwork, privacy (absent
@@ -1784,6 +1877,7 @@ def main():
     test_digital_student_placement()
     test_reassignment_pool_vs_backfill()
     test_resources_drawer()
+    test_canvas_highlights()
     test_split_workspace()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
