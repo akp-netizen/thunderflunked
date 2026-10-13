@@ -850,6 +850,25 @@ COURSE_TOOLS = [r for r in RESOURCES if r["category"] == TOOL]
 STUDENT_SUPPORTS = [r for r in RESOURCES if r["category"] == SUPPORT]
 
 
+def _resource_image_map():
+    """Map each resource NAME to its committed artwork under static/art/, but only
+    when the file actually exists (so a resource with no accurate artwork simply
+    shows none). Built once at import."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "art")
+    out = {}
+    for r in RESOURCES:
+        pre = "tool" if r["category"] == TOOL else "support"
+        folder = "tools" if pre == "tool" else "supports"
+        slug = "_".join("".join(c if c.isalnum() else " " for c in r["name"].lower()).split())
+        fn = pre + "_" + slug + ".png"
+        if os.path.exists(os.path.join(base, folder, fn)):
+            out[r["name"]] = "/static/art/" + folder + "/" + fn
+    return out
+
+
+RESOURCE_IMAGE = _resource_image_map()
+
+
 def modality_class(modality):
     """Collapse a course's modality string into one of: online, campus, cte."""
     m = (modality or "").lower()
@@ -861,10 +880,18 @@ def modality_class(modality):
 
 
 def support_context_note(team):
-    """Modality-aware guidance for choosing a STUDENT SUPPORT. Deliberately NOT a
-    lookup table: it frames which options are most accessible while keeping several
-    valid, and reminds faculty to match the need before referring anyone."""
-    mc = modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality"))
+    """Modality-aware guidance for the team's own course. Thin wrapper over
+    support_context_note_for()."""
+    return support_context_note_for(
+        modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality")))
+
+
+def support_context_note_for(mc):
+    """Modality-aware guidance for choosing a STUDENT SUPPORT, for a given
+    modality_class ('online' / 'cte' / 'campus'). Deliberately NOT a lookup
+    table: it frames which options are most accessible while keeping several
+    valid, and reminds faculty to match the need before referring anyone. Reused
+    by the shell Resources tab and the workspace Resources drawer (same text)."""
     if mc == "online":
         return ("For this asynchronous online course, <strong>Brainfuse online tutoring</strong> "
                 "(sidebar link in Canvas) is usually the most accessible tutoring option — "
@@ -2533,7 +2560,8 @@ def status_screen(game_code, team_index, team):
         body = ("<div class='card'><h2>Please wait for the Game Master</h2>"
                 "<p>Checkpoint " + str(number) + " (" + name + ") has not been opened yet.</p></div>")
     body = ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
-            "<p>" + open_course_button(game_code, team_index) + "</p></div>"
+            "<p>" + open_course_button(game_code, team_index) + "</p>"
+            + resources_drawer(team) + "</div>"
             + resource_meters(team["resources"], team["statuses"])
             + team_roles_panel(team) + body)
     return page("Team Screen - " + team["name"], body + team_footer(game_code, team_index))
@@ -3313,7 +3341,8 @@ def open_course_button(game_code, team_index):
 
 def cp_header(game_code, team_index, team, index):
     return ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
-            "<p>" + open_course_button(game_code, team_index) + "</p></div>"
+            "<p>" + open_course_button(game_code, team_index) + "</p>"
+            + resources_drawer(team) + "</div>"
             + resource_meters(team["resources"], team["statuses"])
             + team_roles_panel(team))
 
@@ -4592,6 +4621,100 @@ def resources_panel_full(team):
 
 def shell_resources(team, cp_index):
     return resources_panel_full(team)
+
+
+def resources_drawer(team):
+    """Always-available Resources overlay for the PUBLIC Team Workspace. Reuses
+    the existing 12 instructor tools + 6 student supports and their descriptions
+    (no new resources, no rewritten text). Category and teaching-context filters
+    are a pure-CSS radio group that works with JavaScript disabled; JS adds
+    Escape-to-close, the close button, backdrop-click, and focus handling. It
+    opens in place without navigating, so decision-form selections are preserved.
+    Rendered only on public gameplay screens -- never on a private screen."""
+    mc = modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality"))
+    items = ""
+    for r in RESOURCES:
+        cat = "tool" if r["category"] == TOOL else "support"
+        src = RESOURCE_IMAGE.get(r["name"])
+        img = ("<img src='" + src + "' alt='' loading='lazy' class='res-img'>") if src else ""
+        mnote = ("<p class='muted'><strong>Teaching-context note:</strong> " + e(r["modality_note"])
+                 + "</p>") if r.get("modality_note") else ""
+        items += ("<div class='res-item' data-cat='" + cat + "'>" + img
+                  + _resource_card_html(r) + mnote + "</div>")
+    notes = ("<p class='res-note res-note-online'>" + support_context_note_for("online") + "</p>"
+             "<p class='res-note res-note-campus'>" + support_context_note_for("campus") + "</p>"
+             "<p class='res-note res-note-cte'>" + support_context_note_for("cte") + "</p>")
+    ck = {"online": "", "campus": "", "cte": ""}
+    ck[mc] = " checked"
+    css = ("<style>"
+           ".res-drawer{display:block;margin:6px 0 0;}"
+           ".res-open{display:inline-block;padding:8px 16px;background:var(--red);color:#fff;"
+           "border-radius:8px;font-weight:700;cursor:pointer;list-style:none;}"
+           ".res-open::-webkit-details-marker{display:none;}.res-open::marker{content:'';}"
+           # Closed by default so the fixed backdrop/panel can never intercept
+           # clicks or focus on the decision controls; shown only when [open].
+           # (Author rules can override the UA's details-closed hiding, so we gate
+           # display explicitly rather than relying on it.)
+           ".res-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:60;"
+           "justify-content:flex-end;display:none;}"
+           ".res-drawer[open] .res-overlay{display:flex;}"
+           ".res-panel{background:#fff;color:#2d3b45;width:min(600px,100%);height:100%;overflow:auto;"
+           "padding:16px 18px;box-shadow:-4px 0 20px rgba(0,0,0,.25);}"
+           ".res-r{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);}"
+           ".res-head{display:flex;justify-content:space-between;align-items:center;gap:12px;}"
+           ".res-close{background:#edf0f2;border:0;border-radius:8px;font-size:1.4rem;line-height:1;"
+           "padding:2px 12px;cursor:pointer;color:#2d3b45;}"
+           ".res-bar{margin:8px 0;font-size:.9rem;}"
+           ".res-bar label{display:inline-block;margin:2px 4px 2px 0;padding:6px 12px;border:1px solid #c7cdd1;"
+           "border-radius:16px;cursor:pointer;background:#f5f5f5;color:#2d3b45;}"
+           "#rc-all:checked~.res-bar label[for=\"rc-all\"],#rc-tools:checked~.res-bar label[for=\"rc-tools\"],"
+           "#rc-supports:checked~.res-bar label[for=\"rc-supports\"],#rx-online:checked~.res-bar label[for=\"rx-online\"],"
+           "#rx-campus:checked~.res-bar label[for=\"rx-campus\"],#rx-cte:checked~.res-bar label[for=\"rx-cte\"]"
+           "{background:var(--red);color:#fff;border-color:var(--red);}"
+           ".res-r:focus-visible~.res-bar label{outline:2px solid var(--red);outline-offset:2px;}"
+           "#rc-tools:checked~.res-list .res-item[data-cat=\"support\"]{display:none;}"
+           "#rc-supports:checked~.res-list .res-item[data-cat=\"tool\"]{display:none;}"
+           ".res-note{display:none;}"
+           "#rx-online:checked~.res-notes .res-note-online,#rx-campus:checked~.res-notes .res-note-campus,"
+           "#rx-cte:checked~.res-notes .res-note-cte{display:block;}"
+           ".res-notes{background:#faecec;border-radius:8px;padding:2px 12px;margin:6px 0;}"
+           ".res-img{width:100%;max-width:120px;height:auto;border-radius:6px;float:right;margin:0 0 6px 10px;}"
+           "@media(max-width:600px){.res-panel{width:100%;}.res-img{float:none;max-width:100%;}}"
+           "</style>")
+    body = ("<details class='res-drawer'>"
+            "<summary class='res-open'>Resources &amp; Student Support</summary>"
+            "<div class='res-overlay'>"
+            "<div class='res-panel' role='dialog' aria-label='Teaching tools and student supports' tabindex='-1'>"
+            "<input type='radio' class='res-r' name='res-cat' id='rc-all' checked>"
+            "<input type='radio' class='res-r' name='res-cat' id='rc-tools'>"
+            "<input type='radio' class='res-r' name='res-cat' id='rc-supports'>"
+            "<input type='radio' class='res-r' name='res-ctx' id='rx-online'" + ck["online"] + ">"
+            "<input type='radio' class='res-r' name='res-ctx' id='rx-campus'" + ck["campus"] + ">"
+            "<input type='radio' class='res-r' name='res-ctx' id='rx-cte'" + ck["cte"] + ">"
+            "<div class='res-head'><h2 style='margin:0'>Resources &amp; Student Support</h2>"
+            "<button type='button' class='res-close' aria-label='Close resources'>&times;</button></div>"
+            "<p class='muted' style='margin:.3em 0'>Browse teaching tools and student supports at any time. "
+            "Reference only &mdash; it does not choose for you.</p>"
+            "<div class='res-bar' role='radiogroup' aria-label='Filter by category'><strong>Show:</strong> "
+            "<label for='rc-all'>All</label><label for='rc-tools'>Instructor Tools</label>"
+            "<label for='rc-supports'>Student Supports</label></div>"
+            "<div class='res-bar' role='radiogroup' aria-label='Teaching context'><strong>Teaching context:</strong> "
+            "<label for='rx-online'>Online</label><label for='rx-campus'>Face-to-Face</label>"
+            "<label for='rx-cte'>CTE / Lab</label></div>"
+            "<div class='res-notes'>" + notes + "</div>"
+            "<div class='res-list'>" + items + "</div>"
+            "</div></div></details>")
+    script = ("<script>(function(){var d=document.querySelector('.res-drawer');if(!d)return;"
+              "var s=d.querySelector('summary'),p=d.querySelector('.res-panel'),"
+              "x=d.querySelector('.res-close'),o=d.querySelector('.res-overlay');"
+              "function close(){d.open=false;if(s)s.focus();}"
+              "if(x)x.addEventListener('click',close);"
+              "if(o)o.addEventListener('click',function(e){if(e.target===o)close();});"
+              "d.addEventListener('toggle',function(){if(d.open&&p)p.focus();});"
+              "document.addEventListener('keydown',function(e){"
+              "if((e.key==='Escape'||e.key==='Esc')&&d.open)close();});"
+              "})();</script>")
+    return css + body + script
 
 
 # A SMALL set of resources plausibly worth considering at each checkpoint - a mix

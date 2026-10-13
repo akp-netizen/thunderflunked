@@ -1315,6 +1315,127 @@ def test_split_workspace():
             "ws-panes" not in early)
 
 
+def test_resources_drawer():
+    """Always-available Resources drawer in the public Team Workspace: resource
+    completeness, category + teaching-context filters, artwork, privacy (absent
+    from private screens; no secrets/scoring), and form-state preservation."""
+    print("\n=== Resources drawer (public workspace) ===")
+    client = fresh_client()
+    code = create_game(client)
+    idx = register_team(client, code, "Res", ["A", "B", "C", "D"])
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])   # WELL 142, on-campus
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    finish_reassignment(client, code)
+    qs = {"game_code": code, "team_index": str(idx)}
+
+    # Available on the waiting screen (before any checkpoint opens).
+    wait = text(client.get("/team/status", query_string=qs))
+    C.check("drawer available on the waiting screen",
+            "res-drawer" in wait and "Resources &amp; Student Support" in wait)
+
+    client.post("/gm/open")   # CP1
+    cp = text(client.get("/team/status", query_string=qs))
+
+    # --- Completeness: all 12 tools + 6 supports, with existing descriptions ---
+    C.check("drawer has 12 instructor tools", cp.count("data-cat='tool'") == 12)
+    C.check("drawer has 6 student supports", cp.count("data-cat='support'") == 6)
+    for r in game.RESOURCES:
+        C.check("drawer lists resource: %s" % r["name"], r["name"] in cp)
+    C.check("drawer reuses existing resource descriptions",
+            "What it is:" in cp and "When it may help:" in cp and "Limitations:" in cp)
+
+    # --- Artwork, mapped accurately ------------------------------------------
+    C.check("drawer shows tool artwork", "/static/art/tools/tool_" in cp)
+    C.check("drawer shows support artwork", "/static/art/supports/support_" in cp)
+
+    # --- Category filters: All / Instructor Tools / Student Supports ----------
+    C.check("category filters present (All/Tools/Supports)",
+            "for='rc-all'" in cp and "for='rc-tools'" in cp and "for='rc-supports'" in cp)
+    # --- Teaching-context filters: Online / Face-to-Face / CTL/Lab -----------
+    C.check("teaching-context filters present (Online/F2F/CTE)",
+            "for='rx-online'" in cp and "for='rx-campus'" in cp and "for='rx-cte'" in cp)
+    mc = game.modality_class(game.COURSE_BY_NAME[game.COURSE_NAMES[0]]["modality"])
+    C.check("default teaching context matches the course modality",
+            ("id='rx-%s' checked" % mc) in cp)
+    # Context never hard-excludes resources: all 18 remain regardless of context.
+    C.check("context filter does not hide resources (no context-based display:none)",
+            "res-item" in cp and ":checked~.res-list .res-item[data-cat" in cp
+            and "res-note{display:none" in cp)   # only the NOTES toggle, not items
+    C.check("filters are pure-CSS radios (work without JS)",
+            "type='radio'" in cp and ":checked~.res-list" in cp)
+
+    # --- Concern 1: a CLOSED drawer cannot intercept clicks/focus -------------
+    # The fixed backdrop/panel is display:none unless the <details> is [open],
+    # so when closed it is removed from the layout and the hit-testing tree.
+    overlay_rule = cp[cp.index(".res-overlay{"):cp.index(".res-overlay{") + 180]
+    C.check("closed drawer overlay is display:none (cannot intercept)", "display:none" in overlay_rule)
+    C.check("overlay only shows when [open]", ".res-drawer[open] .res-overlay{display:flex" in cp)
+    C.check("base overlay rule is hidden by default (not unconditionally shown)",
+            "flex-end;display:none" in cp)
+
+    # --- Concern 2: the drawer never wraps the decision form ------------------
+    C.check("decision form still renders alongside the drawer",
+            "action='/team/cp/submit'" in cp and "name='actions'" in cp)
+    C.check("drawer opens client-side via <details> (no navigation, no submit)",
+            "<details class='res-drawer'>" in cp)
+    C.check("drawer sits OUTSIDE the decision form (opens before it)",
+            cp.index("res-drawer") < cp.index("action='/team/cp/submit'"))
+    C.check("drawer fully CLOSES before the decision form begins",
+            cp.index("</details>") < cp.index("action='/team/cp/submit'"))
+    C.check("drawer filter fields do not collide with decision fields",
+            "name='res-cat'" in cp and "name='res-ctx'" in cp
+            and "res-cat" != "actions" and "res-ctx" != "reassess")
+
+    # --- Concern 3: all 18 resources + artwork reachable in the SPLIT pane -----
+    embp = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("drawer present in the embedded split pane", "res-drawer" in embp)
+    C.check("embedded pane keeps all 12 tools + 6 supports",
+            embp.count("data-cat='tool'") == 12 and embp.count("data-cat='support'") == 6)
+    C.check("embedded pane keeps tool + support artwork",
+            "/static/art/tools/tool_" in embp and "/static/art/supports/support_" in embp)
+
+    # --- Privacy: no secrets/scoring inside the drawer -----------------------
+    draw = cp[cp.index("<details class='res-drawer'>"):cp.index("</details>")]
+    for leak in ["THUNDERFLUNKED", "THUNDERSTRUCK", "Thunderflunked", "Suspicion",
+                 "Secret Mission", "Overall Course Score", "compute_scores"]:
+        C.check("drawer hides '%s'" % leak, leak not in draw)
+    # The drawer is built only from static RESOURCES + the course modality; it
+    # reads no player/allegiance/score state, so it is deterministic and cannot
+    # carry hidden identities.
+    C.check("drawer content is deterministic (no hidden/random state)",
+            game.resources_drawer(team) == game.resources_drawer(team))
+
+    # --- Privacy: drawer is ABSENT from private pass-the-computer screens -----
+    client.post("/team/cp/submit", data={**qs, "cp": "0", "actions": ["clarify"]})
+    priv = text(client.post("/team/private/ready", data={**qs, "cp": "0"}))
+    C.check("private screen carries no resources drawer", "res-drawer" not in priv)
+    C.check("private screen carries no Resources button", "Resources &amp; Student Support" not in priv)
+
+    # --- Available across all five checkpoints --------------------------------
+    run_private_check(client, code, idx, team, 0)
+    client.post("/gm/lock"); client.post("/gm/advance")
+    def drawer_at_cp(n):
+        return "res-drawer" in text(client.get("/team/status", query_string=qs))
+    client.post("/gm/open")  # CP2
+    C.check("drawer at CP2", drawer_at_cp(2))
+    client.post("/team/cp/submit", data={**qs, "cp": "1", "actions": ["start_here"]})
+    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/open")  # CP3
+    C.check("drawer at CP3", drawer_at_cp(3))
+    client.post("/team/cp/submit", data={**qs, "cp": "2", "actions": ["aligned_practice"]})
+    run_private_check(client, code, idx, team, 2)
+    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/open")  # CP4
+    C.check("drawer at CP4 (brief round)", drawer_at_cp(4))
+    client.post("/team/cp4/submit", data={**qs, "priority": "scalable", "supporting": "tool"})
+    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/open")  # CP5
+    C.check("drawer at CP5", drawer_at_cp(5))
+
+
 def test_reassignment_pool_vs_backfill():
     """Pool-first maximization, backfill correctness, per-student origin labels
     with privacy, GM summary counts, and 15 students in the Canvas roster."""
@@ -1662,6 +1783,7 @@ def main():
     test_number_entry_selection()
     test_digital_student_placement()
     test_reassignment_pool_vs_backfill()
+    test_resources_drawer()
     test_split_workspace()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
