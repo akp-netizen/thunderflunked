@@ -1205,6 +1205,10 @@ def test_persistence_and_restart():
         code, idxA, idxB = _build_midgame(client)
         C.check("persistence enabled during build", storage.is_enabled())
 
+        # A help request must persist across a restart (it is a plain team field).
+        client.post("/team/help", data={"game_code": code, "team_index": str(idxA)})
+        C.check("help request recorded before save", game.help_active(game.get_team(code, idxA)))
+
         # The automatic after-POST save should have written the state out.
         saved_games, saved_code = storage.load_state()
         C.check("state was auto-saved to the database", code in saved_games)
@@ -1236,6 +1240,7 @@ def test_persistence_and_restart():
         C.check("allegiance (Thunderflunked) preserved A", isinstance(teamA["thunderflunked"], int))
         C.check("sabotage-used flag preserved B", teamB["sabotage"]["used"] is True)
         C.check("locked course persisted across restart A", teamA.get("course") in game.COURSE_NAMES)
+        C.check("help request persisted across restart A", game.help_active(teamA) is True)
         C.check("missions preserved A", len(teamA["missions_complete"]) >= 1)
         C.check("votes preserved A", len(game.private_round(teamA, 2)["votes"]) == 4)
         # Digital placement state survives a restart intact.
@@ -1286,6 +1291,12 @@ def test_gm_protection():
         r = anon.post("/gm/create")
         C.check("anon POST /gm/create is blocked", r.status_code == 302)
         C.check("no game created by blocked request", game.active_code is None)
+        # The live GM payload and help-resolve are behind the GM guard.
+        C.check("anon GET /gm/live is blocked", anon.get("/gm/live").status_code == 302)
+        C.check("anon POST /gm/help/resolve is blocked",
+                anon.post("/gm/help/resolve", data={"team_index": "0"}).status_code == 302)
+        # Public team-facing live endpoint stays open (team devices need it).
+        C.check("public /live/game stays open", anon.get("/live/game?game_code=ZZZZZ").status_code == 200)
 
         # The login page itself is reachable.
         r = anon.get("/gm/login")
@@ -1302,7 +1313,7 @@ def test_gm_protection():
         C.check("correct password redirects to dashboard",
                 r.status_code == 302 and r.headers.get("Location", "").endswith("/gm"))
         r = gm.get("/gm")
-        C.check("authenticated GM sees dashboard", r.status_code == 200 and "Game Master Dashboard" in text(r))
+        C.check("authenticated GM sees dashboard", r.status_code == 200 and "Game Master Command Center" in text(r))
         r = gm.post("/gm/create")
         C.check("authenticated GM can create a game", r.status_code == 302 and game.active_code is not None)
 
@@ -1987,6 +1998,107 @@ def test_gm_reset_reveal():
     C.check("final role assignments unchanged", [dict(a) for a in team["assignments"]] == before_assign)
 
 
+def test_gm_command_center_and_help():
+    """Batch 2: the GM Command Center (team cards + detail modals + preserved
+    controls), the Request GM Help flow (request/cancel/resolve, persistence,
+    isolation), the live payloads (authorization + no secret leakage), and the
+    no-interference guarantees."""
+    print("\n=== GM Command Center + Request GM Help ===")
+    import json as _json
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Alpha", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+    iB = register_team(client, code, "Bravo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+
+    # --- Command Center structure ---
+    gm = text(client.get("/gm"))
+    C.check("command center title", "Game Master Command Center" in gm)
+    C.check("one clickable team card per team", gm.count("class='cc-card") >= 2)
+    C.check("cards show team names", "Alpha" in gm and "Bravo" in gm)
+    C.check("pinned control area present", "cc-top" in gm and "cc-deck" in gm)
+    C.check("per-team detail modal present", "id='team-0'" in gm and "id='team-1'" in gm)
+    C.check("existing course control preserved", "Course Selection" in gm)
+    C.check("existing game control preserved", "Game Control" in gm)
+    C.check("detail modal keeps the full GM-authorized readout",
+            "Checkpoint decisions" in gm and "Private Player Checks" in gm)
+
+    # --- Help request (no-JS form path re-renders the team's screen) ---
+    r = text(client.post("/team/help", data={"game_code": code, "team_index": str(iA)}))
+    C.check("help request persisted on the team", game.help_active(tA) is True)
+    C.check("help request isolated to that team", game.help_active(tB) is False)
+
+    gm = text(client.get("/gm"))
+    C.check("GM dashboard shows a help alert", "need help" in gm)
+    C.check("a team card enters the NEEDS HELP state", "state-help" in gm)
+
+    # --- /gm/live: help flagged; NO secret information ---
+    live = _json.loads(text(client.get("/gm/live")))
+    C.check("live payload carries rev + both teams", "rev" in live and len(live["teams"]) == 2)
+    a_row = next(t for t in live["teams"] if t["name"] == "Alpha")
+    C.check("live marks Alpha needing help", a_row["help"] is True and a_row["state"] == "help")
+    C.check("live help_names lists Alpha", "Alpha" in live["help_names"])
+    blob = text(client.get("/gm/live")).lower()
+    for secret in ["thunderflunked", "thunderstruck", "allegiance", "sabotage", "vote", "mission"]:
+        C.check("live payload hides '%s'" % secret, secret not in blob)
+
+    # --- /live/game public, scoped, secret-free ---
+    lg = _json.loads(text(client.get("/live/game",
+                                     query_string={"game_code": code, "team_index": str(iA)})))
+    C.check("public live has rev + help", "rev" in lg and lg["help"] is True)
+    lgt = text(client.get("/live/game",
+                          query_string={"game_code": code, "team_index": str(iA)})).lower()
+    for secret in ["thunderflunked", "allegiance", "sabotage"]:
+        C.check("public live hides '%s'" % secret, secret not in lgt)
+    bad = _json.loads(text(client.get("/live/game", query_string={"game_code": "ZZZZZ", "team_index": "0"})))
+    C.check("unknown game is isolated (empty rev)", bad.get("rev") == "")
+
+    # --- rev changes only on a real phase change (drives reload) ---
+    rev_before = _json.loads(text(client.get("/live/game",
+                                             query_string={"game_code": code, "team_index": str(iA)})))["rev"]
+    client.post("/gm/course/open")
+    rev_after = _json.loads(text(client.get("/live/game",
+                                            query_string={"game_code": code, "team_index": str(iA)})))["rev"]
+    C.check("team rev changes when the GM opens course selection", rev_before != rev_after)
+
+    # --- Cancel + resolve ---
+    client.post("/team/help/cancel", data={"game_code": code, "team_index": str(iA)})
+    C.check("team can cancel its own help request", game.help_active(tA) is False)
+    client.post("/team/help", data={"game_code": code, "team_index": str(iB)})
+    C.check("second team requests help", game.help_active(tB) is True)
+    client.post("/gm/help/resolve", data={"team_index": str(iB)})
+    C.check("GM can mark help resolved", game.help_active(tB) is False)
+
+    # --- Help control on PUBLIC screens, never on PRIVATE reveal ---
+    client.post("/gm/course/close")
+    reg = register_course  # course already closed-locked; place iA for a placement screen
+    reg(client, code, iA, game.COURSE_NAMES[0])
+    tA["dealt"] = game.STUDENTS[:15]; tA["deal_version"] = 2
+    place = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}))
+    C.check("help button present on placement (public)", "Request GM Help" in place)
+
+    # A team parked on its private allegiance reveal must have NO help control.
+    iC = register_team(client, code, "Charlie", ["A", "B", "C", "D"])
+    base = {"game_code": code, "team_index": str(iC)}
+    client.post("/team/roles/shuffle", data=base); client.post("/team/roles/confirm", data=base)
+    client.post("/team/setup/reveal/select", data={**base, "player": "0"})
+    rv = text(client.post("/team/setup/reveal/show", data={**base, "player": "0"}))
+    C.check("private allegiance reveal has NO help control",
+            "Request GM Help" not in rv and "id='helpbox'" not in rv)
+
+    # --- No interference: an AJAX help toggle does not touch game/selection state ---
+    before_cp = _json.dumps(tA.get("cp", {}), sort_keys=True)
+    jr = client.post("/team/help", data={"game_code": code, "team_index": str(iA)},
+                     headers={"X-Requested-With": "fetch"})
+    C.check("ajax help returns JSON (no navigation)", jr.headers.get("Content-Type", "").startswith("application/json"))
+    C.check("ajax help does not disturb checkpoint decisions",
+            _json.dumps(tA.get("cp", {}), sort_keys=True) == before_cp)
+    # A GET poll never mutates team state.
+    snap = _json.dumps({k: tA[k] for k in tA if k not in ("help",)}, sort_keys=True, default=str)
+    client.get("/gm/live"); client.get("/live/game", query_string={"game_code": code, "team_index": str(iA)})
+    C.check("polling does not mutate team state",
+            _json.dumps({k: tA[k] for k in tA if k not in ("help",)}, sort_keys=True, default=str) == snap)
+
+
 def test_hidden_information_privacy():
     print("\n=== Hidden information stays private on team screens ===")
     client = fresh_client()
@@ -2188,6 +2300,7 @@ def main():
     test_gm_protection()
     test_gm_open_without_password()
     test_gm_reset_reveal()
+    test_gm_command_center_and_help()
     test_hidden_information_privacy()
     ok = C.summary()
     sys.exit(0 if ok else 1)

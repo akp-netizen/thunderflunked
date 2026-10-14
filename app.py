@@ -19,12 +19,13 @@ and each team dict (players, roles, course, roster, resources, checkpoint
 decisions, private checks, allegiance, sabotage, accusation).
 """
 
+import json
 import os
 import random
 import threading
 import time
 
-from flask import Flask, request, redirect, url_for, session
+from flask import Flask, request, redirect, url_for, session, jsonify
 from markupsafe import escape
 
 import storage
@@ -958,6 +959,124 @@ def current_phase_key(game):
     return "cp%d" % (idx + 1)
 
 
+# ---------------------------------------------------------------------------
+# Live-update signatures + per-team status (used by the GM Command Center, team
+# waiting screens, and the projector). Polling only -- the global state lock
+# serializes requests, so a long-lived SSE stream would block the whole app.
+# None of these expose secret allegiance, private votes, mission, or sabotage
+# content; they report only public-appropriate phase/progress information.
+# ---------------------------------------------------------------------------
+def game_rev(game):
+    """A compact signature of the game-wide phase. Changes exactly when the GM
+    advances the room (checkpoint open/lock/advance/final, course phase,
+    reassignment). The GM dashboard reloads on change; otherwise it patches
+    cards in place."""
+    return "|".join(str(p) for p in [
+        game.get("checkpoint_index", 0), int(bool(game.get("checkpoint_open"))),
+        int(bool(game.get("opened_once"))), int(bool(game.get("final_open"))),
+        game.get("course_trading", "closed"), int(bool(game.get("reassignment_done"))),
+        len(game.get("teams", []))])
+
+
+def team_rev(game, i):
+    """A signature of everything one team's WAITING screen depends on. A waiting
+    team reloads when this changes (e.g. the GM opens a checkpoint, a trade
+    arrives, reassignment distributes). Never includes private content."""
+    t = game["teams"][i]
+    offers = game.get("course_offers", [])
+    n_off = sum(1 for o in offers if i in (o["frm"], o["to"]))
+    return game_rev(game) + "#" + "|".join(str(p) for p in [
+        t.get("course") or "", t.get("course_held") or "",
+        int(bool(t.get("roster_confirmed"))), int(t.get("reassigned") is not None),
+        int(bool(t.get("placement_acked"))), n_off,
+        len(t.get("players", [])), int(bool(t.get("roles_confirmed"))),
+        len(t.get("allegiance_seen", [])), int(bool(t.get("setup_overview_done")))])
+
+
+def projector_rev(game):
+    """Projector reloads on any phase change, plus final-outcome changes."""
+    base = game_rev(game)
+    if game.get("final_open"):
+        base += "#" + ",".join(str(t.get("accusation")) + ":" + str(t.get("overall"))
+                               for t in game.get("teams", []))
+    return base
+
+
+def help_active(team):
+    return bool(team.get("help", {}).get("active"))
+
+
+def _private_progress(game, team, idx):
+    """How many players have finished the current private round (count only, no
+    content). Full rounds count votes; the CP4 brief round counts passes."""
+    rnd = team.get("private", {}).get(idx, {})
+    done = len(rnd.get("votes", {})) if idx in HAS_PRIVATE else len(rnd.get("passed", []))
+    total = len(team.get("players", []))
+    return done, total
+
+
+def team_live_status(game, i, team):
+    """Public-appropriate 'what is this team doing right now' summary for the GM
+    Command Center card and the live payload. Returns phase/activity/state/
+    progress/course/overall. `state` is working | waiting | finished."""
+    teams = game["teams"]
+    course = team.get("course") or team.get("course_held") or ""
+    overall = team.get("overall")
+    idx = game.get("checkpoint_index", 0)
+
+    def d(phase, activity, state, progress=""):
+        return {"phase": phase, "activity": activity, "state": state,
+                "progress": progress, "course": course, "overall": overall}
+
+    if game.get("final_open"):
+        if team.get("outcome"):
+            return d("Final", "Finished", "finished")
+        if team.get("accusation") is not None:
+            return d("Final", "Accusation in — awaiting outcome", "waiting")
+        return d("Final", "Making the final accusation", "working")
+
+    # Setup (before any checkpoint has been opened).
+    if idx == 0 and not game.get("opened_once"):
+        if not team.get("players"):
+            return d("Setup", "Registering players", "working")
+        if team.get("setup_version") == 2 and not team.get("roles_confirmed"):
+            return d("Setup", "Assigning roles", "working")
+        if (team.get("setup_version") == 2
+                and len(team.get("allegiance_seen", [])) < len(team["players"])):
+            n, tot = len(team.get("allegiance_seen", [])), len(team["players"])
+            return d("Setup", "Private allegiance reveal", "working", "%d/%d viewed" % (n, tot))
+        if team.get("setup_version") == 2 and not team.get("setup_overview_done"):
+            return d("Setup", "Reviewing team overview", "working")
+        if not team.get("course"):
+            ph = game.get("course_trading", "closed")
+            if ph == "not_open":
+                return d("Course selection", "Waiting for course selection to open", "waiting")
+            if ph == "open":
+                return d("Course selection", "Reviewing / trading course", "working")
+            return d("Course selection", "Finalizing course", "working")
+        if team.get("deal_version") == 2:
+            if not team.get("roster_confirmed"):
+                return d("Placement", "Choosing 10 of 15 students", "working")
+            if not team.get("reassigned"):
+                return d("Placement", "Finalized — waiting for other teams", "waiting")
+            if not team.get("placement_acked"):
+                return d("Placement", "Reviewing the final class", "working")
+        return d("Ready", "Set up — waiting for Checkpoint 1", "waiting")
+
+    # Checkpoint phase.
+    cpname = "Checkpoint %d" % (idx + 1)
+    if game.get("checkpoint_open"):
+        if team.get("cp", {}).get(idx, {}).get("submitted"):
+            return d(cpname, "Decision submitted — waiting", "waiting")
+        return d(cpname, "Deciding the checkpoint", "working")
+    if not game.get("opened_once"):
+        return d(cpname, "Waiting for %s to open" % cpname, "waiting")
+    if (idx in HAS_PRIVATE or idx == 3) and not private_complete(team, idx):
+        done, tot = _private_progress(game, team, idx)
+        return d(cpname, "Private player check in progress", "working", "%d/%d done" % (done, tot))
+    return d(cpname, "Decisions locked — waiting for the next step", "waiting")
+
+
 def make_game_code(length=5):
     return "".join(random.choice(CODE_CHARACTERS) for _ in range(length))
 
@@ -1154,6 +1273,67 @@ body.projector th,body.projector td{padding:13px 18px;}
 body.projector .big{font-size:2.1rem;}
 body.projector .footer{font-size:1.15rem;}
 body.projector .muted{color:#555;}
+/* GM Command Center */
+.cc-top{position:sticky;top:0;z-index:20;background:#2a2f36;color:#fff;border-radius:12px;
+  padding:14px 18px;margin:8px 0 14px;display:flex;align-items:center;justify-content:space-between;
+  gap:14px;flex-wrap:wrap;box-shadow:0 2px 8px rgba(0,0,0,.18);}
+.cc-id{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.cc-id-code{font-size:1.5rem;font-weight:800;letter-spacing:.04em;}
+.cc-helpcount{background:var(--bad);color:#fff;font-weight:800;border-radius:20px;padding:4px 14px;font-size:1rem;}
+.cc-top .btn,.cc-top button{padding:9px 16px;font-size:1rem;}
+.cc-top .btn.secondary,.cc-top button.secondary{background:#3a414a;color:#fff;border:1px solid #5a636e;}
+.cc-deck{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin:6px 0 10px;}
+.cc-deck .card{margin:0;}
+.cc-deck .card h2{margin-top:0;font-size:1.25rem;}
+.cc-details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 14px;margin:10px 0;}
+.cc-details>summary{cursor:pointer;font-weight:700;font-size:1.05rem;padding:4px 0;}
+.cc-details .card{margin:10px 0 0;border:0;box-shadow:none;padding:0;}
+.cc-alert{background:#fcebe9;border:2px solid var(--bad);border-left:8px solid var(--bad);border-radius:10px;
+  padding:12px 16px;margin:10px 0 14px;font-size:1.1rem;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.cc-alert strong{color:var(--bad);font-size:1.15rem;}
+.cc-alert-team{display:inline-flex;align-items:center;gap:7px;background:#fff;border:1px solid var(--line);
+  border-radius:20px;padding:3px 6px 3px 12px;}
+.cc-alert-team a{font-weight:700;text-decoration:none;}
+.cc-alert-team button{padding:5px 12px;font-size:.92rem;}
+.cc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin:12px 0;}
+.cc-card{display:block;position:relative;background:var(--card);border:1px solid var(--line);
+  border-left:7px solid var(--gray);border-radius:12px;padding:14px 16px 12px;text-decoration:none;color:var(--ink);
+  box-shadow:0 1px 3px rgba(0,0,0,.06);transition:box-shadow .12s,transform .12s;}
+.cc-card:hover,.cc-card:focus-visible{box-shadow:0 4px 14px rgba(0,0,0,.14);transform:translateY(-2px);outline:none;}
+.cc-card:focus-visible{outline:3px solid #000;outline-offset:2px;}
+.cc-name{font-size:1.3rem;font-weight:800;line-height:1.2;}
+.cc-course{color:var(--gray);font-weight:600;margin:2px 0 8px;}
+.cc-chip{display:inline-block;background:#edf0f2;color:#2d3b45;border-radius:20px;padding:3px 12px;
+  font-size:.92rem;font-weight:700;}
+.cc-activity{margin:9px 0 0;font-size:1.05rem;}
+.cc-prog{color:var(--gray);font-weight:600;}
+.cc-foot{display:flex;align-items:center;justify-content:space-between;margin-top:11px;gap:10px;flex-wrap:wrap;}
+.cc-state{font-weight:800;text-transform:uppercase;letter-spacing:.04em;font-size:.9rem;padding:3px 10px;
+  border-radius:6px;background:#eef0f2;color:#2d3b45;}
+.cc-overall{font-weight:700;color:var(--ink);}
+.cc-open{display:block;margin-top:10px;color:var(--red);font-weight:700;font-size:.95rem;}
+.cc-help-badge{display:none;position:absolute;top:-10px;right:14px;background:var(--bad);color:#fff;
+  font-weight:800;border-radius:16px;padding:4px 14px;font-size:.92rem;box-shadow:0 2px 6px rgba(0,0,0,.25);}
+/* Status colors (text label + border + chip, never color alone) */
+.cc-card.state-working{border-left-color:#2f6fed;}
+.cc-card.state-working .cc-state{background:#e5edff;color:#1b47a8;}
+.cc-card.state-waiting{border-left-color:var(--warn);}
+.cc-card.state-waiting .cc-state{background:#fbeccd;color:#8a5200;}
+.cc-card.state-finished{border-left-color:var(--good);}
+.cc-card.state-finished .cc-state{background:#e0f1e7;color:#1d6b40;}
+.cc-card.state-help{border-color:var(--bad);border-left-color:var(--bad);background:#fdf1f0;
+  box-shadow:0 0 0 2px var(--bad) inset;}
+.cc-card.state-help .cc-state{background:var(--bad);color:#fff;}
+.cc-card.state-help .cc-help-badge{display:inline-block;}
+/* Detail modal (pure CSS :target; no JS needed to open/close) */
+.cc-modal{display:none;position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.6);padding:16px;overflow:auto;}
+.cc-modal:target{display:block;}
+.cc-modal-inner{max-width:920px;margin:24px auto;background:var(--card);border-radius:12px;
+  padding:18px 22px 22px;box-shadow:0 10px 40px rgba(0,0,0,.4);}
+.cc-modal-inner .card{border:1px solid var(--line);}
+.cc-modal-close{display:inline-block;float:right;background:#fff;color:var(--ink);border:2px solid var(--line);
+  border-radius:8px;padding:8px 16px;font-weight:700;text-decoration:none;position:sticky;top:0;}
+@media(max-width:560px){.cc-top{position:static;}}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -1643,34 +1823,230 @@ def gm_timer_reset():
     return redirect(url_for("gm"))
 
 
+# ---------------------------------------------------------------------------
+# Live update + Request GM Help endpoints (controlled polling).
+# ---------------------------------------------------------------------------
+@app.route("/live/game")
+def live_game():
+    """Public, secret-free poll target. Returns a revision string that changes
+    when a waiting team's screen (or the projector) should reload. Scoped to the
+    given game (and team, if supplied)."""
+    game_code = request.args.get("game_code", "").strip().upper()
+    if game_code not in games:
+        return jsonify({"rev": ""})
+    game = games[game_code]
+    ti = request.args.get("team_index", "")
+    if ti.isdigit() and get_team(game_code, int(ti)) is not None:
+        team = get_team(game_code, int(ti))
+        # `rev` drives waiting-screen reloads; `help` lets the help control sync
+        # (e.g. the GM resolved the request) without a reload.
+        return jsonify({"rev": team_rev(game, int(ti)), "help": help_active(team)})
+    return jsonify({"rev": projector_rev(game)})
+
+
+@app.route("/gm/live")
+def gm_live():
+    """GM-only live payload (behind the /gm login guard). Public-appropriate
+    per-team status + help flags for in-place card patching -- never allegiance,
+    votes, missions, or sabotage."""
+    if active_code is None:
+        return jsonify({"rev": "", "teams": [], "help_names": []})
+    game = games[active_code]
+    teams = []
+    for i, t in enumerate(game["teams"]):
+        s = team_live_status(game, i, t)
+        teams.append({"i": i, "name": t["name"], "course": s["course"],
+                      "phase": s["phase"], "activity": s["activity"],
+                      "state": ("help" if help_active(t) else s["state"]),
+                      "base_state": s["state"], "progress": s["progress"],
+                      "overall": s["overall"], "help": help_active(t)})
+    help_names = [t["name"] for t in game["teams"] if help_active(t)]
+    return jsonify({"rev": game_rev(game), "teams": teams, "help_names": help_names})
+
+
+def _help_response(game_code, ti, team):
+    """AJAX callers (the fetch-based help button) get JSON so the current screen
+    and any unsent inputs are left untouched; no-JS form posts re-render the
+    team's current screen in place."""
+    if request.headers.get("X-Requested-With") == "fetch" or request.form.get("ajax") == "1":
+        return jsonify({"ok": True, "active": help_active(team)})
+    return resume_screen(game_code, ti, team)
+
+
+@app.route("/team/help", methods=["POST"])
+def team_help():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": False}), 400
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    team = get_team(game_code, ti)
+    team["help"] = {"active": True, "since": time.time()}
+    return _help_response(game_code, ti, team)
+
+
+@app.route("/team/help/cancel", methods=["POST"])
+def team_help_cancel():
+    game_code = request.form.get("game_code", "").strip().upper()
+    team_index = request.form.get("team_index", "")
+    if not team_index.isdigit() or get_team(game_code, int(team_index)) is None:
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": False}), 400
+        return error_page("Something went wrong finding your team. Please start again.")
+    ti = int(team_index)
+    team = get_team(game_code, ti)
+    team["help"] = {"active": False}
+    return _help_response(game_code, ti, team)
+
+
+@app.route("/gm/help/resolve", methods=["POST"])
+def gm_help_resolve():
+    if active_code is None:
+        return redirect(url_for("gm"))
+    team_index = request.form.get("team_index", "")
+    if team_index.isdigit():
+        team = get_team(active_code, int(team_index))
+        if team is not None:
+            team["help"] = {"active": False}
+    return redirect(url_for("gm"))
+
+
+_STATE_LABEL = {"working": "Working", "waiting": "Waiting",
+                "finished": "Finished", "help": "NEEDS HELP"}
+
+
+def gm_team_card(game, i, team):
+    """Compact, clickable, secret-free team card for the Command Center grid.
+    Clicking opens the full GM-authorized detail modal (#team-i)."""
+    s = team_live_status(game, i, team)
+    state = "help" if help_active(team) else s["state"]
+    course = e(s["course"]) if s["course"] else "<span class='muted'>no course yet</span>"
+    prog = (" <span class='cc-prog'>(" + e(s["progress"]) + ")</span>") if s["progress"] else ""
+    overall = ("Score " + str(s["overall"])) if s["overall"] is not None else ""
+    return (
+        "<a class='cc-card state-" + state + "' id='cc-card-" + str(i) + "' href='#team-" + str(i) + "'>"
+        "<span class='cc-help-badge'>Needs help</span>"
+        "<div class='cc-name'>" + e(team["name"]) + "</div>"
+        "<div class='cc-course'>" + course + "</div>"
+        "<div class='cc-chip'>" + e(s["phase"]) + "</div>"
+        "<div class='cc-activity'>" + e(s["activity"]) + prog + "</div>"
+        "<div class='cc-foot'><span class='cc-state'>" + _STATE_LABEL[state] + "</span>"
+        "<span class='cc-overall'>" + overall + "</span></div>"
+        "<span class='cc-open'>Open team details &rarr;</span>"
+        "</a>")
+
+
+def gm_team_modal(code, game, i, team):
+    """Pure-CSS (:target) detail modal reusing the existing GM-authorized
+    gm_team_block. Opening/closing needs no JavaScript; GM action forms inside
+    post and redirect back to /gm as before."""
+    resolve = ""
+    if help_active(team):
+        resolve = ("<form method='post' action='/gm/help/resolve' style='margin:0 0 12px'>"
+                   "<input type='hidden' name='team_index' value='" + str(i) + "'>"
+                   "<button type='submit'>Mark help resolved</button></form>")
+    return ("<div class='cc-modal' id='team-" + str(i) + "'>"
+            "<div class='cc-modal-inner'>"
+            "<a class='cc-modal-close' href='#' aria-label='Close team details'>Close &#10005;</a>"
+            + resolve + gm_team_block(code, game, i, team)
+            + "</div></div>")
+
+
+def gm_help_alert(game):
+    """Prominent help summary strip. Always present (hidden when empty) so the
+    live poller can show/hide it. Resolve buttons post and reload."""
+    items = [(i, t) for i, t in enumerate(game["teams"]) if help_active(t)]
+    inner = ""
+    if items:
+        n = len(items)
+        rows = "".join(
+            "<span class='cc-alert-team'><a href='#team-" + str(i) + "'>" + e(t["name"]) + "</a> "
+            "<form method='post' action='/gm/help/resolve' style='display:inline'>"
+            "<input type='hidden' name='team_index' value='" + str(i) + "'>"
+            "<button class='secondary' type='submit'>Resolve</button></form></span>"
+            for i, t in items)
+        inner = "<strong>" + str(n) + " team" + ("s" if n > 1 else "") + " need help</strong> " + rows
+    style = "" if items else " style='display:none'"
+    return "<div class='cc-alert' id='cc-alert' role='alert'" + style + ">" + inner + "</div>"
+
+
+def gm_live_script(game):
+    """Poll /gm/live every 3s: reload if the game phase changed (controls differ),
+    otherwise patch each card's state/activity/score in place and keep the help
+    counter current. Never reloads for mere team-status/help changes, so an open
+    detail modal or scroll position is preserved. Fails quiet on dropped
+    connection."""
+    cur = game_rev(game)
+    return (
+        "<script>(function(){var cur=" + json.dumps(cur) + ";"
+        "var LBL={working:'Working',waiting:'Waiting',finished:'Finished',help:'NEEDS HELP'};"
+        "function esc(s){return String(s).replace(/[&<>]/g,function(c){"
+        "return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});}"
+        "function tick(){fetch('/gm/live',{headers:{'X-Requested-With':'fetch'}})"
+        ".then(function(r){return r.json();}).then(function(j){if(!j)return;"
+        "if(j.rev&&j.rev!==cur){location.reload();return;}var hn=0;"
+        "(j.teams||[]).forEach(function(t){if(t.help)hn++;var c=document.getElementById('cc-card-'+t.i);if(!c)return;"
+        "c.className='cc-card state-'+t.state;"
+        "var a=c.querySelector('.cc-activity');if(a)a.innerHTML=esc(t.activity)+"
+        "(t.progress?(\" <span class='cc-prog'>(\"+esc(t.progress)+\")</span>\"):'');"
+        "var st=c.querySelector('.cc-state');if(st)st.textContent=LBL[t.state]||t.state;"
+        "var ov=c.querySelector('.cc-overall');if(ov)ov.textContent=(t.overall!=null?('Score '+t.overall):'');"
+        "var ch=c.querySelector('.cc-chip');if(ch)ch.textContent=esc(t.phase);});"
+        "var hc=document.getElementById('cc-helpcount');"
+        "if(hc){if(hn>0){hc.style.display='';hc.textContent=hn+' need help';}else{hc.style.display='none';}}"
+        "}).catch(function(){});}setInterval(tick,3000);})();</script>")
+
+
 @app.route("/gm")
 def gm():
     if active_code is None:
-        body = "<div class='card'><p>No active game yet. Create one to begin.</p></div>"
-    else:
-        game = games[active_code]
-        body = ("<div class='card'><p>Active game code: <strong class='big'>" + active_code + "</strong></p></div>"
-                + pacing_panel(active_code, game)
-                + course_control_html(game) + game_control_html(active_code, game)
-                + reassignment_control_html(active_code, game))
-        teams = game["teams"]
-        if teams:
-            body += "<h2>Teams</h2>"
-            for i, team in enumerate(teams):
-                body += gm_team_block(active_code, game, i, team)
-        else:
-            body += "<div class='card'><p>No teams have joined yet.</p></div>"
+        body = ("<div class='card'><h2>Game Master Command Center</h2>"
+                "<p>No active game yet. Create one to begin.</p>"
+                "<form method='post' action='/gm/create'><button type='submit'>Create New Game</button></form></div>")
+        return page("Game Master Command Center", body, "gm")
 
-    create = ("<form method='post' action='/gm/create'>"
-              "<button type='submit'>Create New Game</button></form>")
+    game = games[active_code]
+    teams = game["teams"]
     logout = ""
     if app.config.get("GM_PASSWORD") and session.get("is_gm"):
         logout = ("<form method='post' action='/gm/logout' style='display:inline'>"
                   "<button class='secondary' type='submit'>Log Out</button></form> ")
-    body += ("<div class='footer'><p>" + create
-             + " <a class='btn secondary' href='/gm'>Refresh</a> " + logout
-             + "<a href='/'>Home</a></p></div>")
-    return page("Game Master Dashboard", body, "gm")
+
+    # Pinned header: identity + room-wide actions, always visible.
+    header = (
+        "<div class='cc-top'>"
+        "<div class='cc-id'><span class='cc-id-code'>Game " + active_code + "</span>"
+        "<span class='cc-helpcount' id='cc-helpcount' style='display:none'></span></div>"
+        "<div class='cc-id-actions'>"
+        "<a class='btn secondary' href='/gm'>Refresh</a> "
+        "<a class='btn secondary' href='/projector' target='_blank' rel='noopener'>Projector</a> "
+        + logout +
+        "<form method='post' action='/gm/create' style='display:inline'>"
+        "<button class='secondary' type='submit'>New Game</button></form>"
+        "</div></div>")
+
+    # Control deck: the critical phase controls stay near the top; the full pacing
+    # schedule is secondary (collapsed).
+    controls = ("<div class='cc-deck'>"
+                + course_control_html(game) + game_control_html(active_code, game)
+                + reassignment_control_html(active_code, game) + "</div>")
+    pacing = ("<details class='cc-details'><summary>Session pacing &amp; timer</summary>"
+              + pacing_panel(active_code, game) + "</details>")
+
+    # Team cards grid + detail modals.
+    if teams:
+        cards = "<div class='cc-grid'>" + "".join(gm_team_card(game, i, t) for i, t in enumerate(teams)) + "</div>"
+        modals = "".join(gm_team_modal(active_code, game, i, t) for i, t in enumerate(teams))
+        grid = "<h2>Teams (" + str(len(teams)) + ")</h2>" + cards + modals
+    else:
+        grid = "<div class='card'><p>No teams have joined yet. Share the game code above.</p></div>"
+
+    body = (header + gm_help_alert(game) + controls + pacing + grid
+            + "<p class='footer'><a href='/'>Home</a></p>"
+            + gm_live_script(game))
+    return page("Game Master Command Center", body, "gm")
 
 
 @app.route("/gm/open", methods=["POST"])
@@ -1863,7 +2239,7 @@ def count_form(game_code, team_index, team_name):
         "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
         + options + "<p><button type='submit'>Next</button></p></form></div>"
     )
-    return page("Team Setup", body)
+    return page("Team Setup", body + help_widget(game_code, team_index, get_team(game_code, team_index)))
 
 
 def resume_screen(game_code, team_index, team):
@@ -1931,7 +2307,7 @@ def team_players():
         "<input type='hidden' name='player_count' value='" + str(count) + "'>"
         + name_fields + "<p><button type='submit'>Register Players</button></p></form></div>"
     )
-    return page("Team Setup", body)
+    return page("Team Setup", body + help_widget(game_code, int(team_index), team))
 
 
 @app.route("/team/save", methods=["POST"])
@@ -2098,7 +2474,7 @@ def roles_setup_screen(game_code, team_index, team):
             "<form method='post' action='/team/roles/shuffle'>" + hidden
             + "<button type='submit'>Shuffle Roles</button></form></div>"
         )
-        return page("Assign Roles - " + team["name"], body)
+        return page("Assign Roles - " + team["name"], body + help_widget(game_code, team_index, team))
 
     # Shuffled but not confirmed: show the deal, allow reshuffle or confirm.
     cards = "".join(role_card_html(a["role"], a["player"]) for a in team["assignments"])
@@ -2111,7 +2487,7 @@ def roles_setup_screen(game_code, team_index, team):
         "<form method='post' action='/team/roles/shuffle' style='display:inline'>" + hidden
         + "<button class='secondary' type='submit'>Reshuffle</button></form></div>"
     )
-    return page("Assign Roles - " + team["name"], body)
+    return page("Assign Roles - " + team["name"], body + help_widget(game_code, team_index, team))
 
 
 @app.route("/team/roles/shuffle", methods=["POST"])
@@ -2285,7 +2661,7 @@ def setup_overview_screen(game_code, team_index, team):
             "<div style='text-align:center'>" + cards + "</div>"
             "<form method='post' action='/team/setup/overview/continue'>" + hidden
             + "<button type='submit'>Continue to Course Registration</button></form></div>")
-    return page("Team Overview - " + team["name"], body)
+    return page("Team Overview - " + team["name"], body + help_widget(game_code, team_index, team))
 
 
 @app.route("/team/setup/overview/continue", methods=["POST"])
@@ -2446,7 +2822,8 @@ def course_trade_screen(game_code, team_index, team):
                 "in full above while you wait.</p>"
                 "<p class='muted'>Course selection has not opened yet. When the Game Master opens it, "
                 "you will be able to propose a one-for-one trade with another team.</p></div>")
-        return page("Your Course - " + team["name"], body + refresh, width="wide")
+        return page("Your Course - " + team["name"],
+                    body + refresh + live_reload_script(game_code, team_index), width="wide")
 
     # phase == "open": trade controls.
     teams = game["teams"]
@@ -2523,7 +2900,8 @@ def course_trade_screen(game_code, team_index, team):
 
     sections.append("<div class='card'><p class='muted'>Course selection is open. When the Game Master "
                     "closes it, the course you currently hold becomes your course for the semester.</p></div>")
-    return page("Course Selection - " + team["name"], "".join(sections) + refresh, width="wide")
+    return page("Course Selection - " + team["name"],
+                "".join(sections) + refresh + live_reload_script(game_code, team_index), width="wide")
 
 
 @app.route("/team/course/propose", methods=["POST"])
@@ -2825,21 +3203,76 @@ def team_setup_complete(team):
     return bool(team.get("starting_roster")) and handoff_done(team)
 
 
+def help_script():
+    """Progressive enhancement for the help control: submit via fetch so toggling
+    help never reloads the page or disturbs an in-progress selection. With no
+    fetch support the forms post normally and the server re-renders the screen."""
+    return (
+        "<script>(function(){var box=document.getElementById('helpbox');if(!box)return;"
+        "function wire(f){if(!f)return;f.addEventListener('submit',function(ev){"
+        "if(!window.fetch)return;ev.preventDefault();"
+        "fetch(f.action,{method:'POST',body:new FormData(f),headers:{'X-Requested-With':'fetch'}})"
+        ".then(function(r){return r.json();}).then(function(j){if(j&&j.ok){"
+        "box.classList.toggle('on',!!j.active);}}).catch(function(){});});}"
+        "wire(box.querySelector('.help-idle form'));wire(box.querySelector('.help-active-wrap form'));"
+        # Sync the help state (e.g. the GM resolved it) without reloading, so the
+        # team's current screen and any in-progress selection are never disturbed.
+        "var g=box.getAttribute('data-game'),t=box.getAttribute('data-team');"
+        "if(window.fetch&&g&&t){var u='/live/game?game_code='+encodeURIComponent(g)+'&team_index='+encodeURIComponent(t);"
+        "setInterval(function(){fetch(u,{headers:{'X-Requested-With':'fetch'}}).then(function(r){return r.json();})"
+        ".then(function(j){if(j&&typeof j.help==='boolean'){box.classList.toggle('on',j.help);}}).catch(function(){});},5000);}"
+        "})();</script>")
+
+
+def help_widget(game_code, team_index, team):
+    """A 'Request GM Help' control for PUBLIC team screens (setup, course
+    selection, roster selection, checkpoint play, waiting). Both states render so
+    fetch can toggle without a reload. Deliberately never placed on private
+    allegiance / mission / vote / sabotage screens."""
+    hid = ("<input type='hidden' name='game_code' value='" + game_code + "'>"
+           "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
+           "<input type='hidden' name='ajax' value='1'>")
+    idle = ("<div class='help-idle'><form method='post' action='/team/help'>" + hid
+            + "<button type='submit' class='help-req-btn'>Request GM Help</button></form></div>")
+    onblk = ("<div class='help-active-wrap'><span class='help-badge'>Help requested</span>"
+             "<span class='muted'> The Game Master has been notified.</span> "
+             "<form method='post' action='/team/help/cancel' style='display:inline'>" + hid
+             + "<button type='submit' class='secondary'>Cancel request</button></form></div>")
+    return ("<div class='helpbox" + (" on" if help_active(team) else "") + "' id='helpbox'"
+            " data-game='" + game_code + "' data-team='" + str(team_index) + "'>"
+            + idle + onblk + "</div>" + help_script())
+
+
+def live_reload_script(game_code, team_index):
+    """Reload a WAITING team screen when its team_rev changes (GM opened a
+    checkpoint, a trade arrived, reassignment ran). Only injected on screens with
+    no unsent inputs; never on the placement selection or private screens.
+    Degrades silently on a dropped connection."""
+    cur = team_rev(games[game_code], team_index)
+    url = "/live/game?game_code=" + game_code + "&team_index=" + str(team_index)
+    return ("<script>(function(){var cur=" + json.dumps(cur) + ";"
+            "function tick(){fetch(" + json.dumps(url) + ",{headers:{'X-Requested-With':'fetch'}})"
+            ".then(function(r){return r.json();}).then(function(j){"
+            "if(j&&typeof j.rev==='string'&&j.rev&&j.rev!==cur){location.reload();}})"
+            ".catch(function(){});}setInterval(tick,4000);})();</script>")
+
+
 def team_footer(game_code, team_index):
     note = "<em>You cannot advance yourself. The Game Master controls the room.</em><br>"
+    team = get_team(game_code, team_index)
+    help_html = help_widget(game_code, team_index, team) if team is not None else ""
     if _embedded():
         # Inside a split pane: refresh reloads this pane only (keep embed); the
         # container supplies Home/navigation, so we add nothing that could load
         # the wrong pane.
-        return ("<p class='footer'>" + note + "<a class='btn secondary' href='"
+        return (help_html + "<p class='footer'>" + note + "<a class='btn secondary' href='"
                 + status_url(game_code, team_index, embed=True) + "'>Refresh</a></p>")
     links = "<a class='btn secondary' href='" + status_url(game_code, team_index) + "'>Refresh</a> "
-    team = get_team(game_code, team_index)
     if team is not None and team_setup_complete(team):
         links += ("<a class='btn' href='" + workspace_url(game_code, team_index)
                   + "'>Split view (Canvas + Workspace)</a> ")
     links += "<a href='/'>Home</a>"
-    return "<p class='footer'>" + note + links + "</p>"
+    return help_html + "<p class='footer'>" + note + links + "</p>"
 
 
 @app.route("/team/workspace")
@@ -2934,7 +3367,11 @@ def status_screen(game_code, team_index, team):
             + resources_drawer(team) + "</div>"
             + resource_meters(team["resources"], team["statuses"])
             + team_roles_panel(team) + body)
-    return page("Team Screen - " + team["name"], body + team_footer(game_code, team_index))
+    # This branch is only a WAITING state (the open-checkpoint case returned
+    # above), so it is safe to auto-reload when the GM advances the room.
+    return page("Team Screen - " + team["name"],
+                body + team_footer(game_code, team_index)
+                + live_reload_script(game_code, team_index))
 
 
 # ---------------------------------------------------------------------------
@@ -3305,7 +3742,7 @@ def roster_decision_screen(game_code, team_index, team, error_message="",
         + grid
         + "<p><button type='submit' id='placement-submit'>Review selection</button></p></form>"
         + placement_select_script(ROSTER_COUNT) + "</div>")
-    return page("Placement Review - " + team["name"], body, width="wide")
+    return page("Placement Review - " + team["name"], body + help_widget(game_code, team_index, team), width="wide")
 
 
 def retain_confirm_screen(game_code, team_index, team, retain, release):
@@ -3326,7 +3763,7 @@ def retain_confirm_screen(game_code, team_index, team, retain, release):
         "<script>(function(){var f=document.getElementById('lockform');if(!f)return;"
         "f.addEventListener('submit',function(){var b=document.getElementById('lockbtn');"
         "if(b){b.disabled=true;b.textContent='Locking\\u2026';}});})();</script>")
-    return page("Confirm Placement - " + team["name"], body, width="wide")
+    return page("Confirm Placement - " + team["name"], body + help_widget(game_code, team_index, team), width="wide")
 
 
 @app.route("/team/retain", methods=["POST"])
@@ -3410,7 +3847,8 @@ def reassignment_screen(game_code, team_index, team):
                     "<strong>all</strong> teams have finalized.</p>"
                     "<p class='muted'>" + str(ready) + " of " + str(total)
                     + " teams finalized.</p></div>")
-        return page("Reassignment - " + team["name"], body + refresh, width="wide")
+        return page("Reassignment - " + team["name"],
+                    body + refresh + live_reload_script(game_code, team_index), width="wide")
 
     # Reassigned: show the final 15-student class with clear labels.
     retained = team["starting_roster"]
@@ -5562,7 +6000,16 @@ def projector():
         table = ("<table><tr><th>Team</th><th>Course</th><th>Overall Course Score</th></tr>"
                  + rows + "</table>") if rows else "<p>No course scores yet.</p>"
 
-    body = banner + "<div class='card'>" + table + "</div><p class='footer'><a href='/projector'>Refresh</a></p>"
+    # Auto-advance the room display when the game phase/outcomes change. The
+    # projector has no inputs, so a reload-on-change is safe; it shows only
+    # public information (never allegiance, votes, missions, or sabotage).
+    cur = projector_rev(game)
+    live = ("<script>(function(){var cur=" + json.dumps(cur) + ";"
+            "var u=" + json.dumps("/live/game?game_code=" + active_code) + ";"
+            "function tick(){fetch(u,{headers:{'X-Requested-With':'fetch'}}).then(function(r){return r.json();})"
+            ".then(function(j){if(j&&typeof j.rev==='string'&&j.rev&&j.rev!==cur){location.reload();}})"
+            ".catch(function(){});}setInterval(tick,5000);})();</script>")
+    body = banner + "<div class='card'>" + table + "</div><p class='footer'><a href='/projector'>Refresh</a></p>" + live
     return page("Projector", body, "projector")
 
 
