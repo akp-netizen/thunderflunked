@@ -1625,6 +1625,64 @@ def test_split_workspace():
             "ws-panes" not in early)
 
 
+def test_checkpoint_split_screen_layout():
+    """Regression guard: for an ACTIVE checkpoint, the participant experience is
+    the side-by-side split (Canvas Classroom on the left, Team Workspace on the
+    right), visible together on desktop -- NOT a narrow single-column page. Also
+    confirms the Canvas nav/resource bars and the decision actions/Resources
+    drawer survive in their respective panes, and that the split is always
+    reachable from the standalone status page."""
+    print("\n=== Active-checkpoint split-screen layout (regression) ===")
+    client = fresh_client()
+    code = create_game(client)
+    idx = register_team(client, code, "Splitters", ["A", "B", "C", "D"])
+    team = game.get_team(code, idx)
+    assign_roles(client, code, idx, team)
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    finish_reassignment(client, code)
+    client.post("/gm/open")   # CP1 open -> an active checkpoint decision
+    qs = {"game_code": code, "team_index": str(idx)}
+
+    cont = text(client.get("/team/workspace", query_string=qs))
+    # Side-by-side container with BOTH panes present (the anti-regression core).
+    C.check("workspace uses a flex side-by-side container", ".ws-panes{display:flex" in cont)
+    C.check("both panes render (Canvas + Workspace)",
+            "class='ws-pane ws-canvas'" in cont and "class='ws-pane ws-work'" in cont)
+    C.check("panes are visible by default on desktop (base rule display:flex)",
+            ".ws-pane{display:flex;flex-direction:column;" in cont)
+    C.check("single-column collapse is gated to narrow screens only (<=899px)",
+            "@media(max-width:899px)" in cont
+            and "display:none" in cont.split("@media(max-width:899px)")[1])
+    C.check("left pane iframes the Canvas Classroom shell",
+            "title='Canvas Classroom'" in cont and ("/team/shell?game_code=" + code) in cont)
+    C.check("right pane iframes the Team Workspace (status, embedded)",
+            "title='Team Workspace'" in cont and ("/team/status?game_code=" + code) in cont
+            and cont.count("embed=1") >= 2)
+
+    # Left pane (Canvas) keeps interactive nav + course resource bars.
+    shell = text(client.get("/team/shell", query_string={**qs, "tab": "home", "embed": "1"}))
+    C.check("Canvas pane keeps the interactive course nav", "lms-course" in shell and "tab=" in shell)
+    C.check("Canvas pane keeps the course resource bars", "Course Resources" in shell and "/ 100" in shell)
+
+    # Right pane (Workspace) holds the live decision actions, Resources drawer, scenario.
+    pane = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("Workspace pane shows the checkpoint scenario", "Checkpoint 1" in pane)
+    C.check("Workspace pane shows the decision actions", "name='actions'" in pane)
+    C.check("Workspace pane keeps the Resources & Student Support drawer",
+            "Resources &amp; Student Support" in pane)
+    C.check("Workspace pane keeps the course resource bars", "Course Resources" in pane)
+
+    # The split is always reachable from the standalone status page.
+    plain = text(client.get("/team/status", query_string=qs))
+    C.check("standalone status links back to the split workspace", "/team/workspace" in plain)
+
+    # No private information leaks into the split container.
+    for s in ["THUNDERFLUNKED", "Thunderflunked", "allegiance", "Secret Mission", "suspicion"]:
+        C.check("split container hides '%s'" % s, s not in cont)
+
+
 def test_canvas_highlights():
     """Contextual Canvas navigation highlights (Step 13): checkpoint->section
     mapping, genuinely-relevant content, correct advancement, accessibility,
@@ -1703,6 +1761,7 @@ def test_canvas_highlights():
             run_private_check(client, code, idx, team, 2)
         elif cpn == 3:
             client.post("/team/cp4/submit", data={**qs, "priority": "scalable", "supporting": "tool"})
+            run_brief_round(client, code, idx, team, 3)  # complete the brief CP4 pass round
         elif cpn == 4:
             client.post("/team/cp5/submit", data={**qs, "protect": "grading",
                                                   "repair": "gradebook", "not_add": "extra_credit"})
@@ -2099,6 +2158,156 @@ def test_gm_command_center_and_help():
             _json.dumps({k: tA[k] for k in tA if k not in ("help",)}, sort_keys=True, default=str) == snap)
 
 
+def _progress_to_active(client, code, iA, tA, iB, tB):
+    """Drive a two-team game to active play (through placement + reassignment)."""
+    assign_roles(client, code, iA, tA)
+    assign_roles(client, code, iB, tB)
+    client.post("/gm/course/open")
+    client.post("/gm/course/close")
+    register_course(client, code, iA, game.COURSE_NAMES[0])
+    register_course(client, code, iB, game.COURSE_NAMES[5])
+    deal_and_draft(client, code, iA, game.STUDENTS[:15], game.STUDENTS[:10])
+    deal_and_draft(client, code, iB, game.STUDENTS[15:30], game.STUDENTS[15:25])
+    finish_reassignment(client, code)
+
+
+def test_smart_progression():
+    """Batch 3: automatic completion detection, mixed-speed teams, all-ready
+    detection, GM-controlled transitions with a premature-advance warning +
+    override, pause/resume, no re-scoring, projector timing/privacy, live
+    payloads, persistence, and isolation. GM keeps control of checkpoints."""
+    print("\n=== Smart progression (GM-controlled checkpoints) ===")
+    import json as _json
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Alpha", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+    iB = register_team(client, code, "Bravo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+    g = game.games[code]
+
+    # --- Completion detection across phases ---
+    C.check("fresh setup team is not done", game.team_activity_done(g, iA, tA) is False)
+    C.check("room progress starts at 0 done, not all ready",
+            game.room_progress(g)["done"] == 0 and game.room_progress(g)["all_ready"] is False)
+
+    _progress_to_active(client, code, iA, tA, iB, tB)
+    C.check("placement acked -> team done in setup phase", game.team_activity_done(g, iA, tA) is True)
+    C.check("all teams ready after placement", game.room_progress(g)["all_ready"] is True)
+    C.check("next GM action is Open Checkpoint 1", "Open Checkpoint 1" in game.room_progress(g)["next_label"])
+
+    # --- Open CP1: nobody done until decision + private are complete ---
+    client.post("/gm/open")
+    C.check("CP1 open: not done before submitting", game.team_activity_done(g, iA, tA) is False)
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA), "cp": "0",
+                                         "actions": ["clarify", "message"]})
+    C.check("submitted but private not done -> still not complete",
+            game.team_activity_done(g, iA, tA) is False)
+    run_private_check(client, code, iA, tA, 0)
+    C.check("A done after decision + private", game.team_activity_done(g, iA, tA) is True)
+
+    # --- Mixed-speed teams ---
+    C.check("B still working (mixed speed)", game.team_activity_done(g, iB, tB) is False)
+    prog = game.room_progress(g)
+    C.check("mixed: 1 of 2 done, not all ready",
+            prog["done"] == 1 and prog["all_ready"] is False and "Bravo" in prog["working"])
+
+    # --- No duplicate submission / no repeated scoring (CP1 still open) ---
+    before_res = dict(tA["resources"])
+    before_actions = list(tA["cp"][0]["actions"])
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA), "cp": "0",
+                                         "actions": ["message"]})
+    C.check("resubmit does not re-score", tA["resources"] == before_res)
+    C.check("resubmit does not change the recorded decision", tA["cp"][0]["actions"] == before_actions)
+
+    # --- Premature lock is blocked with a clear, named warning (override exists) ---
+    r = text(client.post("/gm/lock"))
+    C.check("premature lock shows a warning", "not all teams are finished" in r.lower())
+    C.check("premature lock does NOT lock the checkpoint", g["checkpoint_open"] is True)
+    C.check("warning identifies the incomplete team", "Bravo" in r)
+    client.post("/gm/lock", data={"confirm": "1"})
+    C.check("explicit override locks despite incomplete teams", g["checkpoint_open"] is False)
+
+    # --- All-ready path: reopen, finish B, lock proceeds with no confirm ---
+    client.post("/gm/open")
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB), "cp": "0",
+                                         "actions": ["monitor"], "reassess": game.CP1_REASSESS_OPTIONS[0]})
+    run_private_check(client, code, iB, tB, 0)
+    C.check("all teams ready once both finish", game.room_progress(g)["all_ready"] is True)
+    r2 = text(client.post("/gm/lock"))
+    C.check("clean lock when all ready (no warning)",
+            g["checkpoint_open"] is False and "not all teams are finished" not in r2.lower())
+
+    # --- Live payloads carry progress; secret-free ---
+    live = _json.loads(text(client.get("/gm/live")))
+    C.check("live payload includes room progress",
+            "progress" in live and live["progress"]["total"] == 2)
+    C.check("live per-team done flags present", all("done" in t for t in live["teams"]))
+    for secret in ["thunderflunked", "allegiance", "sabotage", "vote"]:
+        C.check("live progress hides '%s'" % secret, secret not in text(client.get("/gm/live")).lower())
+
+    # --- Auto-advance markup: a fully-finished checkpoint waiting screen carries a
+    #     live reloader + friendly wording, so the team moves when the GM advances. ---
+    g["checkpoint_open"] = True  # peek at the submitted CP1 screen while still "open"
+    done_screen = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}))
+    C.check("finished team screen shows friendly wording",
+            "Your team is finished" in done_screen or "All teams are ready" in done_screen)
+    C.check("finished team screen auto-advances (live reloader present)",
+            "/live/game?game_code=" + code in done_screen)
+    g["checkpoint_open"] = False
+
+    # --- Pause / resume: banner + payload + persistence + projector ---
+    client.post("/gm/pause")
+    C.check("pause sets the flag", g.get("paused") is True)
+    lg = _json.loads(text(client.get("/live/game", query_string={"game_code": code, "team_index": str(iA)})))
+    C.check("live payload reports paused", lg.get("paused") is True)
+    ts = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}))
+    C.check("team screen carries a pause banner element", "id='pausebanner'" in ts)
+    proj_p = text(client.get("/projector"))
+    C.check("projector shows a paused state", "Paused" in proj_p)
+    client.post("/gm/resume")
+    C.check("resume clears the flag", g.get("paused") is False)
+
+    # --- Projector during play: progress + instruction, NO premature scores ---
+    client.post("/gm/advance")  # all ready for CP1 -> advance to CP2
+    client.post("/gm/open")
+    proj = text(client.get("/projector"))
+    C.check("projector shows completion progress", "teams ready" in proj or "All teams are ready" in proj)
+    C.check("projector gives a participant instruction", "on your team screen" in proj.lower())
+    C.check("projector does NOT reveal per-team scores during play", "Overall Course Score" not in proj)
+
+    # --- Isolation: a second game's progress is independent ---
+    code2 = create_game(client)
+    j1 = _json.loads(text(client.get("/live/game", query_string={"game_code": code, "team_index": str(iA)})))
+    jbad = _json.loads(text(client.get("/live/game", query_string={"game_code": "ZZZZZ"})))
+    C.check("live scoped to game (unknown -> empty rev)", jbad.get("rev") == "")
+    C.check("active game switched but first game still addressable by code", j1.get("rev") != "")
+
+
+def test_smart_progression_persistence():
+    """Paused + help survive a restart; completion state is recomputed correctly
+    after reload (nothing about progression is lost)."""
+    print("\n=== Smart progression persistence ===")
+    game.games.clear(); game.active_code = None
+    _enable_persistence()
+    try:
+        client = game.app.test_client()
+        code = create_game(client)
+        iA = register_team(client, code, "Solo", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+        iB = register_team(client, code, "Duo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+        _progress_to_active(client, code, iA, tA, iB, tB)
+        client.post("/gm/pause")
+        before_ready = game.room_progress(game.games[code])["all_ready"]
+        before = copy.deepcopy(game.games); before_code = game.active_code
+        game.games.clear(); game.active_code = None
+        game.restore_state()
+        C.check("state restored byte-for-byte", game.games == before and game.active_code == before_code)
+        C.check("paused persisted across restart", game.games[code].get("paused") is True)
+        C.check("completion recomputed correctly after restart",
+                game.room_progress(game.games[code])["all_ready"] == before_ready)
+    finally:
+        storage._reset_for_tests()
+        game.games.clear(); game.active_code = None
+
+
 def test_hidden_information_privacy():
     print("\n=== Hidden information stays private on team screens ===")
     client = fresh_client()
@@ -2293,6 +2502,7 @@ def main():
     test_resources_drawer()
     test_canvas_highlights()
     test_split_workspace()
+    test_checkpoint_split_screen_layout()
     test_course_shell()
     # Deployment infrastructure tests (added for Render deployment).
     test_persistence_and_restart()
@@ -2301,6 +2511,8 @@ def main():
     test_gm_open_without_password()
     test_gm_reset_reveal()
     test_gm_command_center_and_help()
+    test_smart_progression()
+    test_smart_progression_persistence()
     test_hidden_information_privacy()
     ok = C.summary()
     sys.exit(0 if ok else 1)

@@ -994,8 +994,10 @@ def team_rev(game, i):
 
 
 def projector_rev(game):
-    """Projector reloads on any phase change, plus final-outcome changes."""
-    base = game_rev(game)
+    """Projector reloads on any phase change, pause toggle, completion progress,
+    plus final-outcome changes."""
+    prog = room_progress(game)
+    base = game_rev(game) + "~" + str(int(bool(game.get("paused")))) + "~" + str(prog["done"])
     if game.get("final_open"):
         base += "#" + ",".join(str(t.get("accusation")) + ":" + str(t.get("overall"))
                                for t in game.get("teams", []))
@@ -1066,15 +1068,133 @@ def team_live_status(game, i, team):
     # Checkpoint phase.
     cpname = "Checkpoint %d" % (idx + 1)
     if game.get("checkpoint_open"):
-        if team.get("cp", {}).get(idx, {}).get("submitted"):
-            return d(cpname, "Decision submitted — waiting", "waiting")
-        return d(cpname, "Deciding the checkpoint", "working")
+        if not team.get("cp", {}).get(idx, {}).get("submitted"):
+            return d(cpname, "Deciding the checkpoint", "working")
+        # Submitted, but a required private round may still be in progress -- the
+        # team is not finished yet (keeps the card consistent with completion).
+        if _cp_has_private(idx) and not private_complete(team, idx):
+            done, tot = _private_progress(game, team, idx)
+            return d(cpname, "Private player check", "working", "%d/%d done" % (done, tot))
+        return d(cpname, "Decision submitted — waiting", "waiting")
     if not game.get("opened_once"):
         return d(cpname, "Waiting for %s to open" % cpname, "waiting")
     if (idx in HAS_PRIVATE or idx == 3) and not private_complete(team, idx):
         done, tot = _private_progress(game, team, idx)
         return d(cpname, "Private player check in progress", "working", "%d/%d done" % (done, tot))
     return d(cpname, "Decisions locked — waiting for the next step", "waiting")
+
+
+# ---------------------------------------------------------------------------
+# Completion detection + room progress (Batch 3). These read existing state
+# only; they invent no new mandatory step. "Done" means the team has finished
+# everything required for the CURRENT GM-gated activity -- the signal the GM
+# needs before opening/advancing the next checkpoint.
+# ---------------------------------------------------------------------------
+def _cp_has_private(idx):
+    """CP1/CP3/CP5 run a full private round; CP4 runs the brief pass round;
+    CP2 has none."""
+    return idx in HAS_PRIVATE or idx == 3
+
+
+def team_activity_done(game, i, team):
+    """True when this team has completed the current GM-gated activity."""
+    if game.get("final_open"):
+        return team.get("accusation") is not None
+    idx = game.get("checkpoint_index", 0)
+    if idx == 0 and not game.get("opened_once"):
+        # Setup / course / placement (before Checkpoint 1).
+        ph = game.get("course_trading", "closed")
+        if ph in ("not_open", "open"):
+            # Course selection/trading has no mandatory action; a team is "ready"
+            # for the GM to close once it is holding a dealt course.
+            return bool(team.get("course_held"))
+        # Course closed -> student placement; done when the final class is acked.
+        return team_setup_complete(team)
+    # Checkpoint phase.
+    if not game.get("checkpoint_open"):
+        # Between checkpoints (locked): nothing left to do unless this cp's
+        # private round was left unfinished when it was locked.
+        if _cp_has_private(idx) and not private_complete(team, idx):
+            return False
+        return True
+    # Open checkpoint: decision submitted AND the private round finished (if any).
+    rec = team.get("cp", {}).get(idx, {})
+    if not rec.get("submitted"):
+        return False
+    if _cp_has_private(idx) and not private_complete(team, idx):
+        return False
+    return True
+
+
+def current_activity_label(game):
+    """Short public name for the current GM-gated activity."""
+    if game.get("final_open"):
+        return "Final: accusations & outcomes"
+    idx = game.get("checkpoint_index", 0)
+    if idx == 0 and not game.get("opened_once"):
+        ph = game.get("course_trading", "closed")
+        if ph == "not_open":
+            return "Setup (course not open yet)"
+        if ph == "open":
+            return "Course selection & trading"
+        return "Student placement"
+    return "Checkpoint %d: %s" % (idx + 1, CHECKPOINTS[idx])
+
+
+def next_gm_action(game):
+    """(label, note) describing the next major GM action, for the progression
+    panel. Mirrors the enabling logic in course_control_html/game_control_html;
+    it only labels -- the buttons themselves remain the authoritative controls."""
+    if game.get("final_open"):
+        return ("Game complete", "Teams are viewing their outcomes.")
+    idx = game.get("checkpoint_index", 0)
+    if idx == 0 and not game.get("opened_once"):
+        ph = game.get("course_trading", "closed")
+        if ph == "not_open":
+            return ("Open course selection", "Deals each team a course and lets teams trade.")
+        if ph == "open":
+            return ("Close course selection", "Locks each team's course and starts student placement.")
+        return ("Open Checkpoint 1", "Begins the first checkpoint when placement is done.")
+    if game.get("checkpoint_open"):
+        return ("Lock Checkpoint %d" % (idx + 1), "Closes the checkpoint once teams have decided.")
+    if idx < len(CHECKPOINTS) - 1:
+        return ("Open Checkpoint %d" % (idx + 2), "Begins the next checkpoint.")
+    return ("Proceed to Final", "Opens the final accusation and outcomes.")
+
+
+def room_progress(game):
+    """Aggregate completion for the current activity. Secret-free."""
+    teams = game.get("teams", [])
+    done_flags = [team_activity_done(game, i, t) for i, t in enumerate(teams)]
+    working = [t["name"] for t, f in zip(teams, done_flags) if not f]
+    helpers = [t["name"] for t in teams if help_active(t)]
+    done = sum(1 for f in done_flags if f)
+    label, note = next_gm_action(game)
+    return {"done": done, "total": len(teams), "working": working, "help": helpers,
+            "all_ready": bool(teams) and done == len(teams),
+            "activity": current_activity_label(game),
+            "next_label": label, "next_note": note,
+            "paused": bool(game.get("paused"))}
+
+
+def projector_instruction(game):
+    """Large, public participant instruction for the projector. Never reveals a
+    correct decision, a scoring consequence, private information, or a Canvas
+    teaching takeaway -- only what participants should do right now."""
+    if game.get("final_open"):
+        return ""
+    idx = game.get("checkpoint_index", 0)
+    if idx == 0 and not game.get("opened_once"):
+        ph = game.get("course_trading", "closed")
+        if ph == "not_open":
+            return "Your course has been dealt. Review it on your team screen while we get started."
+        if ph == "open":
+            return ("On your team screen, review your course and propose a one-for-one trade if you want "
+                    "one. Both teams must agree.")
+        return "On your team screen, keep 10 of your 15 students, then confirm."
+    if game.get("checkpoint_open"):
+        return "On your team screen, read the situation and make your team's decision."
+    return "This checkpoint is closed. Please wait for the Game Master."
 
 
 def make_game_code(length=5):
@@ -1333,7 +1453,28 @@ body.projector .muted{color:#555;}
 .cc-modal-inner .card{border:1px solid var(--line);}
 .cc-modal-close{display:inline-block;float:right;background:#fff;color:var(--ink);border:2px solid var(--line);
   border-radius:8px;padding:8px 16px;font-weight:700;text-decoration:none;position:sticky;top:0;}
-@media(max-width:560px){.cc-top{position:static;}}
+@media(max-width:560px){.cc-top{position:static;}.pausebanner{position:static;}}
+/* Progression panel (Command Center hero) */
+.cc-prog{background:var(--card);border:1px solid var(--line);border-left:7px solid #2f6fed;border-radius:12px;
+  padding:16px 20px;margin:10px 0 14px;display:flex;gap:18px;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;}
+.cc-prog.ready{border-left-color:var(--good);background:#eef7f1;}
+.cc-prog-main{flex:1 1 320px;min-width:0;}
+.cc-prog-activity{font-size:1.15rem;margin-bottom:6px;}
+.cc-readycount{font-size:1.55rem;font-weight:800;margin:4px 0;}
+.cc-readycount #cc-ready-n{color:#1b47a8;}
+.cc-working{color:var(--gray);margin:2px 0 6px;}
+.cc-allready{display:none;font-size:1.65rem;font-weight:800;color:var(--good);margin:4px 0;}
+.cc-prog.ready .cc-allready{display:block;}
+.cc-prog.ready .cc-readycount,.cc-prog.ready .cc-working{display:none;}
+.cc-prog-help a{color:var(--bad);font-weight:700;}
+.cc-next{margin:6px 0 0;}
+.cc-prog-actions{flex:0 0 auto;}
+.cc-paused-tag{background:var(--warn);color:#fff;font-weight:800;border-radius:6px;padding:2px 10px;font-size:.9rem;}
+/* Team pause banner (fixed, non-intrusive; toggled by the live poll) */
+.pausebanner{position:fixed;top:0;left:0;right:0;z-index:80;background:var(--warn);color:#fff;
+  text-align:center;font-weight:800;font-size:1.1rem;padding:12px 16px;box-shadow:0 2px 10px rgba(0,0,0,.25);}
+.teamwait{border-left:6px solid var(--good);}
+body.projector .cc-allready{color:var(--good);}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -1835,13 +1976,16 @@ def live_game():
     if game_code not in games:
         return jsonify({"rev": ""})
     game = games[game_code]
+    paused = bool(game.get("paused"))
     ti = request.args.get("team_index", "")
     if ti.isdigit() and get_team(game_code, int(ti)) is not None:
         team = get_team(game_code, int(ti))
-        # `rev` drives waiting-screen reloads; `help` lets the help control sync
-        # (e.g. the GM resolved the request) without a reload.
-        return jsonify({"rev": team_rev(game, int(ti)), "help": help_active(team)})
-    return jsonify({"rev": projector_rev(game)})
+        # `rev` drives waiting-screen reloads; `help` and `paused` let the help
+        # control and the pause banner sync WITHOUT a reload (so no inputs or
+        # private actions are ever disturbed).
+        return jsonify({"rev": team_rev(game, int(ti)), "help": help_active(team),
+                        "paused": paused})
+    return jsonify({"rev": projector_rev(game), "paused": paused})
 
 
 @app.route("/gm/live")
@@ -1860,8 +2004,12 @@ def gm_live():
                       "state": ("help" if help_active(t) else s["state"]),
                       "base_state": s["state"], "progress": s["progress"],
                       "overall": s["overall"], "help": help_active(t)})
+    # Per-team completion of the current activity (drives the live card "done" tick).
+    for row, t in zip(teams, game["teams"]):
+        row["done"] = team_activity_done(game, row["i"], t)
     help_names = [t["name"] for t in game["teams"] if help_active(t)]
-    return jsonify({"rev": game_rev(game), "teams": teams, "help_names": help_names})
+    return jsonify({"rev": game_rev(game), "teams": teams, "help_names": help_names,
+                    "progress": room_progress(game)})
 
 
 def _help_response(game_code, ti, team):
@@ -1910,6 +2058,23 @@ def gm_help_resolve():
         team = get_team(active_code, int(team_index))
         if team is not None:
             team["help"] = {"active": False}
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/pause", methods=["POST"])
+def gm_pause():
+    """Pause the room for instructional discussion. Teams see a banner without
+    any navigation or input loss; private actions are never interrupted. This
+    changes no game state beyond the flag."""
+    if active_code is not None:
+        games[active_code]["paused"] = True
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/resume", methods=["POST"])
+def gm_resume():
+    if active_code is not None:
+        games[active_code]["paused"] = False
     return redirect(url_for("gm"))
 
 
@@ -1972,18 +2137,53 @@ def gm_help_alert(game):
     return "<div class='cc-alert' id='cc-alert' role='alert'" + style + ">" + inner + "</div>"
 
 
+def progression_panel(code, game):
+    """The hero of the Command Center: current activity, how many teams are ready,
+    who is still working, help count, the next GM action, and pause/resume. All
+    fields have stable ids so the live poller patches them (textContent only -- no
+    innerHTML, so team names can never inject markup)."""
+    prog = room_progress(game)
+    if prog["paused"]:
+        pausebtn = ("<form method='post' action='/gm/resume' style='display:inline'>"
+                    "<button type='submit'>Resume play</button></form>")
+    else:
+        pausebtn = ("<form method='post' action='/gm/pause' style='display:inline'>"
+                    "<button class='secondary' type='submit'>Pause room for discussion</button></form>")
+    pausetag = ("<span class='cc-paused-tag' id='cc-paused-tag'"
+                + ("" if prog["paused"] else " style='display:none'") + ">PAUSED</span>")
+    helpn = len(prog["help"])
+    ready_cls = " ready" if prog["all_ready"] else ""
+    working_txt = (", ".join(prog["working"])) or "none"
+    return (
+        "<div class='cc-prog" + ready_cls + "' id='cc-prog'>"
+        "<div class='cc-prog-main'>"
+        "<div class='cc-prog-activity'>Current activity: <strong id='cc-activity'>"
+        + e(prog["activity"]) + "</strong> " + pausetag + "</div>"
+        "<p class='cc-allready'>&#10003; All teams are ready</p>"
+        "<p class='cc-readycount'><span id='cc-ready-n'>" + str(prog["done"]) + "</span> of "
+        "<span id='cc-total-n'>" + str(prog["total"]) + "</span> teams ready</p>"
+        "<p class='cc-working'>Still working: <span id='cc-working'>" + e(working_txt) + "</span></p>"
+        "<p class='cc-prog-help' id='cc-prog-help'" + ("" if helpn else " style='display:none'") + ">"
+        "<a href='#cc-alert'><span id='cc-prog-help-n'>" + str(helpn) + "</span> team(s) need help</a></p>"
+        "<p class='cc-next'><strong>Next GM action:</strong> <span id='cc-next-label'>"
+        + e(prog["next_label"]) + "</span> <span class='muted'>&mdash; <span id='cc-next-note'>"
+        + e(prog["next_note"]) + "</span></span></p>"
+        "</div><div class='cc-prog-actions'>" + pausebtn + "</div></div>")
+
+
 def gm_live_script(game):
     """Poll /gm/live every 3s: reload if the game phase changed (controls differ),
-    otherwise patch each card's state/activity/score in place and keep the help
-    counter current. Never reloads for mere team-status/help changes, so an open
-    detail modal or scroll position is preserved. Fails quiet on dropped
-    connection."""
+    otherwise patch each card's state/activity/score AND the progression panel in
+    place, keeping the help counter current. Never reloads for mere team-status/
+    help changes, so an open detail modal or scroll position is preserved. Fails
+    quiet on dropped connection."""
     cur = game_rev(game)
     return (
         "<script>(function(){var cur=" + json.dumps(cur) + ";"
         "var LBL={working:'Working',waiting:'Waiting',finished:'Finished',help:'NEEDS HELP'};"
         "function esc(s){return String(s).replace(/[&<>]/g,function(c){"
         "return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});}"
+        "function set(id,v){var el=document.getElementById(id);if(el)el.textContent=v;}"
         "function tick(){fetch('/gm/live',{headers:{'X-Requested-With':'fetch'}})"
         ".then(function(r){return r.json();}).then(function(j){if(!j)return;"
         "if(j.rev&&j.rev!==cur){location.reload();return;}var hn=0;"
@@ -1996,6 +2196,13 @@ def gm_live_script(game):
         "var ch=c.querySelector('.cc-chip');if(ch)ch.textContent=esc(t.phase);});"
         "var hc=document.getElementById('cc-helpcount');"
         "if(hc){if(hn>0){hc.style.display='';hc.textContent=hn+' need help';}else{hc.style.display='none';}}"
+        "var p=j.progress;if(p){set('cc-activity',p.activity);set('cc-ready-n',p.done);"
+        "set('cc-total-n',p.total);set('cc-working',p.working.length?p.working.join(', '):'none');"
+        "set('cc-next-label',p.next_label);set('cc-next-note',p.next_note);"
+        "var pw=document.getElementById('cc-prog');if(pw)pw.className='cc-prog'+(p.all_ready?' ready':'');"
+        "var ph=document.getElementById('cc-prog-help');if(ph){if(p.help&&p.help.length){ph.style.display='';"
+        "set('cc-prog-help-n',p.help.length);}else{ph.style.display='none';}}"
+        "var ptag=document.getElementById('cc-paused-tag');if(ptag)ptag.style.display=p.paused?'':'none';}"
         "}).catch(function(){});}setInterval(tick,3000);})();</script>")
 
 
@@ -2043,10 +2250,28 @@ def gm():
     else:
         grid = "<div class='card'><p>No teams have joined yet. Share the game code above.</p></div>"
 
-    body = (header + gm_help_alert(game) + controls + pacing + grid
+    body = (header + progression_panel(active_code, game) + gm_help_alert(game)
+            + controls + pacing + grid
             + "<p class='footer'><a href='/'>Home</a></p>"
             + gm_live_script(game))
     return page("Game Master Command Center", body, "gm")
+
+
+def gm_confirm_page(action_url, action_label, incomplete):
+    """Shown when the GM tries to end an activity before every team is finished.
+    Preserves the authorized override: an explicit confirm re-posts the same
+    action. Opening a checkpoint is never gated (that starts an activity)."""
+    lst = "".join("<li>" + e(n) + "</li>" for n in incomplete)
+    body = ("<div class='card'><h2>Not all teams are finished</h2>"
+            "<p class='err'><strong>" + str(len(incomplete)) + "</strong> team(s) have not finished "
+            "the current activity:</p><ul>" + lst + "</ul>"
+            "<p>You can wait for them (the dashboard updates live as they finish), or override and "
+            "continue now &mdash; overriding may cut a team's work short.</p>"
+            "<form method='post' action='" + action_url + "' style='display:inline'>"
+            "<input type='hidden' name='confirm' value='1'>"
+            "<button type='submit'>" + e(action_label) + " anyway (override)</button></form> "
+            "<a class='btn secondary' href='/gm'>Cancel &mdash; keep waiting</a></div>")
+    return page("Confirm: " + action_label, body, "gm")
 
 
 @app.route("/gm/open", methods=["POST"])
@@ -2060,7 +2285,14 @@ def gm_open():
 @app.route("/gm/lock", methods=["POST"])
 def gm_lock():
     if active_code is not None:
-        games[active_code]["checkpoint_open"] = False
+        game = games[active_code]
+        if game.get("checkpoint_open"):
+            prog = room_progress(game)
+            if not prog["all_ready"] and request.form.get("confirm") != "1":
+                return gm_confirm_page("/gm/lock",
+                                       "Lock Checkpoint %d" % (game["checkpoint_index"] + 1),
+                                       prog["working"])
+            game["checkpoint_open"] = False
     return redirect(url_for("gm"))
 
 
@@ -2122,6 +2354,11 @@ def gm_advance():
         index = game["checkpoint_index"]
         if (not game["checkpoint_open"] and game["opened_once"]
                 and index < len(CHECKPOINTS) - 1):
+            prog = room_progress(game)
+            if not prog["all_ready"] and request.form.get("confirm") != "1":
+                return gm_confirm_page("/gm/advance",
+                                       "Advance to Checkpoint %d" % (index + 2),
+                                       prog["working"])
             game["checkpoint_index"] = index + 1
             game["checkpoint_open"] = False
             game["opened_once"] = False
@@ -2134,6 +2371,9 @@ def gm_final():
         game = games[active_code]
         if (not game["checkpoint_open"] and game["opened_once"]
                 and game["checkpoint_index"] == len(CHECKPOINTS) - 1):
+            prog = room_progress(game)
+            if not prog["all_ready"] and request.form.get("confirm") != "1":
+                return gm_confirm_page("/gm/final", "Proceed to Final", prog["working"])
             game["final_open"] = True
             game["checkpoint_open"] = False
     return redirect(url_for("gm"))
@@ -3220,7 +3460,9 @@ def help_script():
         "var g=box.getAttribute('data-game'),t=box.getAttribute('data-team');"
         "if(window.fetch&&g&&t){var u='/live/game?game_code='+encodeURIComponent(g)+'&team_index='+encodeURIComponent(t);"
         "setInterval(function(){fetch(u,{headers:{'X-Requested-With':'fetch'}}).then(function(r){return r.json();})"
-        ".then(function(j){if(j&&typeof j.help==='boolean'){box.classList.toggle('on',j.help);}}).catch(function(){});},5000);}"
+        ".then(function(j){if(j){if(typeof j.help==='boolean'){box.classList.toggle('on',j.help);}"
+        "var pb=document.getElementById('pausebanner');if(pb&&typeof j.paused==='boolean'){"
+        "pb.style.display=j.paused?'':'none';}}}).catch(function(){});},5000);}"
         "})();</script>")
 
 
@@ -3238,7 +3480,11 @@ def help_widget(game_code, team_index, team):
              "<span class='muted'> The Game Master has been notified.</span> "
              "<form method='post' action='/team/help/cancel' style='display:inline'>" + hid
              + "<button type='submit' class='secondary'>Cancel request</button></form></div>")
-    return ("<div class='helpbox" + (" on" if help_active(team) else "") + "' id='helpbox'"
+    paused = bool(games.get(game_code, {}).get("paused"))
+    banner = ("<div class='pausebanner' id='pausebanner'" + ("" if paused else " style='display:none'")
+              + " role='status'>Paused for discussion &mdash; please pause your work and listen to the "
+              "Game Master.</div>")
+    return (banner + "<div class='helpbox" + (" on" if help_active(team) else "") + "' id='helpbox'"
             " data-game='" + game_code + "' data-team='" + str(team_index) + "'>"
             + idle + onblk + "</div>" + help_script())
 
@@ -3255,6 +3501,38 @@ def live_reload_script(game_code, team_index):
             ".then(function(r){return r.json();}).then(function(j){"
             "if(j&&typeof j.rev==='string'&&j.rev&&j.rev!==cur){location.reload();}})"
             ".catch(function(){});}setInterval(tick,4000);})();</script>")
+
+
+def team_waiting_note(game):
+    """Concise, participant-friendly room-progress line. Public-appropriate
+    counts only -- never other teams' choices or any private information."""
+    prog = room_progress(game)
+    if prog["all_ready"]:
+        inner = ("<p class='big'>All teams are ready.</p>"
+                 "<p>Waiting for the Game Master to begin the next step.</p>")
+    else:
+        inner = ("<p class='big'>Your team is finished.</p>"
+                 "<p>Waiting for other teams &mdash; " + str(prog["done"]) + " of "
+                 + str(prog["total"]) + " ready.</p>")
+    return "<div class='card center teamwait'>" + inner + "</div>"
+
+
+def team_waiting_tail(game_code, team_index, team):
+    """team_waiting_note plus live auto-advance, appended once a team has finished
+    the current activity. Reloads only when the GM moves the room forward
+    (team_rev change). Call ONLY on a screen with no unsent inputs. Never crosses a
+    checkpoint boundary by itself -- it just reloads into whatever screen
+    resume_screen then selects."""
+    return team_waiting_note(games[game_code]) + live_reload_script(game_code, team_index)
+
+
+def checkpoint_done_tail(game_code, team_index, team):
+    """team_waiting_tail for the open-checkpoint screen, but only once this team
+    has fully finished (decision submitted AND any private round complete), so the
+    auto-reload is never added while a private turn or a decision form is live."""
+    if team_activity_done(games[game_code], team_index, team):
+        return team_waiting_tail(game_code, team_index, team)
+    return ""
 
 
 def team_footer(game_code, team_index):
@@ -3357,11 +3635,15 @@ def status_screen(game_code, team_index, team):
     if game["checkpoint_open"]:
         return checkpoint_screen(game_code, team_index, team)
     if game["opened_once"]:
-        body = ("<div class='card'><h2>Checkpoint " + str(number) + ": " + name + " &mdash; Locked</h2>"
-                "<p>Your decisions are locked. Please wait for the Game Master.</p></div>")
+        # Between checkpoints: this team is finished; show room-wide progress.
+        body = (team_waiting_note(game)
+                + "<div class='card'><h2>Checkpoint " + str(number) + ": " + name + " &mdash; Locked</h2>"
+                "<p>Your decisions are locked.</p></div>")
     else:
-        body = ("<div class='card'><h2>Please wait for the Game Master</h2>"
-                "<p>Checkpoint " + str(number) + " (" + name + ") has not been opened yet.</p></div>")
+        body = ("<div class='card center'><h2>Waiting for the Game Master</h2>"
+                "<p class='big'>Waiting for the Game Master to begin Checkpoint "
+                + str(number) + ".</p>"
+                "<p class='muted'>" + e(name) + "</p></div>")
     body = ("<div class='card'><h3>" + e(team["name"]) + " &mdash; " + e(team["course"]) + "</h3>"
             "<p>" + open_course_button(game_code, team_index) + "</p>"
             + resources_drawer(team) + "</div>"
@@ -4298,7 +4580,8 @@ def cp1_screen(game_code, team_index, team):
         chosen = "".join("<li>" + action_label(0, k) + "</li>" for k in rec["actions"])
         body = (base + "<div class='card'><h3>Your First Week decision</h3><ul>" + chosen + "</ul>"
                 "<h3>What happened</h3>" + cp1_narrative(team) + "</div>"
-                + private_block(game_code, team_index, team, 0))
+                + private_block(game_code, team_index, team, 0)
+                + checkpoint_done_tail(game_code, team_index, team))
         return page("Checkpoint 1 - " + team["name"], body + team_footer(game_code, team_index))
     body = base + cp1_evidence(team) + resources_consult_block(team, 0) + multiselect_form(game_code, team_index, 0)
     return page("Checkpoint 1 - " + team["name"], body + team_footer(game_code, team_index))
@@ -4380,7 +4663,8 @@ def cp2_screen(game_code, team_index, team):
         body = (base + "<div class='card'><h3>Your onboarding decision</h3><ul>" + chosen + "</ul>"
                 "<h3>What happened</h3>" + cp2_narrative(team) + "</div>"
                 + "<div class='card'><p class='muted'>No private player check this checkpoint. "
-                  "Please wait for the Game Master to advance.</p></div>")
+                  "Please wait for the Game Master to advance.</p></div>"
+                + checkpoint_done_tail(game_code, team_index, team))
         return page("Checkpoint 2 - " + team["name"], body + team_footer(game_code, team_index))
     body = base + cp2_evidence(team) + resources_consult_block(team, 1) + multiselect_form(game_code, team_index, 1)
     return page("Checkpoint 2 - " + team["name"], body + team_footer(game_code, team_index))
@@ -4450,7 +4734,8 @@ def cp3_screen(game_code, team_index, team):
         chosen = "".join("<li>" + action_label(2, k) + "</li>" for k in rec["actions"]) or "<li>(no action)</li>"
         body = (base + "<div class='card'><h3>Your decision</h3><ul>" + chosen + "</ul>"
                 "<h3>What happened</h3>" + cp3_narrative(team) + "</div>"
-                + private_block(game_code, team_index, team, 2))
+                + private_block(game_code, team_index, team, 2)
+                + checkpoint_done_tail(game_code, team_index, team))
         return page("Checkpoint 3 - " + team["name"], body + team_footer(game_code, team_index))
     body = base + cp3_evidence(team) + resources_consult_block(team, 2) + multiselect_form(game_code, team_index, 2)
     return page("Checkpoint 3 - " + team["name"], body + team_footer(game_code, team_index))
@@ -4627,7 +4912,8 @@ def cp4_screen(game_code, team_index, team):
     base = cp_header(game_code, team_index, team,3) + intro
     if rec and rec.get("submitted"):
         body = (base + "<div class='card'><h3>Your midterm decision</h3>" + cp4_narrative(team) + "</div>"
-                + private_block(game_code, team_index, team, 3))
+                + private_block(game_code, team_index, team, 3)
+                + checkpoint_done_tail(game_code, team_index, team))
         return page("Checkpoint 4 - " + team["name"], body + team_footer(game_code, team_index))
     body = base + cp4_evidence(team) + resources_consult_block(team, 3) + cp4_form(game_code, team_index, team)
     return page("Checkpoint 4 - " + team["name"], body + team_footer(game_code, team_index))
@@ -4737,7 +5023,8 @@ def cp5_screen(game_code, team_index, team):
     base = cp_header(game_code, team_index, team,4) + intro
     if rec and rec.get("submitted"):
         body = (base + "<div class='card'><h3>Your final decision</h3>" + cp5_narrative(team) + "</div>"
-                + private_block(game_code, team_index, team, 4))
+                + private_block(game_code, team_index, team, 4)
+                + checkpoint_done_tail(game_code, team_index, team))
         return page("Checkpoint 5 - " + team["name"], body + team_footer(game_code, team_index))
     body = base + cp5_evidence(team) + resources_consult_block(team, 4) + cp5_form(game_code, team_index, team)
     return page("Checkpoint 5 - " + team["name"], body + team_footer(game_code, team_index))
@@ -5962,55 +6249,59 @@ def projector():
         return page("Projector", "<div class='card'><p>No active game yet.</p></div>"
                     + "<p class='footer'><a href='/projector'>Refresh</a></p>", "projector")
     game = games[active_code]
-    phase = game.get("course_trading", "closed")
-    if game.get("final_open"):
-        banner = "<div class='card'><h2>Final: Accusations &amp; Outcomes</h2></div>"
-    elif phase == "not_open":
-        banner = ("<div class='card'><h2>Course Assignments</h2>"
-                  "<p>Each team has been dealt a course on its own screen. Course selection opens shortly.</p></div>")
-    elif phase == "open":
-        banner = ("<div class='card'><h2>Course Selection Is Open</h2>"
-                  "<p>On your team screen, you may propose a one-for-one course trade with another team. "
-                  "Both teams must agree in the app.</p></div>")
-    else:
-        cp_index = game["checkpoint_index"]
-        cp_status = "OPEN" if game["checkpoint_open"] else "LOCKED"
-        banner = ("<div class='card'><h2>Checkpoint " + str(cp_index + 1) + " of " + str(len(CHECKPOINTS))
-                  + ": " + CHECKPOINTS[cp_index] + " (" + cp_status + ")</h2></div>")
-
+    prog = room_progress(game)
     teams = game["teams"]
-    scored = [t for t in teams if t.get("overall") is not None and t.get("course")]
-    if game.get("final_open"):
-        rows = ""
-        for t in scored:
-            survived = course_survives(t) if t.get("accusation") is not None else None
-            if survived is None:
-                outcome = "(finishing)"
-            else:
-                outcome = "Survived" if survived else "Did Not Survive"
-            rows += ("<tr><td>" + e(t["name"]) + "</td><td>" + e(t["course"]) + "</td><td>"
-                     + str(t["overall"]) + "</td><td>" + outcome + "</td></tr>")
-        table = ("<table><tr><th>Team</th><th>Course</th><th>Final Score</th><th>Outcome</th></tr>"
-                 + rows + "</table>") if rows else "<p>No results yet.</p>"
-    else:
-        rows = ""
-        for t in scored:
-            rows += ("<tr><td>" + e(t["name"]) + "</td><td>" + e(t["course"]) + "</td><td>"
-                     + str(t["overall"]) + "</td></tr>")
-        table = ("<table><tr><th>Team</th><th>Course</th><th>Overall Course Score</th></tr>"
-                 + rows + "</table>") if rows else "<p>No course scores yet.</p>"
 
-    # Auto-advance the room display when the game phase/outcomes change. The
-    # projector has no inputs, so a reload-on-change is safe; it shows only
-    # public information (never allegiance, votes, missions, or sabotage).
+    # Auto-advance the room display on any phase/pause/progress/outcome change.
+    # The projector has no inputs, so a reload-on-change is safe; it shows only
+    # public information -- never allegiance, votes, missions, sabotage, or (until
+    # the final reveal) scoring consequences.
     cur = projector_rev(game)
     live = ("<script>(function(){var cur=" + json.dumps(cur) + ";"
             "var u=" + json.dumps("/live/game?game_code=" + active_code) + ";"
             "function tick(){fetch(u,{headers:{'X-Requested-With':'fetch'}}).then(function(r){return r.json();})"
             ".then(function(j){if(j&&typeof j.rev==='string'&&j.rev&&j.rev!==cur){location.reload();}})"
             ".catch(function(){});}setInterval(tick,5000);})();</script>")
-    body = banner + "<div class='card'>" + table + "</div><p class='footer'><a href='/projector'>Refresh</a></p>" + live
-    return page("Projector", body, "projector")
+    footer = "<p class='footer'><a href='/projector'>Refresh</a></p>" + live
+
+    # Paused: a single, unmistakable room-wide message.
+    if game.get("paused"):
+        body = ("<div class='card center'><h1>Paused</h1>"
+                "<p class='big'>Discussion in progress. Please give the Game Master your attention.</p></div>")
+        return page("Projector", body + footer, "projector")
+
+    # Final: the one place scores/outcomes are revealed.
+    if game.get("final_open"):
+        scored = [t for t in teams if t.get("overall") is not None and t.get("course")]
+        rows = ""
+        for t in scored:
+            survived = course_survives(t) if t.get("accusation") is not None else None
+            outcome = "(finishing)" if survived is None else ("Survived" if survived else "Did Not Survive")
+            rows += ("<tr><td>" + e(t["name"]) + "</td><td>" + e(t["course"]) + "</td><td>"
+                     + str(t["overall"]) + "</td><td>" + outcome + "</td></tr>")
+        table = ("<table><tr><th>Team</th><th>Course</th><th>Final Score</th><th>Outcome</th></tr>"
+                 + rows + "</table>") if rows else "<p>No results yet.</p>"
+        body = ("<div class='card'><h1>Final: Accusations &amp; Outcomes</h1></div>"
+                "<div class='card'>" + table + "</div>")
+        return page("Projector", body + footer, "projector")
+
+    # Active play: current public activity + large instruction + completion
+    # progress. No per-team scores or checkpoint content (nothing premature).
+    activity = e(prog["activity"])
+    instruction = projector_instruction(game)
+    if not teams:
+        progress_html = "<p class='big'>Waiting for teams to join. Share the game code.</p>"
+    elif prog["all_ready"]:
+        progress_html = ("<p class='big cc-allready'>&#10003; All teams are ready.</p>"
+                         "<p class='big'>Waiting for the Game Master.</p>")
+    else:
+        progress_html = ("<p class='big'><strong>" + str(prog["done"]) + " of " + str(prog["total"])
+                         + "</strong> teams ready.</p>"
+                         "<p>Finish on your team screen when you are ready.</p>")
+    body = ("<div class='card'><h1>" + activity + "</h1>"
+            + ("<p class='big'>" + e(instruction) + "</p>" if instruction else "") + "</div>"
+            "<div class='card center'>" + progress_html + "</div>")
+    return page("Projector", body + footer, "projector")
 
 
 # ---------------------------------------------------------------------------
