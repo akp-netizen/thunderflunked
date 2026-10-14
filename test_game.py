@@ -156,7 +156,9 @@ def run_private_check(client, code, idx, team, cp, claim_missions=False,
         decided = (str(cur) in game.private_round(team, cp)["decisions"]
                    or str(cur) in team["missions_complete"])
         if not decided:
-            if claim_missions and cur % 2 == 0:
+            m = game.player_mission(team, cur)
+            claimable = (m is not None) and (cp in m["claim"])
+            if claim_missions and cur % 2 == 0 and claimable:
                 client.post("/team/private/mission/claim", data={**base, "player": str(cur)})
                 client.post("/team/private/mission/confirm", data={**base, "player": str(cur)})
             else:
@@ -314,7 +316,9 @@ def test_full_two_team_game():
     run_private_check(client, code, idxB, teamB, 0)
     C.check("CP1 private complete A", game.private_complete(teamA, 0))
     C.check("all players saw allegiance A", len(teamA["allegiance_seen"]) == 4)
-    C.check("some mission completed A", len(teamA["missions_complete"]) >= 1)
+    # Any mission claimed at CP1 must be one whose window actually includes CP1.
+    C.check("CP1 mission claims respect the claim window A",
+            all(0 in game.player_mission(teamA, int(k))["claim"] for k in teamA["missions_complete"]))
     gm_lock(client)
     gm_advance(client)
 
@@ -387,8 +391,16 @@ def test_full_two_team_game():
     client.post("/team/cp5/submit", data={"game_code": code, "team_index": str(idxB),
                                           "protect": "persistence", "repair": "visibility", "not_add": "new_module"})
     C.check("CP5 submitted A", teamA["cp"][4]["submitted"])
-    run_private_check(client, code, idxA, teamA, 4)
+    run_private_check(client, code, idxA, teamA, 4, claim_missions=True)
     run_private_check(client, code, idxB, teamB, 4)
+    # At CP5 every mission window is open, so the even-indexed players claim here:
+    # completion is reliable and still respects each card's window.
+    C.check("some mission completed by CP5 A", len(teamA["missions_complete"]) >= 1)
+    C.check("all mission claims respect the claim window A",
+            all(4 in game.player_mission(teamA, int(k))["claim"]
+                or 0 in game.player_mission(teamA, int(k))["claim"]
+                or 2 in game.player_mission(teamA, int(k))["claim"]
+                for k in teamA["missions_complete"]))
     gm_lock(client)
 
     # ---- Final ----
@@ -414,6 +426,10 @@ def test_full_two_team_game():
     C.check("reveal correct A", "correct" in outA.lower())
     C.check("debrief present A", "catches the bad idea" in outA)
     C.check("accusation recorded A", teamA["accusation"] == teamA["thunderflunked"])
+    # Endgame Secret Mission reveal: the per-player mission table appears only now.
+    C.check("outcome reveals the Secret Mission table A", "<th>Mission</th>" in outA)
+    C.check("outcome shows each player's mission text A",
+            game.player_mission(teamA, 0)["text"] in outA)
 
     # ---- Projector privacy ----
     proj = text(client.get("/projector"))
@@ -1255,7 +1271,9 @@ def test_persistence_and_restart():
         C.check("sabotage-used flag preserved B", teamB["sabotage"]["used"] is True)
         C.check("locked course persisted across restart A", teamA.get("course") in game.COURSE_NAMES)
         C.check("help request persisted across restart A", game.help_active(teamA) is True)
-        C.check("missions preserved A", len(teamA["missions_complete"]) >= 1)
+        # The digital mission DEAL (one per player) must survive a restart; the
+        # byte-for-byte check above already covers any completions recorded so far.
+        C.check("mission deal preserved A", len(teamA.get("missions", {})) == len(teamA["players"]))
         C.check("votes preserved A", len(game.private_round(teamA, 2)["votes"]) == 4)
         # Digital placement state survives a restart intact.
         C.check("reassigned 5 preserved A", len(teamA["reassigned"]) == 5)
@@ -2661,6 +2679,164 @@ def test_digital_setup():
             "You are THUNDERFLUNKED" not in work and "You are THUNDERSTRUCK" not in work)
 
 
+def test_digital_missions():
+    """Batch 5A: digital Secret Missions replace the physical cards. Verifies deal
+    integrity (distinct, role rules, idempotent), the setup reveal, the privacy-
+    gated re-view, server-enforced claim windows, and single-award."""
+    print("\n=== Digital Secret Missions ===")
+    client = fresh_client()
+    code = create_game(client)
+    names = ["Ann", "Bo", "Cy", "Di", "Ed", "Fi"]
+    idx = register_team(client, code, "Missions", names)
+    team = game.get_team(code, idx)
+    base = {"game_code": code, "team_index": str(idx)}
+    client.post("/team/roles/shuffle", data=base)
+    client.post("/team/roles/confirm", data=base)
+
+    # (1) Deal integrity: one distinct mission per player, role rules respected.
+    missions = team.get("missions", {})
+    C.check("every player dealt a mission", len(missions) == len(names))
+    nums = [missions[str(i)] for i in range(len(names))]
+    C.check("missions are distinct", len(set(nums)) == len(nums))
+    drawn_roles = {a["role"] for a in team["assignments"]}
+    for i in range(len(names)):
+        m = game.MISSION_BY_N[missions[str(i)]]
+        C.check("mission %d names an in-play role or none" % m["n"],
+                m["role"] is None or m["role"] in drawn_roles)
+        C.check("player %d not dealt own-role mission" % i,
+                m["role"] is None or m["role"] != team["assignments"][i]["role"])
+    snapshot = dict(team["missions"])
+    client.post("/team/roles/confirm", data=base)
+    C.check("missions are not re-rolled on re-confirm", team["missions"] == snapshot)
+
+    # (2) Setup reveal shows THIS player's mission privately; no one else's leaks.
+    m0 = game.MISSION_BY_N[missions["0"]]
+    rv = text(client.post("/team/setup/reveal/show", data={**base, "player": "0"}))
+    C.check("setup reveal shows the player's own mission text", m0["text"] in rv)
+    C.check("setup reveal labels it a Secret Mission", "Your Secret Mission" in rv)
+    for j in range(1, len(names)):
+        mj = game.MISSION_BY_N[missions[str(j)]]
+        if mj["text"] != m0["text"]:
+            C.check("setup reveal hides player %d's mission" % j, mj["text"] not in rv)
+    for p in range(len(names)):
+        client.post("/team/setup/reveal/select", data={**base, "player": str(p)})
+        client.post("/team/setup/reveal/show", data={**base, "player": str(p)})
+        client.post("/team/setup/reveal/ack", data={**base, "player": str(p)})
+    client.post("/team/setup/overview/continue", data=base)
+
+    # (3) Into live play: privacy gate + claim-window enforcement at CP1.
+    client.post("/gm/course/open"); client.post("/gm/course/close")
+    register_course(client, code, idx, game.COURSE_NAMES[0])
+    deal_and_draft(client, code, idx, game.STUDENTS[:15], game.STUDENTS[:10])
+    finish_reassignment(client, code)
+    client.post("/gm/open")
+    client.post("/team/cp/submit", data={**base, "cp": "0", "actions": ["clarify"]})
+    pbase = {"game_code": code, "team_index": str(idx), "cp": "0"}
+    r = text(client.post("/team/private/ready", data=pbase))
+    C.check("mission form gates behind a deliberate reveal", "Reveal My Mission" in r)
+    C.check("mission text is hidden before the reveal", m0["text"] not in r)
+    r2 = text(client.post("/team/private/mission/reveal", data={**pbase, "player": "0"}))
+    C.check("revealing shows the mission text", m0["text"] in r2)
+    if 0 in m0["claim"]:
+        C.check("a CP1-eligible mission offers Claim", "Claim Mission" in r2)
+        client.post("/team/private/mission/claim", data={**pbase, "player": "0"})
+        client.post("/team/private/mission/confirm", data={**pbase, "player": "0"})
+        C.check("a CP1-eligible mission completes", "0" in team["missions_complete"])
+        before = list(team["missions_complete"])
+        client.post("/team/private/mission/claim", data={**pbase, "player": "0"})
+        client.post("/team/private/mission/confirm", data={**pbase, "player": "0"})
+        C.check("no duplicate award on a repeat claim", team["missions_complete"] == before)
+    else:
+        C.check("an out-of-window mission hides Claim at CP1", "Claim Mission" not in r2)
+        client.post("/team/private/mission/claim", data={**pbase, "player": "0"})
+        client.post("/team/private/mission/confirm", data={**pbase, "player": "0"})
+        C.check("an out-of-window claim is blocked server-side", "0" not in team["missions_complete"])
+
+
+def test_hallway_rumors():
+    """Batch 5B: a successful sabotage queues exactly one private hallway rumor;
+    the GM announces it as a full projector takeover, then dismisses it; announcing
+    never re-applies the effect; the public wording leaks no mechanic/team/player."""
+    print("\n=== Hallway Rumors ===")
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Team Alpha", ["Ann", "Bo", "Cy", "Di"])
+    iB = register_team(client, code, "Team Bravo", ["Ed", "Fi", "Gu", "Ha"])
+    tA = game.get_team(code, iA); tB = game.get_team(code, iB)
+    _progress_to_active(client, code, iA, tA, iB, tB)
+    # CP1
+    client.post("/gm/open")
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA),
+                                         "cp": "0", "actions": ["clarify"]})
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB),
+                                         "cp": "0", "actions": ["monitor"],
+                                         "reassess": game.CP1_REASSESS_OPTIONS[0]})
+    run_private_check(client, code, iA, tA, 0)
+    run_private_check(client, code, iB, tB, 0)
+    gm_lock(client); gm_advance(client)
+    # CP2 (no sabotage window)
+    client.post("/gm/open")
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA),
+                                         "cp": "1", "actions": ["start_here"]})
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB),
+                                         "cp": "1", "actions": ["start_here"]})
+    gm_lock(client); gm_advance(client)
+    # CP3: Team Alpha's Thunderflunked activates Emergency Sabotage.
+    client.post("/gm/open")
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA),
+                                         "cp": "2", "actions": ["aligned_practice", "reteach"]})
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB),
+                                         "cp": "2", "actions": ["continue"]})
+    res_before = dict(tA["resources"])
+    run_private_check(client, code, iA, tA, 2, tf_sabotage_cp=2)
+    run_private_check(client, code, iB, tB, 2)
+
+    C.check("sabotage applied its effect once", tA["resources"] != res_before)
+    r = game._rumors_read(game.games[code])
+    C.check("exactly one hallway rumor queued", len(r["queue"]) == 1)
+    C.check("nothing announced yet", not r["announced"] and r["active"] is None)
+    key = game.SABOTAGE_OPTIONS[2][0]["key"]
+    pub = game.RUMOR_COPY[key]
+    cause = tA["sabotage"]["label"]
+
+    # Before announcing, the projector must not show the rumor.
+    banner = "HEARING IN THE HALLWAYS"  # apostrophe-free slice of RUMOR_TITLE (HTML-escaped on the page)
+    proj0 = text(client.get("/projector"))
+    C.check("projector hides the rumor before the GM announces it", banner not in proj0)
+
+    # The GM dashboard shows the pending rumor, the public preview, and the cause.
+    gmp = text(client.get("/gm"))
+    C.check("GM dashboard shows the Hallway Rumors area", "Hallway Rumors" in gmp)
+    C.check("GM dashboard flags a rumor ready to announce", "ready to announce" in gmp)
+    C.check("GM preview shows the public wording", pub in gmp)
+    C.check("GM is shown the private cause", cause in gmp)
+
+    # Announce: full projector takeover; effect NOT re-applied.
+    res_before_announce = dict(tA["resources"])
+    client.post("/gm/rumor/announce", data={})
+    r = game._rumors_read(game.games[code])
+    C.check("rumor is now active (removed from queue)", r["active"] is not None and not r["queue"])
+    C.check("rumor is recorded as announced", len(r["announced"]) == 1)
+    C.check("announcing did not re-apply the effect", tA["resources"] == res_before_announce)
+    proj = text(client.get("/projector"))
+    C.check("projector shows the hallway rumor banner", banner in proj)
+    C.check("projector shows the public rumor text", pub in proj)
+    for secret in ["sabotage", "Sabotage", "Thunderflunked", "THUNDERFLUNKED", "Traitor",
+                   "Thunderstruck", cause, "Team Alpha", "Team Bravo"]:
+        C.check("rumor projector hides '%s'" % secret, secret not in proj)
+    for pn in ["Ann", "Bo", "Cy", "Di", "Ed", "Fi", "Gu", "Ha"]:
+        C.check("rumor projector hides player '%s'" % pn, (">" + pn + "<") not in proj)
+
+    # Dismiss: the projector restores automatically; the tally is preserved.
+    client.post("/gm/rumor/dismiss", data={})
+    r = game._rumors_read(game.games[code])
+    C.check("rumor dismissed (no longer active)", r["active"] is None)
+    C.check("announced tally preserved after dismiss", len(r["announced"]) == 1)
+    C.check("no leftover queued rumor", not r["queue"])
+    proj2 = text(client.get("/projector"))
+    C.check("projector restores after dismiss (rumor gone)", banner not in proj2)
+
+
 def main():
     test_data_integrity()
     test_qa_corrections()
@@ -2692,6 +2868,8 @@ def main():
     test_smart_progression()
     test_smart_progression_persistence()
     test_teaching_moments()
+    test_digital_missions()
+    test_hallway_rumors()
     test_hidden_information_privacy()
     ok = C.summary()
     sys.exit(0 if ok else 1)

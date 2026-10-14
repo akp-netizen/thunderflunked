@@ -1004,7 +1004,9 @@ def projector_rev(game):
     if game.get("final_open"):
         base += "#" + ",".join(str(t.get("accusation")) + ":" + str(t.get("overall"))
                                for t in game.get("teams", []))
-    return base
+    # A hallway-rumor announce/dismiss must reload the projector (full takeover and
+    # its removal), so fold the rumor signature in here (not into game_rev).
+    return base + "~" + rumors_sig(game)
 
 
 def help_active(team):
@@ -1067,7 +1069,10 @@ def teach_sig(game):
     return "|".join(str(p) for p in [
         idx, teaching_stage(game, idx), int(teaching_available(game)),
         int(teaching_dismissed(game, idx)), int(bool(game.get("final_open"))),
-        int(bool(game.get("opened_once")))])
+        int(bool(game.get("opened_once"))),
+        # Fold in rumor state so the dashboard reloads when a team's sabotage queues
+        # a rumor, or when the GM announces/dismisses one.
+        rumors_sig(game)])
 
 
 def _private_progress(game, team, idx):
@@ -1581,6 +1586,21 @@ body.projector .cc-allready{color:var(--good);}
 .proj-strat-where{font-size:1.2rem;color:var(--gray);margin-bottom:8px;}
 .proj-strat-solves{font-size:1.25rem;color:#1d6b40;font-weight:600;}
 @media(max-width:1100px){.proj-strat-grid{grid-template-columns:1fr;}.proj-q-text{font-size:2.1rem;}}
+/* GM Hallway Rumors block */
+.cc-rumors{border:1px solid var(--line);border-left:8px solid var(--red);border-radius:12px;
+  padding:16px 20px;margin:12px 0;background:#fff7f6;}
+.cc-rumors h2{margin:0 0 4px;font-size:1.3rem;color:var(--red);}
+.cc-rumors h3{margin:.4em 0 .3em;font-size:1.1rem;}
+.cc-rumor-live{border:1px solid var(--red);border-radius:10px;padding:10px 14px;margin:8px 0;background:#fff;}
+.cc-rumor-pending{border:1px dashed var(--line);border-radius:10px;padding:10px 14px;margin:8px 0;background:#fff;}
+.cc-rumor-public{font-style:italic;font-size:1.05rem;line-height:1.4;margin:.3em 0;}
+.cc-rumors button{padding:10px 20px;font-size:1.05rem;}
+/* Projector: hallway rumor takeover */
+.proj-rumor{padding:48px 56px;text-align:center;}
+.proj-rumor-kicker{font-size:1.9rem;font-weight:800;letter-spacing:.06em;color:var(--red);
+  text-transform:uppercase;margin-bottom:28px;}
+.proj-rumor-text{font-size:2.5rem;line-height:1.4;font-weight:600;color:var(--ink);max-width:26ch;margin:0 auto;}
+@media(max-width:1100px){.proj-rumor-text{font-size:1.9rem;}.proj-rumor-kicker{font-size:1.4rem;}}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -2187,6 +2207,73 @@ def gm_resume():
     return redirect(url_for("gm"))
 
 
+# --- Hallway rumor controls (GM decides when the room hears a rumor) ---------
+@app.route("/gm/rumor/announce", methods=["POST"])
+def gm_rumor_announce():
+    """Move the oldest queued rumor onto the projector (full takeover). Idempotent:
+    does nothing if one is already on screen or the queue is empty. Announcing only
+    displays wording -- it never applies or re-applies any game effect."""
+    if active_code is None:
+        return redirect(url_for("gm"))
+    r = rumors_state(games[active_code])
+    if r.get("active") is None and r["queue"]:
+        nxt = r["queue"].pop(0)
+        r["active"] = nxt
+        r["announced"].append(nxt)
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/rumor/dismiss", methods=["POST"])
+def gm_rumor_dismiss():
+    """Clear the on-screen rumor; the projector automatically restores whatever it
+    was showing before (the stage is derived from game state)."""
+    if active_code is None:
+        return redirect(url_for("gm"))
+    rumors_state(games[active_code])["active"] = None
+    return redirect(url_for("gm"))
+
+
+def hallway_rumors_block(game):
+    """GM-only Hallway Rumors control. Shows the pending count, the exact public
+    wording the room will see, the private cause (the GM is authorized to see it),
+    an Announce action, a Dismiss/Return control while one is live, and a tally of
+    what has already been announced. Renders nothing when there is no rumor at all."""
+    r = _rumors_read(game)
+    active, pending, announced = r["active"], r["queue"], r["announced"]
+    if not active and not pending and not announced:
+        return ""
+    parts = []
+    if active:
+        parts.append(
+            "<div class='cc-rumor-live'><h3>On the projector now</h3>"
+            "<p class='cc-rumor-public'>&ldquo;" + e(rumor_public_text(active)) + "&rdquo;</p>"
+            "<p class='muted'>Private cause (GM only): " + e(active.get("cause", "")) + "</p>"
+            "<form method='post' action='/gm/rumor/dismiss' style='display:inline'>"
+            "<button type='submit'>Dismiss &mdash; return the projector</button></form></div>")
+    if pending:
+        nxt = pending[0]
+        more = ("<p class='muted'>" + str(len(pending) - 1) + " more waiting after this one.</p>"
+                if len(pending) > 1 else "")
+        if active:
+            action = "<p class='muted'>Finish the current announcement before reading the next one.</p>"
+        else:
+            action = ("<form method='post' action='/gm/rumor/announce' style='display:inline'>"
+                      "<button type='submit'>Announce Rumor</button></form>")
+        parts.append(
+            "<div class='cc-rumor-pending'><h3>" + str(len(pending)) + " hallway rumor"
+            + ("" if len(pending) == 1 else "s") + " ready to announce</h3>"
+            "<p class='muted'>Preview &mdash; exactly what the room will see:</p>"
+            "<p class='cc-rumor-public'>&ldquo;" + e(rumor_public_text(nxt)) + "&rdquo;</p>"
+            "<p class='muted'>Private cause (GM only): " + e(nxt.get("cause", "")) + "</p>"
+            + more + action + "</div>")
+    if announced:
+        parts.append("<p class='muted'>Announced so far this game: <strong>" + str(len(announced))
+                     + "</strong>.</p>")
+    return ("<div class='cc-rumors' id='cc-rumors'><h2>Hallway Rumors</h2>"
+            "<p class='muted'>Private to you. Nothing reaches the room until you announce it.</p>"
+            + "".join(parts) + "</div>")
+
+
 # --- GM-guided teaching moment controls (idempotent, double-click safe) ------
 @app.route("/gm/teaching/begin", methods=["POST"])
 def gm_teaching_begin():
@@ -2490,6 +2577,7 @@ def gm():
         grid = "<div class='card'><p>No teams have joined yet. Share the game code above.</p></div>"
 
     body = (header + progression_panel(active_code, game) + teaching_block(game)
+            + hallway_rumors_block(game)
             + gm_help_alert(game) + controls + pacing + grid
             + "<p class='footer'><a href='/'>Home</a></p>"
             + gm_live_script(game))
@@ -3027,6 +3115,9 @@ def team_roles_confirm():
     if not team.get("assignments"):
         # Nothing to confirm yet; send them back to shuffle.
         return roles_setup_screen(game_code, int(team_index), team)
+    # Deal each player their digital Secret Mission now that roles are fixed
+    # (idempotent -- re-confirming never re-rolls).
+    ensure_missions(team)
     team["roles_confirmed"] = True
     return resume_screen(game_code, int(team_index), team)
 
@@ -3122,8 +3213,13 @@ def team_setup_reveal_show():
         text_html = ("<h3>You are THUNDERSTRUCK</h3>"
                      "<p>You're here to get your students and course through the semester.</p>"
                      "<p>Someone at your table is Thunderflunked. You do not know who.</p>")
+    # Deal (if needed) and reveal this player's Secret Mission on the same private
+    # screen, so one pass-the-laptop handoff covers both allegiance and mission.
+    ensure_missions(team)
+    mission_html = mission_reveal_card(player_mission(team, p))
     body = ("<div class='card'><h2>" + e(team["players"][p]) + " &mdash; keep this secret</h2>"
             "<div class='card'>" + img + text_html + "</div>"
+            + mission_html +
             "<form method='post' action='/team/setup/reveal/ack'>" + hidden
             + "<input type='hidden' name='player' value='" + str(p) + "'>"
             "<button type='submit'>I have seen it &mdash; hide and pass on</button></form></div>")
@@ -5696,17 +5792,178 @@ def allegiance_page(game_code, team_index, team, cp, player):
     return page("Private", body, "private")
 
 
-def private_mission_form(game_code, team_index, team, cp, player):
+# ===========================================================================
+# DIGITAL SECRET MISSIONS (Batch 5). Replaces the physical Secret Mission cards.
+# Each player is dealt one mission during setup; it is revealed privately in the
+# pass-the-laptop sequence and can be re-viewed (behind a privacy gate) and
+# claimed during the CP1/CP3/CP5 private rounds, only inside the card's claim
+# window. Content is the canonical 18 printed missions, verbatim.
+#
+# DESIGN NOTE: every mission is a social/persuasion goal (get the team to discuss,
+# shift a mind, raise sustainability). Software cannot observe whether the table's
+# conversation actually met the condition, so completion stays a deliberate,
+# self-attested Claim -- exactly as the printed cards worked. What the software
+# NOW enforces reliably is the claim TIMING (which checkpoints a mission may be
+# claimed at) and single-award (a mission can be completed once). Rewards/scoring
+# are unchanged: a mission is a secondary end-of-game recognition only.
+# ===========================================================================
+_CLAIM_ANY = frozenset({0, 2, 4})   # "any Mission Check: CP1, CP3, or CP5"
+_CLAIM_MID = frozenset({2, 4})      # "CP3 or CP5"
+_CLAIM_END = frozenset({4})         # "CP5 / endgame only"
+
+MISSIONS = [
+    {"n": 1,  "claim": _CLAIM_ANY, "role": None,
+     "text": "Get another player to support proactive outreach to a student who has not asked for help."},
+    {"n": 2,  "claim": _CLAIM_ANY, "role": None,
+     "text": "Get the team to explicitly discuss the difference between a student problem and a course problem before deciding."},
+    {"n": 3,  "claim": _CLAIM_END, "role": "Efficiency Gremlin",
+     "text": "Get the Efficiency Gremlin to back a reusable, scalable solution at least once."},
+    {"n": 4,  "claim": _CLAIM_ANY, "role": None,
+     "text": "Get the team to look at course-activity or practice data (not just grades) before choosing an action."},
+    {"n": 5,  "claim": _CLAIM_END, "role": None,
+     "text": "Convince the team to decline adding at least one new thing in the Final Stretch."},
+    {"n": 6,  "claim": _CLAIM_MID, "role": "Receipts Department",
+     "text": "Get the Receipts Department to state out loud what the evidence does and does not show."},
+    {"n": 7,  "claim": _CLAIM_END, "role": None,
+     "text": "Shift another player off a position they argued for earlier. Change at least one mind during the game."},
+    {"n": 8,  "claim": _CLAIM_ANY, "role": None,
+     "text": "Get the team to choose a whole-class response over an individual one at least once."},
+    {"n": 9,  "claim": _CLAIM_END, "role": None,
+     "text": "Persuade the team to choose an option because it protects Faculty Capacity, and keep Faculty Capacity out of Critical for the entire game."},
+    {"n": 10, "claim": _CLAIM_MID, "role": "Burnout Bouncer",
+     "text": "Get the Burnout Bouncer to raise sustainability before the team finalizes a decision."},
+    {"n": 11, "claim": _CLAIM_END, "role": None,
+     "text": "Get the team to fix gradebook accuracy (zeros / blank cells) at some point in the semester."},
+    {"n": 12, "claim": _CLAIM_ANY, "role": None,
+     "text": "Name a specific Course Reality from your Course Card and get the team to factor it into a decision."},
+    {"n": 13, "claim": _CLAIM_END, "role": None,
+     "text": "Get the team to intentionally defer a lower-priority issue rather than address everything."},
+    {"n": 14, "claim": _CLAIM_ANY, "role": "Student Whisperer",
+     "text": "Get the Student Whisperer to speak up for a student who has gone quiet."},
+    {"n": 15, "claim": _CLAIM_END, "role": None,
+     "text": "Persuade the team to choose a fix that improves Course Quality over a quicker option, and end the game with Course Quality in the Normal band (60+)."},
+    {"n": 16, "claim": _CLAIM_MID, "role": None,
+     "text": "Get the team to connect a performance gap to a practice-to-assessment alignment issue, not just effort."},
+    {"n": 17, "claim": _CLAIM_END, "role": "Professional Buzzkill",
+     "text": "Get the Professional Buzzkill to talk the team out of a decision by naming its later cost."},
+    {"n": 18, "claim": _CLAIM_END, "role": None,
+     "text": "Be the player who proposes the option the team ultimately adopts at three or more checkpoints."},
+]
+MISSION_BY_N = {m["n"]: m for m in MISSIONS}
+
+
+def claim_window_label(mission):
+    c = mission["claim"]
+    if c == _CLAIM_END:
+        return "Claimable at Checkpoint 5 (Final Stretch)"
+    if c == _CLAIM_MID:
+        return "Claimable at Checkpoint 3 or 5"
+    return "Claimable at Checkpoint 1, 3, or 5"
+
+
+def mission_art_src(n):
+    return "/static/art/missions/mission_%02d.png" % int(n)
+
+
+def ensure_missions(team):
+    """Deal one distinct Secret Mission to each player (idempotent -- never
+    re-rolled once stored). Role-specific missions are dealt only if that public
+    role is in play, and no player is dealt the mission that names their own role
+    (the printed deck's 'trade it' rule). Stored as
+    team['missions'] = {str(player_index): mission_number}."""
+    existing = team.get("missions")
+    if existing:
+        return existing
+    assignments = team.get("assignments")
+    if not assignments:
+        return {}
+    drawn_roles = {a["role"] for a in assignments}
+    eligible = [m for m in MISSIONS if (m["role"] is None or m["role"] in drawn_roles)]
+    n = len(assignments)
+    result = {}
+    for _attempt in range(60):
+        pool = list(eligible)
+        random.shuffle(pool)
+        trial, used, ok = {}, set(), True
+        for i in range(n):
+            my_role = assignments[i]["role"]
+            pick = next((m for m in pool if m["n"] not in used and m["role"] != my_role), None)
+            if pick is None:
+                ok = False
+                break
+            trial[str(i)] = pick["n"]
+            used.add(pick["n"])
+        if ok:
+            result = trial
+            break
+    if not result:
+        # Extremely unlikely fallback (always enough distinct missions for 4-6
+        # players): relax only the self-role rule, never the distinctness.
+        pool = random.sample(eligible, min(n, len(eligible)))
+        result = {str(i): pool[i]["n"] for i in range(len(pool))}
+    team["missions"] = result
+    return result
+
+
+def player_mission(team, player):
+    return MISSION_BY_N.get(team.get("missions", {}).get(str(player)))
+
+
+def mission_reveal_card(mission):
+    """The private 'Your Secret Mission' card shown during the setup reveal. Only
+    ever rendered for the single acting player on their own device."""
+    if not mission:
+        return ""
+    return ("<div class='card mission-card'>"
+            "<img src='" + mission_art_src(mission["n"]) + "' alt='Secret Mission' "
+            "style='width:100%;max-width:300px;height:auto;border-radius:10px;display:block;margin:.4em auto'>"
+            "<h3>Your Secret Mission</h3>"
+            "<p>" + e(mission["text"]) + "</p>"
+            "<p class='muted'>" + e(claim_window_label(mission)) + ".</p>"
+            "<p class='muted'>Keep this to yourself. Completing it is a small end-of-game recognition only "
+            "&mdash; it does not affect scoring or who wins, and it is separate from your allegiance.</p></div>")
+
+
+def private_mission_form(game_code, team_index, team, cp, player, revealed=False):
+    pname = e(team["players"][player])
+    m = player_mission(team, player)
+    if m is None:
+        # Legacy team with no dealt mission on record: nothing to claim; continue.
+        body = ("<div class='card'><h2>Private Player Check</h2>"
+                "<p><strong>" + pname + "</strong> &mdash; you have no Secret Mission on record.</p>"
+                "<form method='post' action='/team/private/mission/notyet'>"
+                + private_hidden(game_code, team_index, cp, player)
+                + "<button type='submit'>Continue</button></form></div>")
+        return page("Private", body, "private")
+    if not revealed:
+        # Privacy gate: no mission text is shown until the player deliberately
+        # reveals it (safe for re-viewing round after round).
+        body = ("<div class='card'><h2>Private Player Check</h2>"
+                "<p><strong>" + pname + "</strong> &mdash; Part A: Secret Mission</p>"
+                "<p>Your mission is private. When no one else can see the screen, reveal it.</p>"
+                "<form method='post' action='/team/private/mission/reveal'>"
+                + private_hidden(game_code, team_index, cp, player)
+                + "<button type='submit'>Reveal My Mission</button></form></div>")
+        return page("Private", body, "private")
+    claimable = cp in m["claim"]
+    art = ("<img src='" + mission_art_src(m["n"]) + "' alt='Secret Mission' "
+           "style='width:100%;max-width:280px;height:auto;border-radius:10px;display:block;margin:.3em auto'>")
+    if claimable:
+        timing = ("<p class='muted'>" + e(claim_window_label(m))
+                  + " &mdash; you may claim it now if you have completed it.</p>")
+        claim_btn = ("<form method='post' action='/team/private/mission/claim' style='display:inline'>"
+                     + private_hidden(game_code, team_index, cp, player)
+                     + "<button type='submit'>Claim Mission</button></form> ")
+    else:
+        timing = ("<p class='muted'>" + e(claim_window_label(m)) + ". You cannot claim it at this "
+                  "checkpoint &mdash; you will be asked again when its window opens.</p>")
+        claim_btn = ""
     body = ("<div class='card'><h2>Private Player Check</h2>"
-            "<p><strong>" + e(team["players"][player]) + "</strong> &mdash; Part A: Secret Mission</p>"
-            "<p>Look at the physical <strong>Secret Mission card</strong> you were dealt at the start. "
-            "Only you can see it. If its condition has been met <em>and</em> the card says it may be claimed "
-            "at this point in the game, choose <strong>Claim Mission</strong>. Otherwise choose "
-            "<strong>Not Yet</strong> &mdash; you will be asked again at later checkpoints.</p>"
+            "<p><strong>" + pname + "</strong> &mdash; Part A: Secret Mission</p>"
+            "<div class='card'>" + art + "<p>" + e(m["text"]) + "</p>" + timing + "</div>"
             "<p class='muted'>Completing a mission is a small bonus recognition at the end. It does not decide "
             "who wins, and it is separate from your Thunderstruck/Thunderflunked allegiance.</p>"
-            "<form method='post' action='/team/private/mission/claim' style='display:inline'>"
-            + private_hidden(game_code, team_index, cp, player) + "<button type='submit'>Claim Mission</button></form> "
+            + claim_btn +
             "<form method='post' action='/team/private/mission/notyet' style='display:inline'>"
             + private_hidden(game_code, team_index, cp, player)
             + "<button class='secondary' type='submit'>Not Yet</button></form></div>")
@@ -5714,9 +5971,11 @@ def private_mission_form(game_code, team_index, team, cp, player):
 
 
 def private_mission_confirm_page(game_code, team_index, team, cp, player):
+    m = player_mission(team, player)
+    mtext = ("<p class='muted'>&ldquo;" + e(m["text"]) + "&rdquo;</p>") if m else ""
     body = ("<div class='card'><h2>Private Player Check</h2>"
-            "<p><strong>" + e(team["players"][player]) + "</strong>: Confirm that your physical Secret Mission "
-            "says it may be claimed now and that you completed its condition.</p>"
+            "<p><strong>" + e(team["players"][player]) + "</strong>: confirm you have completed this mission. "
+            "Only claim it if its condition was genuinely met.</p>" + mtext +
             "<form method='post' action='/team/private/mission/confirm' style='display:inline'>"
             + private_hidden(game_code, team_index, cp, player) + "<button type='submit'>Confirm Claim</button></form> "
             "<form method='post' action='/team/private/mission/back' style='display:inline'>"
@@ -5784,6 +6043,21 @@ def team_private_allegiance():
     return _private_resume(game_code, ti, team, cp)
 
 
+@app.route("/team/private/mission/reveal", methods=["POST"])
+def team_private_mission_reveal():
+    """Deliberate privacy-gate step: re-render the current player's mission WITH
+    its text shown (transient -- a refresh returns to the gate)."""
+    game_code = request.form.get("game_code", "").strip().upper()
+    r = _private_team(game_code)
+    if r is None:
+        return error_page("Something went wrong. Please refresh and try again.")
+    team, ti, cp = r
+    cur = private_current(team, cp)
+    if cur is None:
+        return checkpoint_screen(game_code, ti, team)
+    return private_mission_form(game_code, ti, team, cp, cur, revealed=True)
+
+
 @app.route("/team/private/mission/claim", methods=["POST"])
 def team_private_mission_claim():
     game_code = request.form.get("game_code", "").strip().upper()
@@ -5794,6 +6068,11 @@ def team_private_mission_claim():
     cur = private_current(team, cp)
     if cur is None:
         return checkpoint_screen(game_code, ti, team)
+    m = player_mission(team, cur)
+    # Enforce the claim window server-side: a mission can only be claimed at the
+    # checkpoints its card allows. Out of window -> back to the revealed mission.
+    if m is not None and cp not in m["claim"]:
+        return private_mission_form(game_code, ti, team, cp, cur, revealed=True)
     return private_mission_confirm_page(game_code, ti, team, cp, cur)
 
 
@@ -5817,6 +6096,11 @@ def team_private_mission_confirm():
     cur = private_current(team, cp)
     if cur is None:
         return checkpoint_screen(game_code, ti, team)
+    m = player_mission(team, cur)
+    # Enforce the claim window here too, so a mission can never be completed
+    # outside the checkpoints its card allows (even via a direct/replayed POST).
+    if m is not None and cp not in m["claim"]:
+        return private_mission_form(game_code, ti, team, cp, cur, revealed=True)
     k = str(cur)
     private_round(team, cp)["decisions"][k] = "complete"
     if k not in team["missions_complete"]:
@@ -5900,6 +6184,75 @@ SABOTAGE_OPTIONS = {
 }
 
 
+# ===========================================================================
+# HALLWAY RUMORS (Batch 5). When a Thunderflunked player ACTIVATES their one
+# Emergency Sabotage, the room never sees a mechanical "sabotage!" alert. Instead
+# a single faculty-lounge rumor is queued privately for the GM, who decides when
+# (if ever) to read it to the room as a full-screen projector takeover titled
+# "WHAT YOU'RE HEARING IN THE HALLWAYS...". The public wording describes only the
+# observable fallout -- never the mechanic, never a Traitor / sabotage / secret
+# action, never the responsible player, their allegiance, or the affected team.
+# ===========================================================================
+RUMOR_TITLE = "WHAT YOU'RE HEARING IN THE HALLWAYS..."
+RUMOR_COPY = {
+    "revision_drag": "Word around the department is that revision grades in one course are taking forever to post. Students keep refreshing the gradebook and finding nothing there yet, and a few are starting to wonder if their work got lost.",
+    "reteach_delay": "People are saying a planned re-teach got pushed back about a week. The students who were counting on that second pass are grumbling that the help they were promised keeps sliding further out.",
+    "practice_clunky": "Rumor has it a brand-new practice activity rolled out a little rough. A class spent a good chunk of its time just getting it to open, and the minutes that should have gone to learning went to troubleshooting instead.",
+    "outreach_delay": "There is chatter that the big push to reach struggling students stalled out. The outreach that was supposed to go this week still has not landed, and a couple of the quieter students seem to be drifting.",
+    "feedback_misroute": "Word in the hallway is that feedback is ending up in the wrong place. Students swear they never saw comments an instructor is just as sure were sent, and nobody can quite find where they went.",
+    "manual_tracking": "Heard through the grapevine that someone is tracking everything by hand now, off in a separate spreadsheet. It is twice the work, and people are nervous something is going to slip through the cracks.",
+}
+_RUMOR_FALLBACK = "Something seems to be slowing one of the courses down this week, and students are starting to notice."
+
+
+def _rumors_read(game):
+    """Non-mutating view of rumor state (safe on GET requests / signatures)."""
+    r = game.get("rumors")
+    if isinstance(r, dict):
+        return {"queue": r.get("queue", []), "announced": r.get("announced", []),
+                "active": r.get("active")}
+    return {"queue": [], "announced": [], "active": None}
+
+
+def rumors_state(game):
+    """Mutating getter (POST handlers only): ensure the rumor store exists."""
+    r = game.get("rumors")
+    if not isinstance(r, dict):
+        r = {"queue": [], "announced": [], "active": None}
+        game["rumors"] = r
+    r.setdefault("queue", [])
+    r.setdefault("announced", [])
+    if "active" not in r:
+        r["active"] = None
+    return r
+
+
+def enqueue_rumor(game, team_index, option_key, cause):
+    """Queue exactly one hallway rumor for a team's sabotage activation. Idempotent
+    per team (sabotage is one-time, so a team contributes at most one rumor)."""
+    r = rumors_state(game)
+    rid = "t" + str(team_index)
+    known = {x["id"] for x in r["queue"]} | {x["id"] for x in r["announced"]}
+    if r.get("active"):
+        known.add(r["active"]["id"])
+    if rid in known:
+        return
+    r["queue"].append({"id": rid, "team_index": team_index, "key": option_key, "cause": cause})
+
+
+def rumor_public_text(rumor):
+    return RUMOR_COPY.get((rumor or {}).get("key"), _RUMOR_FALLBACK)
+
+
+def rumors_sig(game):
+    """Signature of rumor state for reload triggers (projector + GM dashboard).
+    Never added to game_rev/team_rev, so team devices are never reloaded by a
+    rumor (their private forms are never disturbed)."""
+    r = _rumors_read(game)
+    active = r["active"]
+    return "R%d|%d|%s" % (len(r["queue"]), len(r["announced"]), active["id"] if active else "-")
+
+
 def sabotage_page(game_code, team_index, team, cp, player):
     """Offered to the Thunderflunked during their private turn at CP3 (full round)
     or CP4 (brief round).
@@ -5957,6 +6310,10 @@ def sabotage_activate():
     team["sabotage"]["cp"] = cp + 1  # store as 1-based checkpoint number
     team["sabotage"]["label"] = chosen["label"]
     team["sabotage"]["prompted"][cp] = True
+    # A successful activation (never a preview or Save For Later) queues exactly
+    # one private hallway rumor for the GM to announce when they choose. The effect
+    # was applied once, just above; announcing the rumor later never re-applies it.
+    enqueue_rumor(game, ti, chosen["key"], chosen["label"])
     return _private_resume(game_code, ti, team, cp)
 
 
@@ -6679,13 +7036,29 @@ def final_outcome_screen(game_code, team_index, team):
                     "<p><strong>Final Overall Course Score: " + str(team["overall"]) + "</strong></p></div>"
                     + resource_meters(team["resources"], team["statuses"]))
 
+    # Endgame Secret Mission reveal: now that the game is decided (and allegiance
+    # is being revealed on this same screen), it is safe to show who held which
+    # mission and whether it was claimed. Nothing here appears before the final.
+    completed = set(team.get("missions_complete", []))
+    mrows = ""
+    for i, pname in enumerate(team["players"]):
+        m = player_mission(team, i)
+        if m is None:
+            continue
+        done = ("<span class='status-Normal'>&#10003; completed</span>" if str(i) in completed
+                else "<span class='muted'>not claimed</span>")
+        mrows += ("<tr><td>" + e(pname) + "</td><td>" + e(m["text"]) + "</td><td>" + done + "</td></tr>")
+    mission_table = (("<h3>Secret Missions</h3><table><tr><th>Player</th><th>Mission</th><th>Result</th></tr>"
+                      + mrows + "</table>") if mrows else "")
+
     reveal_html = ("<div class='card'><h2>Thunderflunked Reveal</h2>"
                    "<p>The Thunderflunked player was <strong>" + e(tf_name) + "</strong>.</p>"
                    "<p>Your team accused <strong>" + e(accused_name) + "</strong> &mdash; "
                    + ("<strong>correct.</strong>" if correct else "incorrect.") + "</p>"
                    "<p class='muted'>Identifying Thunderflunked is a secondary achievement. It does not decide "
                    "whether the course survived.</p>"
-                   "<p><strong>Secret Missions completed at this table:</strong> " + str(missions) + " (secondary recognition).</p></div>")
+                   "<p><strong>Secret Missions completed at this table:</strong> " + str(missions)
+                   + " (secondary recognition).</p>" + mission_table + "</div>")
 
     recap_html = ("<div class='card'><h2>Semester Recap</h2>" + semester_recap(team) + "</div>")
 
@@ -6724,6 +7097,17 @@ def projector():
             ".then(function(j){if(j&&typeof j.rev==='string'&&j.rev&&j.rev!==cur){location.reload();}})"
             ".catch(function(){});}setInterval(tick,5000);})();</script>")
     footer = "<p class='footer'><a href='/projector'>Refresh</a></p>" + live
+
+    # Hallway rumor: when the GM has announced one, it owns the projector as a full
+    # takeover until the GM dismisses it. On dismiss the previous view is restored
+    # automatically (every other branch below derives from game state). It shows
+    # only the public gossip wording -- no mechanic, player, allegiance, or team.
+    rum = _rumors_read(game)["active"]
+    if rum:
+        body = ("<div class='card center proj-rumor'>"
+                "<div class='proj-rumor-kicker'>" + e(RUMOR_TITLE) + "</div>"
+                "<div class='proj-rumor-text'>" + e(rumor_public_text(rum)) + "</div></div>")
+        return page("Projector", body + footer, "projector")
 
     # Paused: a single, unmistakable room-wide message.
     if game.get("paused"):
