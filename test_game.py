@@ -218,8 +218,22 @@ def gm_lock(client):
     client.post("/gm/lock")
 
 
+def gm_teach(client):
+    """Run the GM-guided teaching moment for the current checkpoint: Begin
+    Discussion (locks decisions) then Reveal Canvas Strategies. Both are
+    idempotent. Done before advancing so the normal flow is not an override."""
+    client.post("/gm/teaching/begin")
+    client.post("/gm/teaching/reveal")
+
+
 def gm_advance(client):
+    gm_teach(client)
     client.post("/gm/advance")
+
+
+def gm_final(client):
+    gm_teach(client)
+    client.post("/gm/final")
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +392,7 @@ def test_full_two_team_game():
     gm_lock(client)
 
     # ---- Final ----
-    client.post("/gm/final")
+    gm_final(client)
     C.check("final open", game.games[code]["final_open"])
     accuseA = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(idxA)}))
     C.check("final accusation screen", "Final Accusation" in accuseA)
@@ -465,7 +479,7 @@ def test_single_team_mode():
     client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idx),
                                          "cp": "0", "actions": ["clarify"]})
     run_private_check(client, code, idx, team, 0)
-    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/lock"); gm_advance(client)
     client.post("/gm/open")  # CP2
     client.get("/team/status", query_string={"game_code": code, "team_index": str(idx)})
     C.check("single-team late adds are the 5 reassigned", team["late_adds"] == team["reassigned"])
@@ -1012,7 +1026,7 @@ def test_course_shell():
             run_private_check(client, code, idx, team, 4)
         client.post("/gm/lock")
         if cp < 4:
-            client.post("/gm/advance")
+            gm_advance(client)
     C.check("shell reachable throughout", True)
     # Canvas-style chrome structure on a shell page.
     h = text(client.get("/team/shell", query_string={"game_code": code, "team_index": str(idx), "tab": "gradebook"}))
@@ -1767,7 +1781,7 @@ def test_canvas_highlights():
                                                   "repair": "gradebook", "not_add": "extra_credit"})
         client.post("/gm/lock")
         if cpn < 4:
-            client.post("/gm/advance")
+            gm_advance(client)
 
     C.check("highlights update as the GM advances (distinct sets across CPs)", len(set(seen)) >= 3)
     # The mapping itself only names real nav keys and flags 1-3 per checkpoint.
@@ -1878,22 +1892,22 @@ def test_resources_drawer():
 
     # --- Available across all five checkpoints --------------------------------
     run_private_check(client, code, idx, team, 0)
-    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/lock"); gm_advance(client)
     def drawer_at_cp(n):
         return "res-drawer" in text(client.get("/team/status", query_string=qs))
     client.post("/gm/open")  # CP2
     C.check("drawer at CP2", drawer_at_cp(2))
     client.post("/team/cp/submit", data={**qs, "cp": "1", "actions": ["start_here"]})
-    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/lock"); gm_advance(client)
     client.post("/gm/open")  # CP3
     C.check("drawer at CP3", drawer_at_cp(3))
     client.post("/team/cp/submit", data={**qs, "cp": "2", "actions": ["aligned_practice"]})
     run_private_check(client, code, idx, team, 2)
-    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/lock"); gm_advance(client)
     client.post("/gm/open")  # CP4
     C.check("drawer at CP4 (brief round)", drawer_at_cp(4))
     client.post("/team/cp4/submit", data={**qs, "priority": "scalable", "supporting": "tool"})
-    client.post("/gm/lock"); client.post("/gm/advance")
+    client.post("/gm/lock"); gm_advance(client)
     client.post("/gm/open")  # CP5
     C.check("drawer at CP5", drawer_at_cp(5))
 
@@ -2267,7 +2281,7 @@ def test_smart_progression():
     C.check("resume clears the flag", g.get("paused") is False)
 
     # --- Projector during play: progress + instruction, NO premature scores ---
-    client.post("/gm/advance")  # all ready for CP1 -> advance to CP2
+    gm_advance(client)  # all ready for CP1 -> advance to CP2
     client.post("/gm/open")
     proj = text(client.get("/projector"))
     C.check("projector shows completion progress", "teams ready" in proj or "All teams are ready" in proj)
@@ -2295,17 +2309,181 @@ def test_smart_progression_persistence():
         iB = register_team(client, code, "Duo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
         _progress_to_active(client, code, iA, tA, iB, tB)
         client.post("/gm/pause")
+        # A teaching stage must survive a restart too (plain JSON, string keys).
+        game.games[code].setdefault("teaching", {})["0"] = "revealed"
+        game.save_state()   # persist the direct mutation (no POST triggered it)
         before_ready = game.room_progress(game.games[code])["all_ready"]
         before = copy.deepcopy(game.games); before_code = game.active_code
         game.games.clear(); game.active_code = None
         game.restore_state()
         C.check("state restored byte-for-byte", game.games == before and game.active_code == before_code)
         C.check("paused persisted across restart", game.games[code].get("paused") is True)
+        C.check("teaching stage persisted across restart",
+                game.teaching_stage(game.games[code], 0) == "revealed")
         C.check("completion recomputed correctly after restart",
                 game.room_progress(game.games[code])["all_ready"] == before_ready)
     finally:
         storage._reset_for_tests()
         game.games.clear(); game.active_code = None
+
+
+def _finish_cp(client, code, idx, iA, tA, iB, tB, private=True):
+    """Both teams submit the current checkpoint's decision and (for private
+    checkpoints) complete the private round, leaving the room all-ready."""
+    if idx == 0:
+        client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA),
+                                             "cp": "0", "actions": ["clarify", "message"]})
+        client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB),
+                                             "cp": "0", "actions": ["monitor"],
+                                             "reassess": game.CP1_REASSESS_OPTIONS[0]})
+    elif idx == 1:
+        for ti in (iA, iB):
+            client.post("/team/cp/submit", data={"game_code": code, "team_index": str(ti),
+                                                 "cp": "1", "actions": ["start_here"]})
+    if private:
+        run_private_check(client, code, iA, tA, idx)
+        run_private_check(client, code, iB, tB, idx)
+
+
+def test_teaching_moments():
+    """Batch 4: GM-guided teaching moments -- readiness prompt, Keep Waiting,
+    Begin Discussion, Reveal Strategies, GM-controlled continuation, content for
+    all five checkpoints, overrides, idempotency, isolation, live polling, and
+    strict protection of facilitator notes / unrevealed content."""
+    print("\n=== GM-guided teaching moments ===")
+    import json as _json
+    client = fresh_client()
+    code = create_game(client)
+    iA = register_team(client, code, "Alpha", ["A", "B", "C", "D"]); tA = game.get_team(code, iA)
+    iB = register_team(client, code, "Bravo", ["A", "B", "C", "D"]); tB = game.get_team(code, iB)
+    _progress_to_active(client, code, iA, tA, iB, tB)
+    g = game.games[code]
+
+    # --- Content: all five checkpoints, aligned & complete ---
+    C.check("all five checkpoints have teaching content", set(game.TEACHING) == {0, 1, 2, 3, 4})
+    for idx in range(5):
+        t = game.TEACHING[idx]
+        C.check("CP%d question is substantial" % (idx + 1), bool(t["question"]) and len(t["question"]) > 40)
+        C.check("CP%d has 2-4 concrete strategies (do/where/solves)" % (idx + 1),
+                2 <= len(t["strategies"]) <= 4
+                and all(s.get("do") and s.get("where") and s.get("solves") for s in t["strategies"]))
+        n = t["notes"]
+        C.check("CP%d has complete GM-only notes" % (idx + 1),
+                all(n.get(k) for k in ("opener", "objective", "tools", "why", "time", "transition"))
+                and len(n["followups"]) >= 2)
+    # Topic alignment to the actual scenarios (a light sanity check, not exhaustive).
+    blob0 = (game.TEACHING[0]["question"] + " ".join(s["where"] for s in game.TEACHING[0]["strategies"])).lower()
+    C.check("CP1 aligns to gradebook/due-date/outreach", "message students who" in blob0 and "due date" in blob0)
+    blob2 = " ".join(s["where"] for s in game.TEACHING[2]["strategies"]).lower()
+    C.check("CP3 aligns to rubric/SpeedGrader alignment", "rubric" in blob2 and "speedgrader" in blob2)
+    blob3 = " ".join(s["where"] for s in game.TEACHING[3]["strategies"]).lower()
+    C.check("CP4 aligns to early alert / feedback visibility", "dropout detective" in blob3)
+    blob4 = " ".join(s["where"] for s in game.TEACHING[4]["strategies"]).lower()
+    C.check("CP5 aligns to gradebook accuracy / last date of attendance", "last date of attendance" in blob4)
+
+    # --- Nothing available until every team finishes ---
+    client.post("/gm/open")
+    C.check("teaching not available before teams finish", game.teaching_available(g) is False)
+    # finish only A first
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iA),
+                                         "cp": "0", "actions": ["clarify", "message"]})
+    run_private_check(client, code, iA, tA, 0)
+    C.check("not available with one team still working", game.teaching_available(g) is False)
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(iB),
+                                         "cp": "0", "actions": ["monitor"],
+                                         "reassess": game.CP1_REASSESS_OPTIONS[0]})
+    run_private_check(client, code, iB, tB, 0)
+    C.check("teaching available once all teams finish", game.teaching_available(g) is True)
+
+    # --- Readiness prompt; projector/teams still neutral ---
+    gmp = text(client.get("/gm"))
+    C.check("GM shows 'Teaching moment available'", "Teaching moment available" in gmp)
+    C.check("GM offers Begin Discussion + Keep Waiting", "Begin Discussion" in gmp and "Keep Waiting" in gmp)
+    C.check("GM shows facilitator notes (GM only)", "Facilitator notes (GM only)" in gmp)
+    C.check("projector shows NO question before Begin", game.TEACHING[0]["question"][:30] not in text(client.get("/projector")))
+
+    # --- Keep Waiting: quiets prompt, changes nothing else ---
+    cp_snap = _json.dumps(tA.get("cp", {}), sort_keys=True)
+    client.post("/gm/teaching/dismiss")
+    C.check("Keep Waiting does not lock the checkpoint", g["checkpoint_open"] is True)
+    C.check("Keep Waiting does not start a discussion", game.teaching_stage(g, 0) is None)
+    C.check("Keep Waiting does not alter team work", _json.dumps(tA.get("cp", {}), sort_keys=True) == cp_snap)
+    C.check("Keep Waiting records the dismissal", game.teaching_dismissed(g, 0) is True)
+    C.check("Begin Discussion still available after Keep Waiting", "Begin Discussion" in text(client.get("/gm")))
+
+    # --- Begin Discussion: locks + question on projector + neutral team state ---
+    client.post("/gm/teaching/begin")
+    C.check("Begin locks the checkpoint", g["checkpoint_open"] is False)
+    C.check("Begin sets the discussion stage", game.teaching_stage(g, 0) == "discussion")
+    proj = text(client.get("/projector"))
+    C.check("projector shows the discussion question", game.TEACHING[0]["question"][:30] in proj)
+    C.check("projector does NOT show strategies yet", game.TEACHING[0]["strategies"][0]["do"][:20] not in proj)
+    ts = text(client.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}))
+    C.check("team sees neutral 'Discussion in progress — look at the projector'",
+            "Discussion in progress" in ts and "look at the projector" in ts.lower())
+    C.check("team screen never shows the question", game.TEACHING[0]["question"][:30] not in ts)
+    C.check("team screen never shows strategies", game.TEACHING[0]["strategies"][0]["do"][:20] not in ts)
+    C.check("team screen never shows facilitator notes", game.TEACHING[0]["notes"]["opener"][:20] not in ts)
+    client.post("/gm/teaching/begin")  # double-click
+    C.check("double Begin is idempotent", game.teaching_stage(g, 0) == "discussion")
+
+    # --- Advance is blocked before reveal (never silently skipped) ---
+    r = text(client.post("/gm/advance"))
+    C.check("advance before reveal warns about the teaching moment", "Teaching moment not finished" in r)
+    C.check("advance before reveal does not advance", g["checkpoint_index"] == 0)
+
+    # --- Reveal: strategies only on explicit GM action ---
+    client.post("/gm/teaching/reveal")
+    C.check("reveal sets the revealed stage", game.teaching_stage(g, 0) == "revealed")
+    projr = text(client.get("/projector"))
+    C.check("projector shows strategies after reveal", game.TEACHING[0]["strategies"][0]["do"][:20] in projr)
+    client.post("/gm/teaching/reveal")
+    C.check("double Reveal is idempotent", game.teaching_stage(g, 0) == "revealed")
+
+    # --- GM-controlled continuation ---
+    C.check("GM shows 'Discussion complete — ready to continue'", "Discussion complete" in text(client.get("/gm")))
+    client.post("/gm/advance")
+    C.check("advance after reveal moves to CP2", g["checkpoint_index"] == 1)
+    C.check("CP1 teaching stage persists in state", game.teaching_stage(g, 0) == "revealed")
+
+    # --- Live payloads never leak notes / unrevealed teaching content ---
+    client.post("/gm/open")
+    for ti in (iA, iB):
+        client.post("/team/cp/submit", data={"game_code": code, "team_index": str(ti),
+                                             "cp": "1", "actions": ["start_here"]})
+    client.post("/gm/teaching/begin")   # CP2 discussion
+    glive = text(client.get("/gm/live"))
+    C.check("gm/live includes teach_sig", "teach_sig" in glive)
+    C.check("gm/live never leaks notes or strategy text",
+            game.TEACHING[1]["notes"]["opener"][:15] not in glive
+            and game.TEACHING[1]["strategies"][0]["do"][:15] not in glive)
+    plive = text(client.get("/live/game", query_string={"game_code": code}))
+    C.check("/live/game never leaks teaching text",
+            game.TEACHING[1]["question"][:20] not in plive
+            and game.TEACHING[1]["strategies"][0]["do"][:15] not in plive)
+
+    # --- Pause is NOT discussion ---
+    code2 = create_game(client)
+    jB = register_team(client, code2, "Zed", ["A", "B", "C", "D"]); tZ = game.get_team(code2, jB)
+    jC = register_team(client, code2, "Yan", ["A", "B", "C", "D"]); tY = game.get_team(code2, jC)
+    _progress_to_active(client, code2, jB, tZ, jC, tY)
+    g2 = game.games[code2]
+    client.post("/gm/open")
+    client.post("/gm/pause")
+    C.check("pausing does not begin a discussion", game.teaching_stage(g2, 0) is None)
+    C.check("pausing is independent of teaching", g2.get("paused") is True)
+    client.post("/gm/resume")
+
+    # --- Cross-game isolation: game1's teaching stage is unaffected ---
+    C.check("teaching state is isolated per game",
+            game.teaching_stage(game.games[code], 0) == "revealed"
+            and game.teaching_stage(g2, 0) is None)
+
+    # --- Override: an explicit confirm can skip the teaching moment on advance ---
+    _finish_cp(client, code2, 0, jB, tZ, jC, tY, private=True)
+    client.post("/gm/teaching/begin")                 # discussion, not revealed
+    client.post("/gm/advance", data={"confirm": "1"})  # deliberate override
+    C.check("explicit override may skip the teaching moment", g2["checkpoint_index"] == 1)
 
 
 def test_hidden_information_privacy():
@@ -2513,6 +2691,7 @@ def main():
     test_gm_command_center_and_help()
     test_smart_progression()
     test_smart_progression_persistence()
+    test_teaching_moments()
     test_hidden_information_privacy()
     ok = C.summary()
     sys.exit(0 if ok else 1)

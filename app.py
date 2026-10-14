@@ -975,7 +975,10 @@ def game_rev(game):
         game.get("checkpoint_index", 0), int(bool(game.get("checkpoint_open"))),
         int(bool(game.get("opened_once"))), int(bool(game.get("final_open"))),
         game.get("course_trading", "closed"), int(bool(game.get("reassignment_done"))),
-        len(game.get("teams", []))])
+        len(game.get("teams", [])),
+        # Teaching-moment stage of the current checkpoint: changes make the
+        # projector and team screens reload (into the discussion/strategies view).
+        str(game.get("teaching", {}).get(str(game.get("checkpoint_index", 0))))])
 
 
 def team_rev(game, i):
@@ -1006,6 +1009,65 @@ def projector_rev(game):
 
 def help_active(team):
     return bool(team.get("help", {}).get("active"))
+
+
+# ---------------------------------------------------------------------------
+# GM-guided teaching moments (Batch 4). Each checkpoint has an explicit stage
+# the GM controls: None (not begun) -> "discussion" (question on projector) ->
+# "revealed" (Canvas strategies on projector). A separate per-checkpoint
+# "dismissed" flag lets the GM quiet the readiness prompt (Keep Waiting) without
+# starting anything. All state is plain JSON (string keys) so it persists and
+# restores. Nothing instructional appears automatically -- only the GM advances
+# a stage.
+# ---------------------------------------------------------------------------
+def in_checkpoint(game):
+    """True while the room is inside one of the five checkpoints (not setup,
+    not the final)."""
+    return bool(game.get("opened_once")) and not game.get("final_open")
+
+
+def teaching_stage(game, idx):
+    return game.get("teaching", {}).get(str(idx))        # None | "discussion" | "revealed"
+
+
+def _set_teaching_stage(game, idx, stage):
+    game.setdefault("teaching", {})[str(idx)] = stage
+
+
+def teaching_dismissed(game, idx):
+    return bool(game.get("teaching_dismissed", {}).get(str(idx)))
+
+
+def teaching_available(game):
+    """The readiness prompt is worth showing: we're in a checkpoint, discussion
+    has not begun, and every team has finished the decision + any private round."""
+    if not in_checkpoint(game):
+        return False
+    idx = game["checkpoint_index"]
+    if teaching_stage(game, idx) is not None:
+        return False
+    return room_progress(game)["all_ready"]
+
+
+def teaching_active(game):
+    """Discussion has begun (question shown) and/or strategies revealed for the
+    current checkpoint."""
+    return in_checkpoint(game) and teaching_stage(game, game["checkpoint_index"]) in ("discussion", "revealed")
+
+
+def teaching_revealed_current(game):
+    return in_checkpoint(game) and teaching_stage(game, game["checkpoint_index"]) == "revealed"
+
+
+def teach_sig(game):
+    """A GM-dashboard reload trigger for teaching availability/stage/dismiss
+    changes that game_rev does not capture (game_rev omits live readiness). The
+    GM page reloads when this changes so the right facilitation controls appear."""
+    idx = game.get("checkpoint_index", 0)
+    return "|".join(str(p) for p in [
+        idx, teaching_stage(game, idx), int(teaching_available(game)),
+        int(teaching_dismissed(game, idx)), int(bool(game.get("final_open"))),
+        int(bool(game.get("opened_once")))])
 
 
 def _private_progress(game, team, idx):
@@ -1141,10 +1203,10 @@ def current_activity_label(game):
     return "Checkpoint %d: %s" % (idx + 1, CHECKPOINTS[idx])
 
 
-def next_gm_action(game):
-    """(label, note) describing the next major GM action, for the progression
-    panel. Mirrors the enabling logic in course_control_html/game_control_html;
-    it only labels -- the buttons themselves remain the authoritative controls."""
+def next_gm_action(game, all_ready=False):
+    """(label, note) for the single next GM step. Teaching-aware inside a
+    checkpoint so the GM always knows what to do next. `all_ready` is passed in
+    (room_progress computes it) to avoid recomputing / recursion."""
     if game.get("final_open"):
         return ("Game complete", "Teams are viewing their outcomes.")
     idx = game.get("checkpoint_index", 0)
@@ -1155,11 +1217,21 @@ def next_gm_action(game):
         if ph == "open":
             return ("Close course selection", "Locks each team's course and starts student placement.")
         return ("Open Checkpoint 1", "Begins the first checkpoint when placement is done.")
+    # Inside a checkpoint: the guided teaching sequence drives the next step.
+    stage = teaching_stage(game, idx)
+    if stage == "revealed":
+        if idx < len(CHECKPOINTS) - 1:
+            return ("Advance to Checkpoint %d" % (idx + 2), "The teaching moment is done — move the room on.")
+        return ("Proceed to Final", "The teaching moment is done — open the final accusation.")
+    if stage == "discussion":
+        return ("Reveal Canvas strategies", "Shows the practical Canvas strategies on the projector.")
+    if all_ready:
+        return ("Begin the Checkpoint %d discussion" % (idx + 1),
+                "Locks decisions and shows the discussion question on the projector.")
     if game.get("checkpoint_open"):
-        return ("Lock Checkpoint %d" % (idx + 1), "Closes the checkpoint once teams have decided.")
-    if idx < len(CHECKPOINTS) - 1:
-        return ("Open Checkpoint %d" % (idx + 2), "Begins the next checkpoint.")
-    return ("Proceed to Final", "Opens the final accusation and outcomes.")
+        return ("Teams are deciding", "The teaching moment unlocks when every team has finished.")
+    return ("Begin the Checkpoint %d discussion" % (idx + 1),
+            "Decisions are locked — start the discussion when you're ready.")
 
 
 def room_progress(game):
@@ -1169,9 +1241,10 @@ def room_progress(game):
     working = [t["name"] for t, f in zip(teams, done_flags) if not f]
     helpers = [t["name"] for t in teams if help_active(t)]
     done = sum(1 for f in done_flags if f)
-    label, note = next_gm_action(game)
+    all_ready = bool(teams) and done == len(teams)
+    label, note = next_gm_action(game, all_ready)
     return {"done": done, "total": len(teams), "working": working, "help": helpers,
-            "all_ready": bool(teams) and done == len(teams),
+            "all_ready": all_ready,
             "activity": current_activity_label(game),
             "next_label": label, "next_note": note,
             "paused": bool(game.get("paused"))}
@@ -1475,6 +1548,39 @@ body.projector .muted{color:#555;}
   text-align:center;font-weight:800;font-size:1.1rem;padding:12px 16px;box-shadow:0 2px 10px rgba(0,0,0,.25);}
 .teamwait{border-left:6px solid var(--good);}
 body.projector .cc-allready{color:var(--good);}
+/* GM teaching-moment block */
+.cc-teach{border:1px solid var(--line);border-left:8px solid var(--gray);border-radius:12px;
+  padding:16px 20px;margin:12px 0;background:var(--card);}
+.cc-teach h3{margin:0 0 6px;font-size:1.3rem;}
+.cc-teach p{margin:.3em 0;}
+.cc-teach button{padding:12px 22px;font-size:1.12rem;}
+.cc-teach.avail{border-left-color:var(--good);background:#eef7f1;box-shadow:0 0 0 2px var(--good) inset;}
+.cc-teach.avail h3{color:#1d6b40;font-size:1.5rem;}
+.cc-teach.discussion{border-left-color:#2f6fed;background:#eef3ff;}
+.cc-teach.discussion h3{color:#1b47a8;}
+.cc-teach.revealed{border-left-color:var(--good);background:#eef7f1;}
+.cc-teach.revealed h3{color:#1d6b40;}
+.cc-teach.dismissed,.cc-teach.pending{border-left-color:var(--line);}
+.cc-notes{background:#fff;border:1px solid var(--line);border-left:5px solid var(--warn);border-radius:10px;
+  padding:8px 16px;margin:8px 0 14px;}
+.cc-notes>summary{cursor:pointer;font-weight:700;color:#8a5200;padding:4px 0;}
+.cc-notes-body{padding:4px 0 8px;}
+.cc-notes-body ul{margin:.3em 0 .6em;padding-left:1.2em;}
+.cc-notes-body li{margin:.25em 0;}
+/* Projector: teaching question + strategies */
+.proj-teach-head{font-size:1.5rem;color:var(--red);font-weight:800;letter-spacing:.02em;margin-bottom:10px;}
+.proj-question{text-align:center;padding:40px 48px;}
+.proj-q-label{font-size:1.6rem;text-transform:uppercase;letter-spacing:.14em;color:var(--gray);margin-bottom:18px;}
+.proj-q-text{font-size:2.9rem;line-height:1.3;font-weight:700;color:var(--ink);max-width:22ch;margin:0 auto;}
+.proj-strats{padding:28px 36px;}
+.proj-strats-title{font-size:2.3rem;margin:0 0 20px;}
+.proj-strat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;}
+.proj-strat{border:1px solid var(--line);border-left:7px solid var(--red);border-radius:12px;
+  padding:18px 22px;background:#fff;}
+.proj-strat-do{font-size:1.55rem;font-weight:800;line-height:1.25;margin-bottom:8px;}
+.proj-strat-where{font-size:1.2rem;color:var(--gray);margin-bottom:8px;}
+.proj-strat-solves{font-size:1.25rem;color:#1d6b40;font-weight:600;}
+@media(max-width:1100px){.proj-strat-grid{grid-template-columns:1fr;}.proj-q-text{font-size:2.1rem;}}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -2008,8 +2114,11 @@ def gm_live():
     for row, t in zip(teams, game["teams"]):
         row["done"] = team_activity_done(game, row["i"], t)
     help_names = [t["name"] for t in game["teams"] if help_active(t)]
+    # `teach_sig` lets the dashboard reload when teaching availability/stage/dismiss
+    # changes (so the right facilitation controls appear). No notes/question/
+    # strategy text is ever sent in this payload.
     return jsonify({"rev": game_rev(game), "teams": teams, "help_names": help_names,
-                    "progress": room_progress(game)})
+                    "progress": room_progress(game), "teach_sig": teach_sig(game)})
 
 
 def _help_response(game_code, ti, team):
@@ -2075,6 +2184,52 @@ def gm_pause():
 def gm_resume():
     if active_code is not None:
         games[active_code]["paused"] = False
+    return redirect(url_for("gm"))
+
+
+# --- GM-guided teaching moment controls (idempotent, double-click safe) ------
+@app.route("/gm/teaching/begin", methods=["POST"])
+def gm_teaching_begin():
+    """Begin Discussion: safely lock the checkpoint (close decisions) and show the
+    discussion question on the projector. Requires all teams finished unless the
+    GM explicitly overrides. Idempotent -- a second click (or a double-submit)
+    leaves the stage at 'discussion'."""
+    if active_code is not None:
+        game = games[active_code]
+        if in_checkpoint(game):
+            idx = game["checkpoint_index"]
+            if teaching_stage(game, idx) is None:
+                prog = room_progress(game)
+                if not prog["all_ready"] and request.form.get("confirm") != "1":
+                    return gm_confirm_page(
+                        "/gm/teaching/begin",
+                        "Begin the Checkpoint %d discussion" % (idx + 1),
+                        prog["working"])
+                game["checkpoint_open"] = False      # safe lock: decisions close
+                _set_teaching_stage(game, idx, "discussion")
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/teaching/reveal", methods=["POST"])
+def gm_teaching_reveal():
+    """Reveal Canvas Strategies on the projector. Never automatic / never timed --
+    only this explicit GM action moves 'discussion' -> 'revealed'. Idempotent."""
+    if active_code is not None:
+        game = games[active_code]
+        if in_checkpoint(game) and teaching_stage(game, game["checkpoint_index"]) == "discussion":
+            _set_teaching_stage(game, game["checkpoint_index"], "revealed")
+    return redirect(url_for("gm"))
+
+
+@app.route("/gm/teaching/dismiss", methods=["POST"])
+def gm_teaching_dismiss():
+    """Keep Waiting: quiet the 'teaching moment available' prompt for the current
+    readiness WITHOUT starting discussion, locking, advancing, or altering any
+    team's work. The GM can still Begin Discussion later."""
+    if active_code is not None:
+        game = games[active_code]
+        if in_checkpoint(game) and teaching_stage(game, game["checkpoint_index"]) is None:
+            game.setdefault("teaching_dismissed", {})[str(game["checkpoint_index"])] = True
     return redirect(url_for("gm"))
 
 
@@ -2178,15 +2333,18 @@ def gm_live_script(game):
     help changes, so an open detail modal or scroll position is preserved. Fails
     quiet on dropped connection."""
     cur = game_rev(game)
+    tsig = teach_sig(game)
     return (
-        "<script>(function(){var cur=" + json.dumps(cur) + ";"
+        "<script>(function(){var cur=" + json.dumps(cur) + ";var tsig=" + json.dumps(tsig) + ";"
         "var LBL={working:'Working',waiting:'Waiting',finished:'Finished',help:'NEEDS HELP'};"
         "function esc(s){return String(s).replace(/[&<>]/g,function(c){"
         "return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});}"
         "function set(id,v){var el=document.getElementById(id);if(el)el.textContent=v;}"
         "function tick(){fetch('/gm/live',{headers:{'X-Requested-With':'fetch'}})"
         ".then(function(r){return r.json();}).then(function(j){if(!j)return;"
-        "if(j.rev&&j.rev!==cur){location.reload();return;}var hn=0;"
+        # Reload when the phase OR the teaching availability/stage changes so the
+        # facilitation controls (Begin / Reveal / Advance) stay correct.
+        "if((j.rev&&j.rev!==cur)||(typeof j.teach_sig==='string'&&j.teach_sig!==tsig)){location.reload();return;}var hn=0;"
         "(j.teams||[]).forEach(function(t){if(t.help)hn++;var c=document.getElementById('cc-card-'+t.i);if(!c)return;"
         "c.className='cc-card state-'+t.state;"
         "var a=c.querySelector('.cc-activity');if(a)a.innerHTML=esc(t.activity)+"
@@ -2204,6 +2362,87 @@ def gm_live_script(game):
         "set('cc-prog-help-n',p.help.length);}else{ph.style.display='none';}}"
         "var ptag=document.getElementById('cc-paused-tag');if(ptag)ptag.style.display=p.paused?'':'none';}"
         "}).catch(function(){});}setInterval(tick,3000);})();</script>")
+
+
+def facilitator_notes(idx):
+    """GM-only facilitator notes + a preview of the projector question/strategies,
+    collapsed by default. NEVER rendered on a team screen, the projector, or any
+    live payload."""
+    t = TEACHING.get(idx)
+    if not t:
+        return ""
+    n = t["notes"]
+    follow = "".join("<li>" + e(q) + "</li>" for q in n["followups"])
+    strat = "".join("<li><strong>" + e(s["do"]) + "</strong> "
+                    "<span class='muted'>" + e(s["where"]) + "</span> &mdash; " + e(s["solves"]) + "</li>"
+                    for s in t["strategies"])
+    return ("<details class='cc-notes'><summary>Facilitator notes (GM only)</summary>"
+            "<div class='cc-notes-body'>"
+            "<p class='muted'>Private to you &mdash; never shown on the projector or team screens. "
+            "Suggested time: <strong>" + e(n["time"]) + "</strong>.</p>"
+            "<p><strong>Objective:</strong> " + e(n["objective"]) + "</p>"
+            "<p><strong>Opener:</strong> &ldquo;" + e(n["opener"]) + "&rdquo;</p>"
+            "<p><strong>Follow-up angles:</strong></p><ul>" + follow + "</ul>"
+            "<p><strong>Discussion question (appears on the projector at Begin):</strong><br>"
+            + e(t["question"]) + "</p>"
+            "<p><strong>Canvas strategies (appear on the projector at Reveal):</strong></p><ul>"
+            + strat + "</ul>"
+            "<p><strong>Tools:</strong> " + e(n["tools"]) + "</p>"
+            "<p><strong>Why it matters:</strong> " + e(n["why"]) + "</p>"
+            "<p><strong>Transition:</strong> " + e(n["transition"]) + "</p>"
+            "</div></details>")
+
+
+def teaching_block(game):
+    """The GM's guided teaching-moment control for the CURRENT checkpoint: the
+    stage-appropriate prompt + the single clear next action, plus the GM-only
+    facilitator notes. Rendered server-side for the current stage; the live poller
+    reloads the dashboard when availability/stage changes (teach_sig)."""
+    if not in_checkpoint(game):
+        return ""
+    idx = game["checkpoint_index"]
+    if idx not in TEACHING:
+        return ""
+    stage = teaching_stage(game, idx)
+    cpn = idx + 1
+    cpname = e(CHECKPOINTS[idx])
+    begin = ("<form method='post' action='/gm/teaching/begin' style='display:inline'>"
+             "<button type='submit'>Begin Discussion</button></form>")
+    reveal = ("<form method='post' action='/gm/teaching/reveal' style='display:inline'>"
+              "<button type='submit'>Reveal Canvas Strategies</button></form>")
+    keepwait = ("<form method='post' action='/gm/teaching/dismiss' style='display:inline'>"
+                "<button class='secondary' type='submit'>Keep Waiting</button></form>")
+    if stage == "revealed":
+        if idx < len(CHECKPOINTS) - 1:
+            nxt_label, nxt_url = "Advance to Checkpoint %d" % (cpn + 1), "/gm/advance"
+        else:
+            nxt_label, nxt_url = "Proceed to Final", "/gm/final"
+        inner = ("<h3>&#10003; Discussion complete &mdash; ready to continue</h3>"
+                 "<p>The Canvas strategies are on the projector. When you're ready:</p>"
+                 "<form method='post' action='" + nxt_url + "' style='display:inline'>"
+                 "<button type='submit'>" + nxt_label + "</button></form>")
+        cls = "revealed"
+    elif stage == "discussion":
+        inner = ("<h3>Discussion in progress</h3>"
+                 "<p>The projector is showing the discussion question; teams are looking at the projector.</p>"
+                 "<p class='muted'>Strategies appear only when you press Reveal &mdash; never automatically or on a timer.</p>"
+                 + reveal)
+        cls = "discussion"
+    elif teaching_available(game) and not teaching_dismissed(game, idx):
+        inner = ("<h3>&#9733; All teams ready &mdash; Teaching moment available</h3>"
+                 "<p>Checkpoint " + str(cpn) + ": " + cpname + ". Begin the discussion to lock decisions "
+                 "and show the question on the projector.</p>" + begin + " " + keepwait)
+        cls = "avail"
+    elif teaching_dismissed(game, idx):
+        inner = ("<h3>Teaching moment available</h3>"
+                 "<p>Checkpoint " + str(cpn) + ": " + cpname + ". Begin the discussion whenever you're ready.</p>"
+                 + begin)
+        cls = "dismissed"
+    else:
+        inner = ("<h3>Teaching moment</h3><p class='muted'>Unlocks for Checkpoint " + str(cpn)
+                 + " once every team has finished its decision and private round.</p>")
+        cls = "pending"
+    return ("<div class='cc-teach " + cls + "' id='cc-teach'>" + inner + "</div>" + facilitator_notes(idx))
 
 
 @app.route("/gm")
@@ -2250,8 +2489,8 @@ def gm():
     else:
         grid = "<div class='card'><p>No teams have joined yet. Share the game code above.</p></div>"
 
-    body = (header + progression_panel(active_code, game) + gm_help_alert(game)
-            + controls + pacing + grid
+    body = (header + progression_panel(active_code, game) + teaching_block(game)
+            + gm_help_alert(game) + controls + pacing + grid
             + "<p class='footer'><a href='/'>Home</a></p>"
             + gm_live_script(game))
     return page("Game Master Command Center", body, "gm")
@@ -2272,6 +2511,26 @@ def gm_confirm_page(action_url, action_label, incomplete):
             "<button type='submit'>" + e(action_label) + " anyway (override)</button></form> "
             "<a class='btn secondary' href='/gm'>Cancel &mdash; keep waiting</a></div>")
     return page("Confirm: " + action_label, body, "gm")
+
+
+def gm_teaching_skip_confirm_page(action_url, action_label, idx):
+    """Shown when the GM tries to move past a checkpoint without completing its
+    teaching moment (discussion + reveal). A teaching moment is never skipped
+    silently; bypassing it takes a deliberate, explicit override."""
+    stage = teaching_stage(games[active_code], idx)
+    where = ("you have not begun the discussion yet" if stage is None
+             else "you began the discussion but have not revealed the Canvas strategies")
+    body = ("<div class='card'><h2>Teaching moment not finished</h2>"
+            "<p class='err'>For <strong>Checkpoint " + str(idx + 1) + ": " + e(CHECKPOINTS[idx])
+            + "</strong>, " + where + ".</p>"
+            "<p>The teaching moment is the point of the round. You can go back and run it, or skip it "
+            "deliberately this time.</p>"
+            "<form method='post' action='" + action_url + "' style='display:inline'>"
+            "<input type='hidden' name='confirm' value='1'>"
+            "<input type='hidden' name='skip_teaching' value='1'>"
+            "<button type='submit'>Skip the teaching moment &amp; " + e(action_label) + "</button></form> "
+            "<a class='btn secondary' href='/gm'>Cancel &mdash; go back</a></div>")
+    return page("Confirm: skip teaching moment", body, "gm")
 
 
 @app.route("/gm/open", methods=["POST"])
@@ -2359,6 +2618,11 @@ def gm_advance():
                 return gm_confirm_page("/gm/advance",
                                        "Advance to Checkpoint %d" % (index + 2),
                                        prog["working"])
+            # Never silently skip the teaching moment: bypassing it needs an
+            # explicit override (reuses the same confirm=1 token as the page).
+            if teaching_stage(game, index) != "revealed" and request.form.get("confirm") != "1":
+                return gm_teaching_skip_confirm_page(
+                    "/gm/advance", "Advance to Checkpoint %d" % (index + 2), index)
             game["checkpoint_index"] = index + 1
             game["checkpoint_open"] = False
             game["opened_once"] = False
@@ -2374,6 +2638,9 @@ def gm_final():
             prog = room_progress(game)
             if not prog["all_ready"] and request.form.get("confirm") != "1":
                 return gm_confirm_page("/gm/final", "Proceed to Final", prog["working"])
+            if teaching_stage(game, game["checkpoint_index"]) != "revealed" and request.form.get("confirm") != "1":
+                return gm_teaching_skip_confirm_page(
+                    "/gm/final", "Proceed to Final", game["checkpoint_index"])
             game["final_open"] = True
             game["checkpoint_open"] = False
     return redirect(url_for("gm"))
@@ -3634,7 +3901,14 @@ def status_screen(game_code, team_index, team):
 
     if game["checkpoint_open"]:
         return checkpoint_screen(game_code, team_index, team)
-    if game["opened_once"]:
+    if teaching_active(game):
+        # The GM has started the teaching discussion for this checkpoint. Teams
+        # see a neutral pointer to the projector -- never the question, the
+        # strategies, or any facilitator content.
+        body = ("<div class='card center teamwait'><h2>Discussion in progress</h2>"
+                "<p class='big'>Please look at the projector.</p>"
+                "<p class='muted'>Your decisions are locked while the group discusses this checkpoint.</p></div>")
+    elif game["opened_once"]:
         # Between checkpoints: this team is finished; show room-wide progress.
         body = (team_waiting_note(game)
                 + "<div class='card'><h2>Checkpoint " + str(number) + ": " + name + " &mdash; Locked</h2>"
@@ -4406,6 +4680,193 @@ CP5_NOT_ADD = [
     {"key": "new_policy", "label": "A new late/grading policy this late in the term",
      "deltas": D(cq=3, tr=6, fc=8)},
 ]
+
+
+# ---------------------------------------------------------------------------
+# GM-guided teaching moments: one scenario-specific discussion question and a
+# small set of concrete Canvas/NCC strategies per checkpoint, plus GM-only
+# facilitator notes. Aligned to the ACTUAL checkpoint scenarios above; it names
+# only tools/outcomes that already exist in the game and the real NCC toolset.
+# The `question` and `strategies` are projector-safe (public). `notes` are
+# GM-only and must never reach a team screen, the projector, or any live payload.
+# ---------------------------------------------------------------------------
+TEACHING = {
+    0: {  # First Week
+        "title": "First Week: a course problem, or a student problem?",
+        "question": ("Before you “fix the students”: your syllabus and Canvas disagree on a due "
+                     "date, missing work shows as blank cells, and one student has the same confusion as "
+                     "a classmate who spoke up — but stays silent. Which of these is a COURSE problem "
+                     "you own, and which is a student problem?"),
+        "strategies": [
+            {"do": "Make the gradebook tell the truth — enter 0s for missing work.",
+             "where": "Canvas Grades → column menu → “Set Default Grade” (or “Message Students Who → Haven’t submitted”).",
+             "solves": "Blank cells hide who is behind and make the class look better than it is."},
+            {"do": "Give due dates one source of truth.",
+             "where": "Set each Assignment’s due date to match the syllabus; point to a Start Here / Simple Syllabus page.",
+             "solves": "A syllabus-vs-Canvas mismatch is a course error, not a student mistake."},
+            {"do": "Nudge the students who haven’t started — in two minutes.",
+             "where": "Grades → “Message Students Who… Haven’t submitted yet,” with the instructions + rubric.",
+             "solves": "Fast, scalable early outreach before small gaps become disengagement."},
+            {"do": "Watch for the quiet ones who never ask.",
+             "where": "New Analytics → low page views + no messages.",
+             "solves": "Engagement is not help-seeking; the silent student needs you to reach first."},
+        ],
+        "notes": {
+            "opener": ("Quick show of hands: who has ever treated a “student problem” in week one that "
+                       "turned out to be a setup problem of their own? Keep that in mind as we look at this."),
+            "followups": [
+                "When does one class-wide clarification beat twenty individual replies?",
+                "What’s your two-minute move for students who have gone quiet but aren’t failing yet?",
+                "Where in YOUR course could a syllabus/Canvas mismatch be quietly costing students points?"],
+            "objective": ("Separate course-design problems from student problems in week one, and act early "
+                          "with scalable tools instead of heroics."),
+            "tools": ("Canvas Grades (Set Default Grade, Message Students Who), Assignment due dates, "
+                      "Simple Syllabus / Start Here, New Analytics; refer to the Learning Center or Brainfuse."),
+            "why": ("Week-one accuracy and clarity prevent avoidable failures; blank-cell gradebooks and "
+                    "conflicting dates erode trust and regular contact from day one."),
+            "time": "~5–6 min",
+            "transition": "Early systems pay off next — let’s see what happens when new students arrive mid-stream.",
+        },
+    },
+    1: {  # Early Semester / late adds
+        "title": "Early Semester: onboard by hand, or build it once?",
+        "question": ("New students just added two weeks in. Do you onboard them by hand again — or build "
+                     "ONE reusable “Start Here” that onboards every late add from now on? What would it "
+                     "actually contain?"),
+        "strategies": [
+            {"do": "Build a reusable “Start Here” / late-start module once.",
+             "where": "Canvas Modules → a Start Here module: welcome, where things live, first steps, how to catch up.",
+             "solves": "Every future late add self-onboards without a new email from you."},
+            {"do": "Message just the new students with their catch-up steps.",
+             "where": "People/Grades → “Message Students Who,” or a Canvas Group for late adds.",
+             "solves": "Specific guidance without spamming the whole class."},
+            {"do": "Route needs to the right support.",
+             "where": "Link Academic Advising + the Learning Center / Brainfuse right in the Start Here page.",
+             "solves": "Onboarding isn’t all on you — scalable and sustainable."},
+            {"do": "For labs/CTE: gate lab access behind a safety/orientation step.",
+             "where": "Module prerequisites / requirements (a safety quiz before lab content unlocks).",
+             "solves": "Late adds can’t skip required safety or sequence."},
+        ],
+        "notes": {
+            "opener": "Who has onboarded a late add three separate times the hard way? Let’s build it once.",
+            "followups": [
+                "What belongs on the very first screen a late add sees?",
+                "How do you make the same Start Here work for face-to-face AND asynchronous students?",
+                "What can advising or the Learning Center own so it’s off your plate?"],
+            "objective": "Replace repeated manual onboarding with a reusable Canvas system that scales.",
+            "tools": ("Canvas Modules (Start Here, prerequisites/requirements), Groups, Message Students Who, "
+                      "Advising + Learning Center/Brainfuse links."),
+            "why": ("Scalable onboarding protects faculty capacity and gives every student a consistent entry "
+                    "— essential for hybrid/asynchronous courses and rolling CTE cohorts."),
+            "time": "~4–5 min",
+            "transition": "Systems in place — now the first big assessment tests whether practice prepared students.",
+        },
+    },
+    2: {  # First Major Assessment / alignment
+        "title": "First Major Assessment: studying, teaching, or alignment?",
+        "question": ("The class did fine overall, but most students lost points on the ONE rubric skill your "
+                     "practice never actually asked them to do. Is this a studying problem, a teaching "
+                     "problem, or an ALIGNMENT problem — and how can you tell the difference?"),
+        "strategies": [
+            {"do": "Align practice to the rubric’s verb.",
+             "where": "If the rubric says “justify,” rebuild one low-stakes practice to ask students to justify — not just “identify.”",
+             "solves": "The practice-to-assessment mismatch that caused the gap."},
+            {"do": "Let the rubric do the teaching.",
+             "where": "Attach the Canvas Rubric to the assignment and grade in SpeedGrader so students see exactly where points were lost.",
+             "solves": "Vague “try harder” feedback; students learn the standard."},
+            {"do": "Offer a structured revision tied to the weak criterion.",
+             "where": "A resubmission that must address the specific rubric row (use sparingly for capacity).",
+             "solves": "Turns a low score into actual learning."},
+            {"do": "Separate the two causes before you act.",
+             "where": "New Analytics: low-practice students → outreach/tutoring; engaged students who still struggled → reteach.",
+             "solves": "One fix can’t address two different causes at once."},
+        ],
+        "notes": {
+            "opener": "When a WHOLE class misses the same thing, the odds it’s purely “them” drop fast.",
+            "followups": [
+                "How do you check that your practice matches the cognitive demand of the assessment?",
+                "When is a reteach worth it versus a revision window — given your capacity?",
+                "How do rubric-anchored comments in SpeedGrader change what students do next?"],
+            "objective": "Diagnose assessment results by cause and fix alignment, not just symptoms.",
+            "tools": ("Canvas Rubrics + SpeedGrader, aligned practice assignments, New Analytics, "
+                      "Learning Center/Brainfuse referrals."),
+            "why": ("Alignment and rubric-anchored feedback are the core of regular substantive interaction "
+                    "and meaningful feedback — the biggest lever on learning."),
+            "time": "~6–7 min",
+            "transition": "Midterm raises the stakes: more needs than time. Next we practice triage.",
+        },
+    },
+    3: {  # Midterm / triage
+        "title": "Midterm: triage, not a to-do list.",
+        "question": ("At midterm you have a declining student, a shared misconception, a grading backlog, AND "
+                     "students who can’t even FIND your feedback — with no time for all of it. What do you "
+                     "protect first, and what do you deliberately let go this round?"),
+        "strategies": [
+            {"do": "Use early alert for your highest-risk student.",
+             "where": "Dropout Detective (in Canvas) → flag + notify the advisor for the declining student.",
+             "solves": "One coordinated response instead of chasing it alone."},
+            {"do": "Fix the shared misconception once, for everyone.",
+             "where": "A short Announcement or a 3-minute mini-lesson addressing the common error.",
+             "solves": "Scalable beats individual when the problem is class-wide."},
+            {"do": "Make feedback findable.",
+             "where": "Show where SpeedGrader comments live (a 30-second Canvas Studio clip or an Announcement with a screenshot).",
+             "solves": "Feedback students can’t find isn’t feedback."},
+            {"do": "Protect your capacity on purpose.",
+             "where": "Deliberately defer one lower-priority task — and say so.",
+             "solves": "Doing everything “a little” at midterm burns you out and helps no one."},
+        ],
+        "notes": {
+            "opener": "Midterm is triage, not a to-do list. If you can only protect two things, what are they?",
+            "followups": [
+                "What makes a student “highest-risk” versus just behind?",
+                "When is a scalable whole-class move better than twenty personal emails?",
+                "What will you deliberately NOT do this round — and how will you communicate that?"],
+            "objective": "Prioritize high-impact, scalable moves and protect faculty capacity under real constraints.",
+            "tools": ("Dropout Detective (early alert), Announcements, SpeedGrader + Canvas Studio for feedback "
+                      "visibility, Message Students Who."),
+            "why": ("Prioritization and early alert catch persistence risks in time; feedback students can’t "
+                    "find is a quiet failure of regular substantive interaction."),
+            "time": "~5–6 min",
+            "transition": "Last stretch: finishing accurately and sustainably — without adding scope.",
+        },
+    },
+    4: {  # Final Stretch
+        "title": "Final Stretch: protect, repair, add nothing new.",
+        "question": ("Final stretch: a student is one point from passing, grading is piling up, some zeros are "
+                     "still blank, and students want brand-new extra credit. What do you PROTECT, what do you "
+                     "REPAIR, and what do you refuse to ADD — and why is “add nothing new” sometimes the "
+                     "most professional call?"),
+        "strategies": [
+            {"do": "Close the gradebook accurately.",
+             "where": "Canvas Grades → enter real 0s and record the last date of attendance / last activity for non-submitters.",
+             "solves": "Accurate final grades and financial-aid / completion reporting depend on it."},
+            {"do": "Protect a sustainable routine — reuse, don’t rebuild.",
+             "where": "Reuse existing rubrics and feedback banks for the remaining grading.",
+             "solves": "Recovers the capacity you need to finish accurately."},
+            {"do": "Decline new scope, on purpose.",
+             "where": "Say no to a brand-new extra-credit assignment or new module this late.",
+             "solves": "New work this late rarely helps learning and crushes capacity."},
+            {"do": "Publish grades and close the loop.",
+             "where": "Publish final grades; complete the Course Improvement Survey; send one clear “what’s left and when” message.",
+             "solves": "Students know where they stand, and you capture improvements for next term."},
+        ],
+        "notes": {
+            "opener": ("The finish line is where accuracy and sustainability matter most — and where “do "
+                       "more” is usually the wrong instinct."),
+            "followups": [
+                "What’s the difference between a student failing and the COURSE failing?",
+                "Which end-of-term tasks are compliance-critical (grades, last date of attendance) versus optional?",
+                "What will you reuse instead of rebuild to protect your capacity?"],
+            "objective": "Finish sustainably and accurately: protect capacity, repair what matters, add nothing new.",
+            "tools": ("Canvas Grades (zeros, last date of attendance), Grade Publish, Course Improvement Survey, "
+                      "reused rubrics; one final Announcement."),
+            "why": ("Accurate final grades and last-activity dates are compliance-critical; declining new scope "
+                    "models sustainable, professional practice."),
+            "time": "~5–6 min",
+            "transition": "That’s the full arc — week one to finals. Next: the final accusation and the real debrief.",
+        },
+    },
+}
 
 
 def cp_dict(team):
@@ -6269,6 +6730,31 @@ def projector():
         body = ("<div class='card center'><h1>Paused</h1>"
                 "<p class='big'>Discussion in progress. Please give the Game Master your attention.</p></div>")
         return page("Projector", body + footer, "projector")
+
+    # Teaching moment: the ONE discussion question, then (only after the GM
+    # reveals) the Canvas strategies. Nothing here appears until the GM acts, and
+    # facilitator notes / correct answers are never shown.
+    if teaching_active(game):
+        idx = game["checkpoint_index"]
+        t = TEACHING.get(idx)
+        if t:
+            stage = teaching_stage(game, idx)
+            head = ("<div class='proj-teach-head'>Checkpoint " + str(idx + 1) + " of "
+                    + str(len(CHECKPOINTS)) + " &mdash; " + e(CHECKPOINTS[idx]) + "</div>")
+            if stage == "discussion":
+                body = ("<div class='card proj-question'>" + head
+                        + "<div class='proj-q-label'>Discussion</div>"
+                        "<div class='proj-q-text'>" + e(t["question"]) + "</div></div>")
+            else:  # revealed
+                cards = "".join(
+                    "<div class='proj-strat'><div class='proj-strat-do'>" + e(s["do"]) + "</div>"
+                    "<div class='proj-strat-where'>" + e(s["where"]) + "</div>"
+                    "<div class='proj-strat-solves'>&#8594; " + e(s["solves"]) + "</div></div>"
+                    for s in t["strategies"])
+                body = ("<div class='card proj-strats'>" + head
+                        + "<h1 class='proj-strats-title'>Practical Canvas strategies</h1>"
+                        "<div class='proj-strat-grid'>" + cards + "</div></div>")
+            return page("Projector", body + footer, "projector")
 
     # Final: the one place scores/outcomes are revealed.
     if game.get("final_open"):
