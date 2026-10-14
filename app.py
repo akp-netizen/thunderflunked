@@ -991,27 +991,50 @@ BASE_CSS = """
 :root{--red:#A4343A;--gray:#676767;--ink:#1f2224;--bg:#f4f1ec;--card:#ffffff;
       --line:#d9d4cc;--good:#2e7d4f;--warn:#b26a00;--bad:#9e2b25;}
 *{box-sizing:border-box;}
+/* Base readability: 17px root so rem-based sizing scales up app-wide. */
+html{font-size:17px;}
+/* Images never force horizontal overflow on narrow screens. */
+img{max-width:100%;height:auto;}
 body{margin:0;font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-     color:var(--ink);background:var(--bg);line-height:1.5;}
-.wrap{max-width:900px;margin:0 auto;padding:20px;}
-header.bar{background:var(--red);color:#fff;padding:14px 20px;}
+     color:var(--ink);background:var(--bg);line-height:1.55;font-size:1rem;}
+/* Content width tiers. Default stays a readable measure; 'wide' is for
+   card/working screens that need desktop space. GM and projector get their own
+   wider frames (set below) regardless of the per-screen width. */
+.wrap{max-width:1040px;margin:0 auto;padding:22px 24px;}
+.wrap.wide{max-width:1380px;}
+header.bar{background:var(--red);color:#fff;padding:16px 24px;}
 header.bar .wrap{padding:0;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;}
-header.bar h1{font-size:1.25rem;margin:0;}
-header.bar .tag{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;opacity:.9;}
-h1,h2,h3,h4{color:var(--ink);}
-h2{border-bottom:3px solid var(--red);padding-bottom:4px;margin-top:1.4em;}
+header.bar h1{font-size:1.4rem;margin:0;}
+header.bar .tag{font-size:.95rem;text-transform:uppercase;letter-spacing:.08em;opacity:.92;}
+h1,h2,h3,h4{color:var(--ink);line-height:1.25;}
+h1{font-size:1.95rem;margin:.2em 0 .5em;}
+h2{font-size:1.5rem;border-bottom:3px solid var(--red);padding-bottom:5px;margin-top:1.3em;}
+h3{font-size:1.22rem;}
+h4{font-size:1.06rem;}
 a{color:var(--red);}
+/* Comfortable interactive controls (labels/buttons ~18-20px). */
+input[type=text],input[type=number],textarea,select{font-size:1.02rem;padding:9px 11px;
+  border:1px solid var(--line);border-radius:6px;max-width:100%;}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
       padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.04);}
 .evidence{border-left:5px solid var(--gray);}
-.notice{background:#fff7e6;border:1px solid #f0d9a6;border-radius:8px;padding:12px 14px;margin:12px 0;}
+.notice{background:#fff7e6;border:1px solid #f0d9a6;border-radius:8px;padding:14px 16px;margin:14px 0;font-size:1.05rem;}
 .btn,button{background:var(--red);color:#fff;border:0;border-radius:8px;
-      padding:10px 16px;font-size:1rem;cursor:pointer;text-decoration:none;display:inline-block;}
+      padding:12px 22px;font-size:1.1rem;cursor:pointer;text-decoration:none;display:inline-block;line-height:1.2;}
 .btn.secondary,button.secondary{background:#fff;color:var(--red);border:2px solid var(--red);}
 button:focus,a:focus,input:focus,select:focus{outline:3px solid #000;outline-offset:2px;}
-label{display:block;margin:.4em 0;}
-.choice{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0;background:#fff;}
-.choice small{color:var(--gray);display:block;margin-top:4px;}
+label{display:block;margin:.5em 0;font-size:1.02rem;}
+.choice{border:1px solid var(--line);border-radius:8px;padding:13px 15px;margin:10px 0;background:#fff;font-size:1.04rem;}
+.choice small{color:var(--gray);display:block;margin-top:5px;font-size:.95rem;}
+/* GM runs on a desktop; projector is read across a room -- give each more room. */
+body.gm .wrap{max-width:1440px;}
+/* Small-screen guard: tighten chrome so the header never overflows. */
+@media(max-width:560px){
+  .wrap{padding:16px 15px;}
+  header.bar{padding:14px 16px;}
+  header.bar h1{font-size:1.15rem;}
+  h1{font-size:1.6rem;} h2{font-size:1.3rem;}
+}
 .meter{margin:10px 0;}
 .meter .top{display:flex;justify-content:space-between;font-weight:600;}
 .meter .track{background:#e6e1d8;border-radius:6px;height:16px;overflow:hidden;border:1px solid var(--line);}
@@ -1023,7 +1046,7 @@ th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;}
 th{background:#efe9e0;}
 .err{color:#fff;background:var(--bad);padding:10px 12px;border-radius:8px;}
 .muted{color:var(--gray);}
-.pill{display:inline-block;background:#efe9e0;border-radius:20px;padding:2px 10px;font-size:.85rem;}
+.pill{display:inline-block;background:#efe9e0;border-radius:20px;padding:3px 12px;font-size:.95rem;}
 .resource{border-left:5px solid var(--line);}
 .resource.support{border-left-color:var(--red);}
 .resource.tool{border-left-color:var(--gray);}
@@ -1034,9 +1057,9 @@ details.card[open] summary{margin-bottom:8px;}
 .private .wrap{min-height:40vh;}
 .private h1,.private h2,.private h3{color:#fff;}
 .private .card{background:#3a3f45;border-color:#555;color:#fff;}
-.big{font-size:1.3rem;}
+.big{font-size:1.55rem;}
 .center{text-align:center;}
-.footer{margin-top:24px;font-size:.9rem;}
+.footer{margin-top:26px;font-size:1rem;}
 ul.clean{list-style:none;padding-left:0;}
 ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 .tilegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin:12px 0;}
@@ -1055,13 +1078,27 @@ ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 #selcount.count-ok{color:var(--good);} #selcount.count-no{color:var(--warn);}
 .selbar label{display:inline;}
 .selbar input[type=text]{width:220px;max-width:60vw;}
-/* Artwork-based Student Card tiles (the card art carries name + all six stats) */
-.cardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin:14px 0;}
-.student-tile{padding:6px;display:block;}
-.student-tile img,.scard img{width:100%;height:auto;display:block;border-radius:8px;}
-.student-tile img{transition:opacity .12s;opacity:.9;}
-.student-tile:has(input:checked) img{opacity:1;}
-.student-tile .check{top:12px;left:12px;right:auto;font-size:.85rem;padding:3px 10px;}
+/* Artwork-based Student Card tiles -- large and readable, 3-up on desktop,
+   2-up on small laptops, 1-up on narrow. The card art carries the name + all six
+   stats, so no stat table is repeated beside it. */
+.cardgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:16px 0;}
+@media(max-width:1100px){.cardgrid{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:620px){.cardgrid{grid-template-columns:minmax(0,1fr);}}
+.student-tile{position:relative;border:2px solid var(--line);border-radius:12px;padding:8px;background:#fff;min-width:0;}
+.sel-cb{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);}
+.sel-face{display:block;cursor:pointer;border-radius:8px;margin:0;}
+.sel-face img,.scard img{width:100%;height:auto;display:block;border-radius:8px;}
+.sel-face img{transition:opacity .12s;opacity:.9;}
+.student-tile:has(.sel-cb:checked){border-color:var(--red);box-shadow:0 0 0 3px var(--red) inset;background:#faecec;}
+.student-tile:has(.sel-cb:checked) .sel-face img{opacity:1;}
+.sel-cb:focus-visible+.sel-face{outline:3px solid #000;outline-offset:2px;}
+.student-tile .check{position:absolute;top:16px;left:16px;font-size:1rem;font-weight:700;color:#fff;
+  background:var(--red);border-radius:10px;padding:5px 13px;opacity:0;pointer-events:none;z-index:2;}
+.student-tile:has(.sel-cb:checked) .check{opacity:1;}
+.enlarge-btn{position:absolute;top:16px;right:16px;z-index:3;background:rgba(255,255,255,.96);
+  border:1px solid var(--line);border-radius:8px;padding:6px 13px;font-size:.98rem;font-weight:600;
+  color:var(--ink);cursor:zoom-in;}
+.zoom-cb:focus-visible+.enlarge-btn{outline:3px solid #000;outline-offset:2px;}
 .scard{position:relative;border:1px solid var(--line);border-radius:10px;padding:6px;background:#fff;}
 .scard-badge{position:absolute;top:10px;left:10px;background:var(--red);color:#fff;font-weight:700;}
 /* Persistent selection counter for the placement screen */
@@ -1092,9 +1129,9 @@ ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 .zoom-cb{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);}
 .zoom-thumb{display:inline-block;cursor:zoom-in;margin:0;text-align:center;}
 .zoom-thumb img{width:100%;height:auto;display:block;border-radius:10px;border:1px solid var(--line);}
-.zoom-lg .zoom-thumb img{max-width:440px;}
-.zoom-md .zoom-thumb img{max-width:260px;}
-.zoom-hint{display:block;font-size:.8rem;color:var(--gray);margin-top:5px;}
+.zoom-lg .zoom-thumb img{max-width:min(440px,100%);}
+.zoom-md .zoom-thumb img{max-width:min(260px,100%);}
+.zoom-hint{display:block;font-size:.95rem;color:var(--gray);margin-top:6px;}
 .zoom-cb:focus-visible+.zoom-thumb{outline:3px solid #000;outline-offset:2px;}
 .zoom-cb:focus-visible+.zoom-thumb .zoom-hint{text-decoration:underline;}
 .zoom-overlay{display:none;}
@@ -1103,6 +1140,20 @@ ul.clean li{padding:4px 0;border-bottom:1px solid var(--line);}
 .zoom-overlay img{max-width:min(96vw,780px);width:100%;height:auto;border-radius:8px;margin:auto;}
 .zoom-close{align-self:center;position:sticky;top:0;margin:0 0 12px;background:#fff;color:var(--ink);
   border-radius:8px;padding:9px 20px;font-weight:700;cursor:pointer;}
+/* Projector / room screen: large type meant to be read from the back of a room. */
+body.projector .wrap{max-width:1680px;}
+body.projector{font-size:1.4rem;}
+body.projector header.bar h1{font-size:1.9rem;}
+body.projector header.bar .tag{font-size:1.15rem;}
+body.projector h1{font-size:2.7rem;}
+body.projector h2{font-size:2.2rem;}
+body.projector h3{font-size:1.7rem;}
+body.projector .card{padding:22px 28px;margin:18px 0;}
+body.projector table{font-size:1.3rem;}
+body.projector th,body.projector td{padding:13px 18px;}
+body.projector .big{font-size:2.1rem;}
+body.projector .footer{font-size:1.15rem;}
+body.projector .muted{color:#555;}
 /* Canvas-style course shell */
 body.shell{background:#fff;}
 .lms{display:flex;min-height:100vh;background:#fff;color:#2d3b45;}
@@ -1137,9 +1188,11 @@ body.shell{background:#fff;}
 """
 
 
-def page(title, body, screen="team", header_tag="Faculty Development Game", bare=False):
+def page(title, body, screen="team", header_tag="Faculty Development Game", bare=False, width=""):
     body_class = {"team": "", "projector": "projector", "gm": "gm",
                   "private": "private", "landing": "", "shell": "shell"}.get(screen, "")
+    # 'wide' gives card/working screens (student + course selection) desktop width.
+    wrapcls = "wrap wide" if width == "wide" else "wrap"
     head = (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -1156,9 +1209,9 @@ def page(title, body, screen="team", header_tag="Faculty Development Game", bare
     # never applies to standalone/legacy pages or to the full-screen private
     # screens, which are not embedded.
     header = ("" if _embedded() else
-              "<header class='bar'><div class='wrap'><h1>Northwest Iowa Community College</h1>"
+              "<header class='bar'><div class='" + wrapcls + "'><h1>Northwest Iowa Community College</h1>"
               "<span class='tag'>" + e(header_tag) + "</span></div></header>")
-    return head + header + "<main class='wrap'>" + body + "</main></body></html>"
+    return head + header + "<main class='" + wrapcls + "'>" + body + "</main></body></html>"
 
 
 def resource_meters(scores, statuses):
@@ -1245,15 +1298,28 @@ def student_mini_card(label, selectable=False, checked=False, badge=""):
     the card's game state; when `selectable`, the whole card is a keyboard- and
     tap-accessible checkbox with a visible selected state and checkmark."""
     num = int(label[1:3])
+    src = e(student_image_src(label))
     alt = e(label) + " Student Card (shows name, number, and all six stats)"
-    img = ("<img src='" + student_image_src(label) + "' alt='" + alt
-           + "' loading='lazy'>")
+    img = "<img src='" + src + "' alt='" + alt + "' loading='lazy'>"
     if selectable:
         ck = " checked" if checked else ""
-        return ("<label class='tile student-tile'><input type='checkbox' name='students' value='"
-                + e(label) + "' data-num='" + str(num) + "'" + ck + ">"
-                "<span class='check' aria-hidden='true'>&#10003; Selected</span>"
-                + img + "</label>")
+        sid = "sel-%02d" % num
+        zid = "szoom-%02d" % num
+        # Two independent controls in one tile: the card face is the SELECT
+        # checkbox (tap/click/Space to keep the student); a separate corner button
+        # opens a full-size enlarge overlay without touching the selection state.
+        return (
+            "<div class='tile student-tile'>"
+            "<input type='checkbox' class='sel-cb' name='students' id='" + sid + "' value='"
+            + e(label) + "' data-num='" + str(num) + "'" + ck + ">"
+            "<label for='" + sid + "' class='sel-face'>" + img
+            + "<span class='check' aria-hidden='true'>&#10003; Selected</span></label>"
+            "<input type='checkbox' class='zoom-cb' id='" + zid + "'>"
+            "<label for='" + zid + "' class='enlarge-btn'>Enlarge card</label>"
+            "<label for='" + zid + "' class='zoom-overlay'>"
+            "<span class='zoom-close'>Close &#10005;</span>"
+            "<img src='" + src + "' alt='" + alt + ", enlarged'></label>"
+            "</div>")
     badge_html = ("<span class='pill scard-badge'>" + e(badge) + "</span>") if badge else ""
     return "<div class='scard'>" + img + badge_html + "</div>"
 
@@ -2380,7 +2446,7 @@ def course_trade_screen(game_code, team_index, team):
                 "in full above while you wait.</p>"
                 "<p class='muted'>Course selection has not opened yet. When the Game Master opens it, "
                 "you will be able to propose a one-for-one trade with another team.</p></div>")
-        return page("Your Course - " + team["name"], body + refresh)
+        return page("Your Course - " + team["name"], body + refresh, width="wide")
 
     # phase == "open": trade controls.
     teams = game["teams"]
@@ -2457,7 +2523,7 @@ def course_trade_screen(game_code, team_index, team):
 
     sections.append("<div class='card'><p class='muted'>Course selection is open. When the Game Master "
                     "closes it, the course you currently hold becomes your course for the semester.</p></div>")
-    return page("Course Selection - " + team["name"], "".join(sections) + refresh)
+    return page("Course Selection - " + team["name"], "".join(sections) + refresh, width="wide")
 
 
 @app.route("/team/course/propose", methods=["POST"])
@@ -3239,7 +3305,7 @@ def roster_decision_screen(game_code, team_index, team, error_message="",
         + grid
         + "<p><button type='submit' id='placement-submit'>Review selection</button></p></form>"
         + placement_select_script(ROSTER_COUNT) + "</div>")
-    return page("Placement Review - " + team["name"], body)
+    return page("Placement Review - " + team["name"], body, width="wide")
 
 
 def retain_confirm_screen(game_code, team_index, team, retain, release):
@@ -3260,7 +3326,7 @@ def retain_confirm_screen(game_code, team_index, team, retain, release):
         "<script>(function(){var f=document.getElementById('lockform');if(!f)return;"
         "f.addEventListener('submit',function(){var b=document.getElementById('lockbtn');"
         "if(b){b.disabled=true;b.textContent='Locking\\u2026';}});})();</script>")
-    return page("Confirm Placement - " + team["name"], body)
+    return page("Confirm Placement - " + team["name"], body, width="wide")
 
 
 @app.route("/team/retain", methods=["POST"])
@@ -3344,7 +3410,7 @@ def reassignment_screen(game_code, team_index, team):
                     "<strong>all</strong> teams have finalized.</p>"
                     "<p class='muted'>" + str(ready) + " of " + str(total)
                     + " teams finalized.</p></div>")
-        return page("Reassignment - " + team["name"], body + refresh)
+        return page("Reassignment - " + team["name"], body + refresh, width="wide")
 
     # Reassigned: show the final 15-student class with clear labels.
     retained = team["starting_roster"]
@@ -3388,7 +3454,7 @@ def reassignment_screen(game_code, team_index, team):
         "<input type='hidden' name='game_code' value='" + game_code + "'>"
         "<input type='hidden' name='team_index' value='" + str(team_index) + "'>"
         "<button type='submit'>Continue</button></form></div>")
-    return page("Final Class - " + team["name"], body)
+    return page("Final Class - " + team["name"], body, width="wide")
 
 
 @app.route("/team/placement/ack", methods=["POST"])

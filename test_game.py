@@ -918,12 +918,25 @@ def test_placement_screen_redesign():
     C.check("responsive artwork grid of the 15 dealt students",
             "cardgrid" in s and s.count("/static/art/students/student_") >= 15)
     C.check("no repeated six-stat table (stats are on the card art)", "/5)" not in s)
-    C.check("no written rationale field", "textarea" not in s and "rationale" not in s.lower())
+    C.check("no written rationale field", "<textarea" not in s and "rationale" not in s.lower())
     C.check("no required card-number / quick-entry typing", "Quick entry" not in s)
-    C.check("cards are checkboxes inside labels (tap + keyboard accessible)",
-            "<label class='tile student-tile'>" in s and "type='checkbox'" in s)
+    C.check("each card's face is a selection checkbox (tap + keyboard accessible)",
+            "class='sel-cb'" in s and "name='students'" in s and "class='sel-face'" in s)
     C.check("visible selected checkmark on each card", "&#10003; Selected" in s)
     C.check("keyboard hint present", "Space to toggle" in s)
+    # Click-to-enlarge: a SEPARATE control so enlarging never changes selection.
+    C.check("each card has an Enlarge control", s.count(">Enlarge card<") >= 15)
+    C.check("enlarge uses its own checkbox + overlay (independent of selection)",
+            "class='zoom-cb'" in s and "class='enlarge-btn'" in s and "zoom-overlay" in s)
+    C.check("enlarge overlay has an obvious close control", "zoom-close" in s)
+    # Large, readable 3-up desktop grid (not four tiny cards).
+    C.check("desktop grid is 3 columns", "grid-template-columns:repeat(3,minmax(0,1fr))" in game.BASE_CSS)
+    C.check("grid drops to 2 then 1 column on smaller widths",
+            "grid-template-columns:repeat(2,minmax(0,1fr))" in game.BASE_CSS
+            and "max-width:620px" in game.BASE_CSS)
+    C.check("images are capped so narrow screens never overflow horizontally",
+            "img{max-width:100%;height:auto;}" in game.BASE_CSS)
+    C.check("placement screen uses the wide working-width layout", "wrap wide" in s)
 
     # Validation: wrong count is rejected, nothing locked.
     r8 = text(client.post("/team/retain",
