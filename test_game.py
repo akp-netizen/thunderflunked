@@ -13,6 +13,7 @@ Run:  python test_game.py
 
 import copy
 import os
+import random
 import re
 import sys
 import tempfile
@@ -430,6 +431,16 @@ def test_full_two_team_game():
     C.check("outcome reveals the Secret Mission table A", "<th>Mission</th>" in outA)
     C.check("outcome shows each player's mission text A",
             game.player_mission(teamA, 0)["text"] in outA)
+    # Batch 6 final reveal: displayed overall matches the engine; weakest-link rule
+    # explained; "what moved the needle" present; sabotage only after the reveal.
+    C.check("displayed overall matches the scoring engine A",
+            ("Final Overall Course Score: " + str(teamA["overall"])) in outA)
+    C.check("final reveal explains the weakest-link rule A", "weakest dimension" in outA)
+    C.check("final reveal names the most consequential decision A", "What moved the needle" in outA)
+    C.check("sabotage effect is shown at the reveal when used B",
+            (("hallway complication" in text(client.get("/team/status",
+             query_string={"game_code": code, "team_index": str(idxB)})).lower())
+             == bool(teamB["sabotage"]["used"])))
 
     # ---- Projector privacy ----
     proj = text(client.get("/projector"))
@@ -581,7 +592,7 @@ def test_scoring_model():
     strong = by_total[-10:]
     ws, wst, wo = game.compute_scores(weak)
     ss, sst, so = game.compute_scores(strong)
-    C.check("all starting scores >=40 (weak)", all(ws[n] >= 40 for n in game.RESOURCE_NAMES))
+    C.check("all starting scores >= floor (weak)", all(ws[n] >= game.RESOURCE_FLOOR for n in game.RESOURCE_NAMES))
     C.check("all starting scores <=100", all(ss[n] <= 100 for n in game.RESOURCE_NAMES))
     C.check("strong roster scores higher overall than weak", so >= wo)
     C.check("overall within 0-100", 0 <= wo <= 100 and 0 <= so <= 100)
@@ -598,6 +609,173 @@ def test_scoring_model():
     # Totals in range 16-21.
     C.check("all student totals 16-21",
             all(16 <= sum(game.STUDENT_STATS[s].values()) <= 21 for s in game.STUDENTS))
+
+
+# Shared helpers for the Batch 6 balance tests: drive scoring through the REAL
+# production engine (compute_scores + delta tables + modality_modifier +
+# apply_deltas soft cap + course_survives), mirroring the approved simulation.
+_B6_COURSE = {"campus": "Advanced Competitive Napping", "cte": "Bigfoot Field Research",
+              "online": "Internet Rabbit Hole Research"}
+
+def _b6_rosters():
+    ranked = sorted(game.STUDENTS, key=lambda s: sum(game.STUDENT_STATS[s].values()))
+    return {"strong": ranked[-15:], "average": ranked[7:22], "weak": ranked[:15]}
+
+def _b6_team(roster, modality):
+    sc, st, ov = game.compute_scores(roster)
+    return {"resources": dict(sc), "statuses": dict(st), "overall": ov, "course": _B6_COURSE[modality]}
+
+def _b6_cp(team, idx, keys):
+    total = game.D()
+    for a in game.CP_ACTIONS[idx]:
+        if a["key"] in keys:
+            for k, v in a["deltas"].items():
+                total[k] += v
+            mod = game.modality_modifier(team, idx, a["key"])
+            if mod:
+                for k, v in mod.items():
+                    total[k] += v
+    game.apply_deltas(team, total)
+
+def _b6_cp4(team, pr, su):
+    pd = next(o["deltas"] for o in game.CP4_PRIORITY if o["key"] == pr)
+    sd = next(o["deltas"] for o in game.CP4_PRIORITY if o["key"] == su)
+    total = game.D()
+    for k, v in pd.items():
+        total[k] += v
+    for k, v in sd.items():
+        total[k] += round(v / 2)
+    game.apply_deltas(team, total)
+
+def _b6_cp5(team, pt, rp, na):
+    total = game.D()
+    for tbl, key in ((game.CP5_PROTECT, pt), (game.CP5_REPAIR, rp), (game.CP5_NOT_ADD, na)):
+        for k, v in next(o["deltas"] for o in tbl if o["key"] == key).items():
+            total[k] += v
+    game.apply_deltas(team, total)
+
+def _b6_run(roster, strat, modality, sabotage=False):
+    t = _b6_team(roster, modality)
+    _b6_cp(t, 0, strat[0]); _b6_cp(t, 1, strat[1]); _b6_cp(t, 2, strat[2])
+    if sabotage:
+        game.apply_deltas(t, game.SABOTAGE_OPTIONS[2][0]["deltas"])
+    _b6_cp4(t, *strat[3]); _b6_cp5(t, *strat[4])
+    return {"final": t["overall"], "min": min(t["resources"][n] for n in game.RESOURCE_NAMES),
+            "survived": game.course_survives(t), "res": dict(t["resources"])}
+
+_B6_ARCH = {
+    "balanced": {0: ["clarify", "fix_schedule", "tutoring"], 1: ["pathway", "advisor"],
+                 2: ["reteach", "redesign_assessment"], 3: ("scalable", "tool"),
+                 4: ("sustainable", "visibility", "new_policy")},
+    "passive": {0: ["monitor"], 1: ["monitor"], 2: ["monitor"],
+                3: ("defer", "feedback"), 4: ("sustainable", "alignment", "new_module")},
+    "overextended": {0: ["clarify", "contact", "message"], 1: ["orientation", "catchup"],
+                     2: ["reteach", "aligned_practice", "revision"], 3: ("scalable", "urgent"),
+                     4: ("grading", "gradebook", "new_module")},
+    "reckless": {0: ["contact", "extend", "message"], 1: ["orientation", "catchup"],
+                 2: ["revision", "outreach_low", "reteach"], 3: ("individual_all", "urgent"),
+                 4: ("persistence", "visibility", "extra_credit")},
+}
+
+
+def test_scoring_balance_batch6():
+    """Batch 6: the approved scoring balance. Validates the 12 acceptance criteria
+    and the new mechanics (soft cap, roster term, modality tradeoffs, sabotage
+    magnitude, state-dependent CP5) against the REAL production engine."""
+    print("\n=== Scoring balance (Batch 6 acceptance) ===")
+    R = _b6_rosters()
+    A = R["average"]
+    bal = _b6_run(A, _B6_ARCH["balanced"], "campus")
+    over = _b6_run(A, _B6_ARCH["overextended"], "campus")
+    pas = _b6_run(A, _B6_ARCH["passive"], "campus")
+    rec = _b6_run(A, _B6_ARCH["reckless"], "campus")
+
+    # AC1 / AC4: balanced outperforms both passivity and overextension (clearly).
+    C.check("AC1 balanced > passivity and > overextension",
+            bal["final"] > pas["final"] and bal["final"] > over["final"])
+    C.check("AC4 balanced beats passivity by >= 12", bal["final"] - pas["final"] >= 12)
+    # AC2: balanced survives every roster, with and without sabotage.
+    C.check("AC2 balanced survives all rosters +/- sabotage",
+            all(_b6_run(R[r], _B6_ARCH["balanced"], "campus", s)["survived"]
+                for r in ("strong", "average", "weak") for s in (False, True)))
+    # AC3: passivity and reckless overextension do NOT win (fail or bottom-tier).
+    C.check("AC3 passivity does not survive (ignoring students is not viable)", not pas["survived"])
+    C.check("AC3 reckless overextension fails", not rec["survived"])
+    # AC5: roster start is monotonic and modest (gap 4..10).
+    gs = game.compute_scores(R["strong"])[2]; ga = game.compute_scores(A)[2]; gw = game.compute_scores(R["weak"])[2]
+    C.check("AC5 roster start monotonic strong>=avg>=weak", gs >= ga >= gw)
+    C.check("AC5 roster start gap modest (4..10)", 4 <= gs - gw <= 10)
+    C.check("AC5b weak roster survivable with good play", _b6_run(R["weak"], _B6_ARCH["balanced"], "campus")["survived"])
+    # AC7: sabotage is consequential (swing >= 3) but no unavoidable loss for sound play.
+    swing = over["final"] - _b6_run(A, _B6_ARCH["overextended"], "campus", sabotage=True)["final"]
+    C.check("AC7 sabotage swing >= 3", swing >= 3)
+    C.check("AC7b sabotage is no unavoidable loss (balanced survives +sab)",
+            _b6_run(A, _B6_ARCH["balanced"], "campus", sabotage=True)["survived"])
+
+    # AC6 + AC9 + AC10: sincere-strategy distribution (reduced sample for speed).
+    rng = random.Random(1234)
+    sincere0 = ["zeros", "message", "contact", "clarify", "fix_schedule", "tutoring", "extend"]
+    sincere1 = ["start_here", "pathway", "catchup", "orientation", "advisor"]
+    sincere2 = ["reteach", "aligned_practice", "revision", "outreach_low", "change_future", "redesign_assessment"]
+    p4 = [o["key"] for o in game.CP4_PRIORITY]
+    prot = [o["key"] for o in game.CP5_PROTECT]; rep = [o["key"] for o in game.CP5_REPAIR]
+    nad = [o["key"] for o in game.CP5_NOT_ADD]
+    def sample():
+        pr, su = rng.sample(p4, 2)
+        return {0: rng.sample(sincere0, rng.randint(1, 3)), 1: rng.sample(sincere1, rng.randint(1, 2)),
+                2: rng.sample(sincere2, rng.randint(1, 3)), 3: (pr, su),
+                4: (rng.choice(prot), rng.choice(rep), rng.choice(nad))}
+    def dist(modality, n=4000):
+        fin, surv = [], 0
+        for _ in range(n):
+            r = _b6_run(A, sample(), modality)
+            fin.append(r["final"]); surv += 1 if r["survived"] else 0
+        fin.sort()
+        return {"p10": fin[int(.10 * (n - 1))], "p90": fin[int(.90 * (n - 1))],
+                "median": fin[n // 2], "survival": 100.0 * surv / n}
+    dcampus = dist("campus"); dcte = dist("cte"); donline = dist("online")
+    C.check("AC9 sincere survival healthy (85-95%)", 85 <= dcampus["survival"] <= 95)
+    C.check("AC10 meaningful separation (p90-p10 >= 14)", dcampus["p90"] - dcampus["p10"] >= 14)
+    meds = [dcampus["median"], dcte["median"], donline["median"]]
+    C.check("AC6 no modality is easier (medians within 3)", max(meds) - min(meds) <= 3)
+
+    # AC8: CP5 'do not add' is a real, state-dependent choice (not one dominant buff).
+    def best_na(base):
+        best, bv = None, -1
+        for k in nad:
+            t = {"resources": dict(base)}; game.recompute(t)
+            game.apply_deltas(t, next(o["deltas"] for o in game.CP5_NOT_ADD if o["key"] == k))
+            if t["overall"] > bv:
+                bv, best = t["overall"], k
+        return best
+    RN = game.RESOURCE_NAMES
+    picks = {best_na({RN[0]: 70, RN[1]: 70, RN[2]: 30, RN[3]: 45}),
+             best_na({RN[0]: 70, RN[1]: 40, RN[2]: 65, RN[3]: 65}),
+             best_na({RN[0]: 70, RN[1]: 70, RN[2]: 60, RN[3]: 30})}
+    C.check("AC8 CP5 not-add choice is state-dependent", len(picks) >= 2)
+
+    # Mechanics: soft cap never exceeds 100 and diminishes above the knee.
+    near = {n: 95 for n in RN}
+    t = {"resources": dict(near)}; game.recompute(t)
+    game.apply_deltas(t, game.D(cq=20))
+    C.check("soft cap keeps resources <= 100", t["resources"]["Course Quality"] <= 100)
+    C.check("soft cap gives partial (diminished) credit near 100",
+            95 < t["resources"]["Course Quality"] < 100)
+    # Losses still apply at full value.
+    t2 = {"resources": {n: 60 for n in RN}}; game.recompute(t2)
+    game.apply_deltas(t2, game.D(fc=-10))
+    C.check("losses apply at full value", t2["resources"]["Faculty Capacity"] == 50)
+    # Modality tradeoff registers: aligned_practice is cheaper on Faculty Capacity in CTE.
+    tc = _b6_team(A, "cte"); game.apply_deltas(tc, game.D())  # noop to normalize
+    fc_cte_mod = game.modality_modifier(tc, 2, "aligned_practice")
+    C.check("CTE rewards in-person practice (FC relief on aligned_practice)",
+            fc_cte_mod is not None and fc_cte_mod["Faculty Capacity"] > 0)
+    to = _b6_team(A, "online")
+    C.check("online penalizes synchronous outreach (contact FC cost)",
+            game.modality_modifier(to, 0, "contact")["Faculty Capacity"] < 0)
+    # Sabotage magnitude is the approved 6, single-resource.
+    C.check("sabotage magnitude is 6",
+            max(abs(v) for opts in game.SABOTAGE_OPTIONS.values() for o in opts for v in o["deltas"].values()) == 6)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,14 +1299,15 @@ def test_qa_corrections():
     C.check("CP5 is not a generic restore (sustainable also costs/varies other resources)",
             any(v != 0 for k, v in game.CP5_PROTECT[0]["deltas"].items() if k != "Faculty Capacity"))
 
-    # --- Sabotage near threshold: the largest single sabotage FC hit is small (3) and
-    #     cannot, by itself, drop a sound-play Faculty Capacity below the survival floor.
-    max_sab_fc = max(abs(o["deltas"].get("Faculty Capacity", 0))
-                     for opts in game.SABOTAGE_OPTIONS.values() for o in opts)
-    C.check("max single sabotage FC hit is small (<=3)", max_sab_fc <= 3)
-    sound_fc_at_cp3 = 33  # plausible sound-play Faculty Capacity entering the CP3 sabotage
-    C.check("one sabotage alone does not cross the floor from sound play",
-            sound_fc_at_cp3 - max_sab_fc >= game.SURVIVE_FLOOR)
+    # --- Sabotage (Batch 6): one-time, single-resource hit, now magnitude 6 so it
+    #     is consequential enough to create tension and justify a hallway rumor, yet
+    #     cannot by itself sink a team that kept a sound margin above the floor.
+    max_sab = max(abs(v) for opts in game.SABOTAGE_OPTIONS.values()
+                  for o in opts for v in o["deltas"].values())
+    C.check("single sabotage is consequential but bounded (5-6)", 5 <= max_sab <= 6)
+    sound_fc_at_cp3 = 40  # sound, balanced play keeps capacity well above the survival floor
+    C.check("one sabotage alone does not sink a sound-margin team",
+            sound_fc_at_cp3 - max_sab >= game.SURVIVE_FLOOR)
 
     # --- CP5 can still change the final outcome, and a sound team can survive.
     # Team sitting just below the floor on FC entering CP5 (otherwise healthy).
@@ -2841,6 +3020,7 @@ def main():
     test_data_integrity()
     test_qa_corrections()
     test_scoring_model()
+    test_scoring_balance_batch6()
     test_full_two_team_game()
     test_single_team_mode()
     test_reentry()

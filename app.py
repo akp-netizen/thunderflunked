@@ -20,6 +20,7 @@ decisions, private checks, allegiance, sabotage, accusation).
 """
 
 import json
+import math
 import os
 import random
 import threading
@@ -468,7 +469,35 @@ RESOURCE_WEIGHTS = {
                        "motivation": 1.0, "adaptability": 0.5},
 }
 
-RESOURCE_FLOOR = 40  # starting resources may never begin below this
+RESOURCE_FLOOR = 36  # starting resources may never begin below this
+# A stronger draft should start at or above a weaker one, by a MODEST, predictable
+# amount. A uniform term tied to the roster's grand-mean student quality guarantees
+# that monotonicity; it is capped so students' circumstances nudge, never determine,
+# the outcome (decisions swing far more).
+ROSTER_SLOPE = 60      # points per 1.0 of grand-mean stat (1..5) above 3.0
+ROSTER_CAP = 6         # the uniform roster term is bounded to +/- this
+
+# Soft cap (diminishing returns) for POSITIVE resource gains: full value in the
+# normal operating band (<= the knee), then a smooth, bounded approach to 100 so
+# strong course-design / student-success work keeps earning partial credit instead
+# of being wasted against a hard ceiling. Losses always apply at full value, so
+# overextension still hurts.
+SOFT_KNEE = 75.0
+
+
+def _soft_add(v, d):
+    """Apply one signed delta to a resource (0..100). Losses full value; gains
+    diminish above the knee and never exceed 100."""
+    if d <= 0:
+        return max(0.0, v + d)
+    cur, g = float(v), float(d)
+    if cur < SOFT_KNEE:
+        step = min(SOFT_KNEE - cur, g)
+        cur += step
+        g -= step
+    if g > 0:
+        cur = 100.0 - (100.0 - cur) * math.exp(-g / (100.0 - SOFT_KNEE))
+    return cur
 
 
 def resource_status(value):
@@ -494,14 +523,20 @@ def _resource_from_roster(roster, weights):
         per.append(val)
     m = sum(per) / len(per)
     base = 25 + (m - 1) / 4 * 70            # m=1->25, m=3->60, m=5->95
-    if base > 65:                           # diminishing returns on the high side
-        base = 65 + (base - 65) * 0.6
+    if base > 68:                           # diminishing returns on the high side
+        base = 68 + (base - 68) * 0.6
     lows = sum(1 for v in per if v <= 2.25)  # clustered weakness
     penalty = (lows - 1) * 6 if lows >= 2 else 0
     highs = sum(1 for v in per if v >= 4.2)  # complementary strengths (capped)
     bonus = min(highs, 3) * 2
-    score = base - penalty + bonus
-    return max(RESOURCE_FLOOR, min(100, round(score)))
+    return base - penalty + bonus            # raw float; roster term + floor/round applied in compute_scores
+
+
+def _roster_term(roster):
+    """Uniform, capped, MONOTONIC roster-quality term added to every starting
+    resource so a stronger draft starts >= a weaker one by a modest amount."""
+    gmean = sum(sum(STUDENT_STATS[s].values()) / len(STAT_KEYS) for s in roster) / len(roster)  # 1..5
+    return max(-ROSTER_CAP, min(ROSTER_CAP, (gmean - 3.0) * ROSTER_SLOPE))
 
 
 def _geomean(scores):
@@ -512,8 +547,11 @@ def _geomean(scores):
 
 
 def compute_scores(roster):
-    """Return (scores, statuses, overall) for a 10-student roster."""
-    scores = {name: _resource_from_roster(roster, RESOURCE_WEIGHTS[name])
+    """Return (scores, statuses, overall) for a roster. Each resource reads the
+    roster as a classroom system, plus a modest uniform roster-quality term, then
+    is floored and clamped to 0-100."""
+    term = _roster_term(roster)
+    scores = {name: max(RESOURCE_FLOOR, min(100, round(_resource_from_roster(roster, RESOURCE_WEIGHTS[name]) + term)))
               for name in RESOURCE_NAMES}
     statuses = {name: resource_status(scores[name]) for name in RESOURCE_NAMES}
     overall = _geomean(scores)
@@ -528,10 +566,11 @@ def recompute(team):
 
 
 def apply_deltas(team, deltas):
-    """Apply a {resource: delta} dict to current resources, clamp 0-100."""
+    """Apply a {resource: delta} dict to current resources. Gains use the soft cap
+    (diminishing returns near 100); losses apply at full value. Clamped 0-100."""
     res = team["resources"]
     for name, delta in deltas.items():
-        res[name] = max(0, min(100, res[name] + delta))
+        res[name] = int(round(_soft_add(res[name], delta)))
     recompute(team)
 
 
@@ -4612,74 +4651,74 @@ CP_ACTIONS = {
     0: [  # First Week - LOOK BEFORE REACTING
         {"key": "zeros", "label": "Enter zeros for missing work so the gradebook is accurate",
          "meta": "Effort: Low | Reach: Whole class | Consideration: Students see the real picture; early grades look worse",
-         "deltas": D(ss=-3, cq=10, fc=-2)},
+         "deltas": D(ss=-2, cq=8, fc=-1)},
         {"key": "message", "label": "Message the students who haven't submitted (Canvas 'Message Students Who')",
          "meta": "Effort: Low | Reach: Targeted | Consideration: Fast, but relies on student follow-through",
-         "deltas": D(ss=9, fc=-3)},
+         "deltas": D(ss=8, fc=-2)},
         {"key": "contact", "label": "Call or email each at-risk student individually",
          "meta": "Effort: High | Reach: Individual | Consideration: Personal and effective, but heavy on your time",
-         "deltas": D(ss=12, fc=-10, tr=-5)},
+         "deltas": D(ss=12, fc=-9, tr=-3)},
         {"key": "clarify", "label": "Post a clarification, an example, and the rubric for the whole class",
          "meta": "Effort: Moderate | Reach: Whole class | Consideration: Heads off repeat confusion for everyone",
-         "deltas": D(ss=9, cq=12, fc=-4)},
+         "deltas": D(ss=8, cq=11, fc=-3)},
         {"key": "fix_schedule", "label": "Reconcile the syllabus and Canvas due dates",
          "meta": "Effort: Low | Reach: Whole class | Consideration: Fixes a course inconsistency, not a student mistake",
-         "deltas": D(ss=5, cq=13, fc=-2)},
+         "deltas": D(ss=4, cq=12, fc=-1)},
         {"key": "extend", "label": "Extend the first assignment deadline for everyone",
          "meta": "Effort: Low | Reach: Whole class | Consideration: Helps now, but compresses your grading window",
-         "deltas": D(ss=6, cq=-5, tr=-7)},
+         "deltas": D(ss=8, cq=-3, tr=-5)},
         {"key": "tutoring", "label": "Connect students with academic support (Learning Center or Brainfuse)",
          "meta": "Faculty effort: Low | Reach: Whole class | Consideration: Scalable, but students must choose to use it",
-         "deltas": D(ss=7, cq=3)},
+         "deltas": D(ss=6, cq=2, fc=1, tr=1)},
         {"key": "monitor", "label": "Monitor / take no action yet",
          "meta": "Effort: None | Reach: None | Consideration: Conditions may resolve, hold, or worsen",
-         "deltas": D(ss=-9, cq=-5)},
+         "deltas": D(ss=-10, cq=-6)},
     ],
     1: [  # Early Semester - BUILD SYSTEMS THAT ABSORB CHANGE
         {"key": "start_here", "label": "Send the late-add students a targeted Start Here message",
          "meta": "Effort: Low | Scope: Targeted | Consideration: Fast and specific to the new students",
-         "deltas": D(ss=9, fc=-3)},
+         "deltas": D(ss=8, cq=1, fc=-2)},
         {"key": "pathway", "label": "Build a reusable late-start module in Canvas",
          "meta": "Effort: High now | Scope: Scalable | Consideration: A system that serves every future late add",
-         "deltas": D(cq=14, tr=8, fc=-8)},
+         "deltas": D(ss=2, cq=12, fc=-6, tr=9)},
         {"key": "catchup", "label": "Open a short catch-up window for foundational work",
          "meta": "Effort: Low | Scope: Flexible | Consideration: Flexibility now, grading/workload later",
-         "deltas": D(ss=9, cq=-3, tr=-7)},
+         "deltas": D(ss=9, cq=-2, tr=-5)},
         {"key": "orientation", "label": "Hold an orientation / office-hours check-in for the new students",
          "meta": "Effort: High | Scope: Whole group | Consideration: Strong clarification; costs your bandwidth",
-         "deltas": D(ss=12, cq=4, fc=-9)},
+         "deltas": D(ss=11, cq=4, fc=-9)},
         {"key": "advisor", "label": "Loop in advising and academic support (Learning Center / Brainfuse) for the new students",
          "meta": "Effort: Low | Scope: Scalable | Consideration: Routes needs to the right support, off your plate",
-         "deltas": D(ss=8, tr=4, fc=-2)},
+         "deltas": D(ss=8, fc=1, tr=5)},
         {"key": "monitor", "label": "Monitor (no onboarding action yet)",
          "meta": "Effort: None | Scope: None | Consideration: New students may drift without an entry point",
-         "deltas": D(ss=-11, cq=-3)},
+         "deltas": D(ss=-12, cq=-5)},
     ],
     2: [  # First Major Assessment - INVESTIGATE BEFORE DECIDING
         {"key": "reteach", "label": "Reteach the weak skill to the whole class",
          "meta": "Faculty effort: Moderate | Reach: Whole class | Consideration: Addresses the shared gap directly",
-         "deltas": D(ss=11, cq=9, fc=-5)},
+         "deltas": D(ss=10, cq=9, fc=-3)},
         {"key": "aligned_practice", "label": "Add aligned practice that matches the rubric's demand",
          "meta": "Faculty effort: High | Reach: Whole class | Consideration: Fixes the practice-to-assessment mismatch",
-         "deltas": D(ss=9, cq=14, fc=-5, tr=-4)},
+         "deltas": D(ss=9, cq=13, fc=-4, tr=-2)},
         {"key": "revision", "label": "Allow a structured revision/resubmission after feedback",
          "meta": "Faculty effort: High | Reach: Whole class | Consideration: Strong learning, heavy grading load",
-         "deltas": D(ss=13, cq=5, fc=-9, tr=-6)},
+         "deltas": D(ss=12, cq=5, fc=-8, tr=-5)},
         {"key": "outreach_low", "label": "Outreach to low-engagement students + refer to tutoring",
          "meta": "Faculty effort: Moderate | Reach: Targeted | Consideration: Addresses engagement, not the class-wide gap",
-         "deltas": D(ss=9, fc=-4)},
+         "deltas": D(ss=9, fc=-3)},
         {"key": "change_future", "label": "Revise how you teach this skill next term",
          "meta": "Faculty effort: Low | Reach: Future | Consideration: Helps later cohorts, not this one now",
-         "deltas": D(cq=8)},
+         "deltas": D(cq=8, tr=1)},
         {"key": "redesign_assessment", "label": "Realign the rubric/assessment for future terms",
          "meta": "Faculty effort: Low | Reach: Future | Consideration: Improves alignment going forward",
-         "deltas": D(cq=10, fc=-3)},
+         "deltas": D(cq=10, fc=-2)},
         {"key": "continue", "label": "Continue without change",
          "meta": "Faculty effort: None | Reach: None | Consideration: Leaves the mismatch in place",
-         "deltas": D(ss=-12, cq=-10)},
+         "deltas": D(ss=-13, cq=-12)},
         {"key": "monitor", "label": "Monitor and reassess",
          "meta": "Faculty effort: None | Reach: None | Consideration: The gap persists for now",
-         "deltas": D(ss=-7, cq=-7)},
+         "deltas": D(ss=-9, cq=-9)},
     ],
 }
 
@@ -4701,6 +4740,38 @@ ACTION_NEEDS = {
     (2, "revision"): "course_design", (2, "outreach_low"): "support",
     (2, "change_future"): "course_design", (2, "redesign_assessment"): "course_design",
 }
+
+
+# Modality-specific tradeoffs (Batch 6). Small, cost-side modifiers added on top of
+# a chosen CP1-CP3 action's base delta so each modality rewards its AUTHENTIC strong
+# practice and taxes a poor-fit move -- without making any modality globally easier
+# (sincere-strategy medians stay equal across modalities). modality_class() never
+# returns "hybrid" today (no hybrid course card exists); that entry is preserved for
+# future use and is dormant until a hybrid course is added (a separate decision).
+MODALITY_MODIFIERS = {
+    "cte": {     # hands-on lab/shop: in-person practice efficient; off-site support a weak substitute
+        (2, "aligned_practice"): D(fc=3), (2, "reteach"): D(fc=2),
+        (0, "tutoring"): D(ss=-3), (1, "advisor"): D(ss=-3),
+    },
+    "online": {  # asynchronous: scalable Canvas-native comms efficient; synchronous outreach costly
+        (1, "pathway"): D(fc=3), (0, "message"): D(ss=2), (1, "start_here"): D(ss=2),
+        (1, "orientation"): D(fc=-3), (0, "contact"): D(fc=-3),
+    },
+    "campus": {  # face-to-face: in-person clarification efficient; building async modules less native
+        (0, "clarify"): D(fc=3), (2, "reteach"): D(fc=2),
+        (1, "pathway"): D(fc=-2, cq=-1),
+    },
+    "hybrid": {  # blend (dormant until a hybrid course card is added)
+        (0, "clarify"): D(fc=2), (1, "pathway"): D(fc=1),
+        (0, "message"): D(ss=1), (1, "orientation"): D(fc=-2),
+    },
+}
+
+
+def modality_modifier(team, cp_index, key):
+    """The modality cost-side modifier for a chosen CP1-CP3 action, or None."""
+    mc = modality_class(COURSE_BY_NAME.get(team.get("course"), {}).get("modality"))
+    return MODALITY_MODIFIERS.get(mc, {}).get((cp_index, key))
 
 
 def support_referral_outcome(team):
@@ -4728,17 +4799,17 @@ CP1_REASSESS_OPTIONS = [
 # CP4 (Midterm) - PRIORITIZE AND SCALE. One priority + one supporting.
 CP4_PRIORITY = [
     {"key": "urgent", "label": "Dropout Detective alert + advisor note for the highest-risk student",
-     "deltas": D(ss=11, fc=-5)},
+     "deltas": D(ss=11, fc=-4)},
     {"key": "scalable", "label": "Scalable whole-class fix for the shared misconception",
-     "deltas": D(ss=10, cq=13, fc=-5)},
+     "deltas": D(ss=9, cq=12, fc=-4, tr=1)},
     {"key": "feedback", "label": "Show students where feedback lives (SpeedGrader comments)",
-     "deltas": D(ss=6, cq=9, fc=-2)},
+     "deltas": D(ss=6, cq=10, fc=-2)},
     {"key": "tool", "label": "Use a Canvas tool/workflow to flag and route at-risk students",
-     "deltas": D(ss=8, fc=-2, tr=4)},
+     "deltas": D(ss=7, fc=-1, tr=5)},
     {"key": "individual_all", "label": "Individually email every student in the class",
-     "deltas": D(ss=7, fc=-16, tr=-10)},
+     "deltas": D(ss=8, fc=-15, tr=-8)},
     {"key": "defer", "label": "Intentionally defer a lower-priority issue this round",
-     "deltas": D(ss=-3, tr=6)},
+     "deltas": D(ss=-3, fc=1, tr=5)},
 ]
 # Supporting response: same menu, roughly half the effect.
 CP4_SUPPORT = CP4_PRIORITY
@@ -4750,9 +4821,9 @@ CP4_SUPPORT = CP4_PRIORITY
 # it competes with the other protect choices and reflects a real teaching behavior.
 CP5_PROTECT = [
     {"key": "sustainable", "label": "Protect a sustainable routine you already built (reuse feedback and systems instead of rebuilding)",
-     "deltas": D(cq=5, fc=10, tr=4)},
+     "deltas": D(cq=4, fc=8, tr=3)},
     {"key": "grading", "label": "Timely grading/feedback on remaining required work",
-     "deltas": D(ss=8, cq=9, fc=-5)},
+     "deltas": D(ss=8, cq=9, fc=-4)},
     {"key": "persistence", "label": "The student sitting just below the passing threshold",
      "deltas": D(ss=12, fc=-4)},
     {"key": "communication", "label": "Clear final communication: what's left, and when",
@@ -4760,21 +4831,24 @@ CP5_PROTECT = [
 ]
 CP5_REPAIR = [
     {"key": "gradebook", "label": "Gradebook accuracy: zeros entered and last date of attendance recorded",
-     "deltas": D(ss=-3, cq=12)},
+     "deltas": D(ss=-2, cq=11)},
     {"key": "visibility", "label": "Feedback visibility so students can actually find your comments",
      "deltas": D(ss=7, cq=8)},
     {"key": "alignment", "label": "Final alignment of remaining assessments",
      "deltas": D(cq=11)},
 ]
-# Declining unnecessary end-of-term work protects the instructor: it recovers
-# Faculty Capacity for the finish (a realistic sustainable practice).
+# Declining unnecessary end-of-term work protects the instructor, but each decline
+# forgoes something different, so the choice is a real tradeoff (not one free buff):
+# decline extra credit (most capacity, students lose a safety net), decline a new
+# module (strong capacity, course misses an enhancement), or decline a disruptive
+# late policy (stability -> Course Quality, less raw capacity).
 CP5_NOT_ADD = [
     {"key": "extra_credit", "label": "A brand-new extra-credit assignment for the whole class",
-     "deltas": D(tr=8, fc=9)},
+     "deltas": D(ss=-4, fc=8, tr=6)},
     {"key": "new_module", "label": "A new end-of-term module or content unit",
-     "deltas": D(tr=10, fc=10)},
+     "deltas": D(cq=-4, fc=7, tr=7)},
     {"key": "new_policy", "label": "A new late/grading policy this late in the term",
-     "deltas": D(cq=3, tr=6, fc=8)},
+     "deltas": D(ss=1, cq=7, fc=3, tr=2)},
 ]
 
 
@@ -5349,7 +5423,13 @@ def team_cp_submit():
     rec["actions"] = ordered
     if index == 0:
         rec["reassess"] = reassess if CP_MONITOR[index] in ordered else None
-    deltas = [a["deltas"] for a in actions if a["key"] in ordered]
+    deltas = []
+    for a in actions:
+        if a["key"] in ordered:
+            deltas.append(a["deltas"])
+            mod = modality_modifier(team, index, a["key"])  # small modality tradeoff, if any
+            if mod:
+                deltas.append(mod)
     summary = [action_label(index, k) for k in ordered]
     apply_checkpoint(team, index, deltas, summary)
     return checkpoint_screen(game_code, ti, team)
@@ -6172,14 +6252,14 @@ def team_private_vote():
 # ===========================================================================
 SABOTAGE_OPTIONS = {
     2: [  # CP3 (full private round)
-        {"key": "revision_drag", "label": "Revision grading drags on longer than expected", "deltas": D(fc=-3)},
-        {"key": "reteach_delay", "label": "The reteach is delayed about a week", "deltas": D(ss=-3)},
-        {"key": "practice_clunky", "label": "The new practice rolls out clunky and eats time", "deltas": D(tr=-3)},
+        {"key": "revision_drag", "label": "Revision grading drags on longer than expected", "deltas": D(fc=-6)},
+        {"key": "reteach_delay", "label": "The reteach is delayed about a week", "deltas": D(ss=-6)},
+        {"key": "practice_clunky", "label": "The new practice rolls out clunky and eats time", "deltas": D(tr=-6)},
     ],
     3: [  # CP4 (brief round)
-        {"key": "outreach_delay", "label": "The priority outreach is delayed", "deltas": D(ss=-3)},
-        {"key": "feedback_misroute", "label": "Feedback routing is misconfigured", "deltas": D(cq=-3)},
-        {"key": "manual_tracking", "label": "Extra manual tracking is introduced", "deltas": D(fc=-3)},
+        {"key": "outreach_delay", "label": "The priority outreach is delayed", "deltas": D(ss=-6)},
+        {"key": "feedback_misroute", "label": "Feedback routing is misconfigured", "deltas": D(cq=-6)},
+        {"key": "manual_tracking", "label": "Extra manual tracking is introduced", "deltas": D(fc=-6)},
     ],
 }
 
@@ -7021,6 +7101,80 @@ def semester_recap(team):
     return "<ul>" + "".join(bits) + "</ul>" if bits else "<p>(no decisions recorded)</p>"
 
 
+def _decision_contributions(team):
+    """Reconstruct (label, net) for every applied checkpoint decision, where net is
+    the sum of its resource deltas (including the CP1-CP3 modality modifier and the
+    CP4 half-weight on the supporting choice). Used to name the most consequential
+    positive and negative decisions at the reveal. Not shown before the final."""
+    out = []
+    cp = team.get("cp", {})
+    for idx in (0, 1, 2):
+        rec = cp.get(idx)
+        if not rec or not rec.get("actions"):
+            continue
+        for a in CP_ACTIONS[idx]:
+            if a["key"] in rec["actions"]:
+                d = dict(a["deltas"])
+                mod = modality_modifier(team, idx, a["key"])
+                if mod:
+                    for k, v in mod.items():
+                        d[k] += v
+                out.append((action_label(idx, a["key"]), sum(d.values())))
+    rec = cp.get(3)
+    if rec and rec.get("priority"):
+        pd = next(o["deltas"] for o in CP4_PRIORITY if o["key"] == rec["priority"])
+        out.append(("Priority: " + cp4_label(rec["priority"]), sum(pd.values())))
+        if rec.get("supporting"):
+            sd = next(o["deltas"] for o in CP4_PRIORITY if o["key"] == rec["supporting"])
+            out.append(("Supporting: " + cp4_label(rec["supporting"]), sum(round(v / 2) for v in sd.values())))
+    rec = cp.get(4)
+    if rec and rec.get("protect"):
+        for tbl, key, pre in ((CP5_PROTECT, rec.get("protect"), "Protect: "),
+                              (CP5_REPAIR, rec.get("repair"), "Repair: "),
+                              (CP5_NOT_ADD, rec.get("not_add"), "Did not add: ")):
+            if key is None:
+                continue
+            d = next((o["deltas"] for o in tbl if o["key"] == key), None)
+            lbl = next((o["label"] for o in tbl if o["key"] == key), key)
+            if d is not None:
+                out.append((pre + lbl, sum(d.values())))
+    return out
+
+
+def weakest_link_html(team, survived):
+    """Explain the weakest-link survival rule in plain language, using this team's
+    actual numbers. Shown only at the final reveal."""
+    weak = min(RESOURCE_NAMES, key=lambda n: team["resources"][n])
+    wv = team["resources"][weak]
+    ov = team["overall"]
+    if survived:
+        return ("<p class='muted'>Survival needs the overall score at " + str(SURVIVE_OVERALL)
+                + "+ <em>and</em> every dimension at " + str(SURVIVE_FLOOR) + "+. Your weakest dimension, "
+                "<strong>" + e(weak) + "</strong> (" + str(wv) + "), held the line.</p>")
+    reasons = []
+    if ov < SURVIVE_OVERALL:
+        reasons.append("the overall score was <strong>" + str(ov) + "</strong> (needs " + str(SURVIVE_OVERALL) + ")")
+    if wv < SURVIVE_FLOOR:
+        reasons.append("<strong>" + e(weak) + "</strong> fell to <strong>" + str(wv)
+                       + "</strong> (Critical &mdash; the weakest dimension decides)")
+    return ("<p class='err'>Why: " + "; ".join(reasons) + ". One collapsed dimension sinks the course "
+            "even when the others look healthy &mdash; balance is the point.</p>")
+
+
+def moved_the_needle_html(team):
+    contribs = _decision_contributions(team)
+    if not contribs:
+        return ""
+    gain = max(contribs, key=lambda x: x[1])
+    cost = min(contribs, key=lambda x: x[1])
+    rows = "<p><strong>Biggest lift:</strong> " + e(gain[0]) + "</p>"
+    if cost[1] < 0 and cost[0] != gain[0]:
+        rows += "<p><strong>Biggest cost:</strong> " + e(cost[0]) + "</p>"
+    return ("<div class='card'><h3>What moved the needle</h3>" + rows
+            + "<p class='muted'>Across the four dimensions (Student Success, Course Quality, Faculty "
+            "Capacity, Time/Resources), these decisions shifted your course the most.</p></div>")
+
+
 def final_outcome_screen(game_code, team_index, team):
     survived = course_survives(team)
     team["outcome"] = "Survived" if survived else "Did Not Survive"
@@ -7033,7 +7187,8 @@ def final_outcome_screen(game_code, team_index, team):
                     "<p class='big status-" + ("Normal" if survived else "Critical") + "'>"
                     + ("SURVIVED THE SEMESTER" if survived else "DID NOT SURVIVE THE SEMESTER") + "</p>"
                     "<p><strong>" + e(team["course"]) + "</strong></p>"
-                    "<p><strong>Final Overall Course Score: " + str(team["overall"]) + "</strong></p></div>"
+                    "<p><strong>Final Overall Course Score: " + str(team["overall"]) + "</strong></p>"
+                    + weakest_link_html(team, survived) + "</div>"
                     + resource_meters(team["resources"], team["statuses"]))
 
     # Endgame Secret Mission reveal: now that the game is decided (and allegiance
@@ -7060,6 +7215,17 @@ def final_outcome_screen(game_code, team_index, team):
                    "<p><strong>Secret Missions completed at this table:</strong> " + str(missions)
                    + " (secondary recognition).</p>" + mission_table + "</div>")
 
+    # Sabotage effect: surfaced only here (after the accusation/reveal), never
+    # before. Describes the observable complication and its size; it was applied
+    # exactly once during the game and is not re-applied.
+    sab = team.get("sabotage", {})
+    sabotage_html = ""
+    if sab.get("used") and sab.get("label"):
+        sabotage_html = ("<div class='card'><h3>A hallway complication this term</h3>"
+                         "<p>" + e(sab["label"]) + " &mdash; it cost about <strong>6 points</strong> of one "
+                         "resource, once. You could not have prevented it; a resilient, balanced course "
+                         "absorbs a single setback like this.</p></div>")
+
     recap_html = ("<div class='card'><h2>Semester Recap</h2>" + semester_recap(team) + "</div>")
 
     debrief_html = ("<div class='card'><h2>Debrief</h2>"
@@ -7069,7 +7235,8 @@ def final_outcome_screen(game_code, team_index, team):
                     "<p><strong>Good course design is not about knowing who has the bad idea. "
                     "It is about having a process that catches the bad idea.</strong></p></div>")
 
-    body = outcome_html + reveal_html + recap_html + debrief_html
+    body = (outcome_html + moved_the_needle_html(team) + reveal_html
+            + sabotage_html + recap_html + debrief_html)
     return page("Course Outcome - " + team["name"], body
                 + "<p class='footer'><a href='/'>Home</a></p>")
 
