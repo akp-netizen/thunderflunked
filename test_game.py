@@ -1517,6 +1517,9 @@ def test_gm_protection():
         r = anon.post("/gm/login", data={"password": "wrong"})
         C.check("wrong password rejected", "Incorrect password" in text(r))
         C.check("still blocked after wrong password", anon.get("/gm").status_code == 302)
+        # Constant-time compare handles an empty/missing password without error.
+        r = anon.post("/gm/login", data={})
+        C.check("empty password rejected cleanly", r.status_code == 200 and "Incorrect password" in text(r))
 
         # Correct password grants access for this client/session.
         gm = game.app.test_client()
@@ -3016,6 +3019,127 @@ def test_hallway_rumors():
     C.check("projector restores after dismiss (rumor gone)", banner not in proj2)
 
 
+def test_team_access_security():
+    """Phase 8B: server-validated, session-bound team authorization. Each team is
+    owned by the device (separate client = separate session) that first joined it;
+    knowing the public game code + team name/index must NOT grant another device
+    read or write access, and a GM-authorized move is the only recovery."""
+    print("\n=== Team access security (Phase 8B) ===")
+    import json as _json
+    gm = fresh_client()                      # the GM's device
+    code = create_game(gm)
+    devA = game.app.test_client()                    # Team Alpha's shared laptop
+    devB = game.app.test_client()                    # Team Bravo's shared laptop
+    iA = register_team(devA, code, "Alpha", ["Al", "Bo", "Cy", "Di"])   # devA claims Alpha
+    iB = register_team(devB, code, "Bravo", ["Ed", "Fy", "Gi", "Ha"])   # devB claims Bravo
+    teamA = game.get_team(code, iA)
+    # A real server-side secret token was minted and is NOT the client's to choose.
+    C.check("claim minted a server-side team token", bool(teamA.get("auth_token")))
+
+    def status(client, ti):
+        return client.get("/team/status", query_string={"game_code": code, "team_index": str(ti)})
+
+    # (1) Team B's device cannot read Team A's screens.
+    r = status(devB, iA)
+    C.check("Team B device cannot read Team A status (403)", r.status_code == 403)
+    C.check("cross-team read leaks no private data", "THUNDERFLUNKED" not in text(r) and "THUNDERSTRUCK" not in text(r))
+    # Own team still works for each device.
+    C.check("Team A device reads its own status", status(devA, iA).status_code == 200)
+    C.check("Team B device reads its own status", status(devB, iB).status_code == 200)
+
+    # (2) A tampered team_index in a POST cannot impersonate another team.
+    r = devA.post("/team/roles/shuffle", data={"game_code": code, "team_index": str(iB)})
+    C.check("tampered team_index POST is rejected (403)", r.status_code == 403)
+    rolesB_before = game.get_team(code, iB).get("assignments")
+    C.check("tampered POST did not mutate the other team", game.get_team(code, iB).get("assignments") == rolesB_before)
+
+    # (3)/(7) Knowing the public code does NOT grant control of a claimed team; a
+    # brand-new browser cannot assume an existing team.
+    anon = game.app.test_client()
+    C.check("new browser cannot read a claimed team (403)", status(anon, iA).status_code == 403)
+    C.check("new browser cannot POST to a claimed team (403)",
+            anon.post("/team/roles/shuffle", data={"game_code": code, "team_index": str(iA)}).status_code == 403)
+    rj = anon.post("/team/join", data={"game_code": code, "team_name": "Alpha"})
+    C.check("new browser rejoin of a claimed team is locked (403)", rj.status_code == 403)
+    C.check("locked rejoin says to ask the GM, leaks no secret",
+            "Move team to this device" in text(rj) and "THUNDERFLUNKED" not in text(rj))
+
+    # (5) Repeated joining cannot silently hijack.
+    C.check("repeated hijack attempts stay locked",
+            all(anon.post("/team/join", data={"game_code": code, "team_name": "Alpha"}).status_code == 403
+                for _ in range(3)))
+
+    # (6) Refresh / same-browser recovery works.
+    C.check("same-browser refresh keeps access", status(devA, iA).status_code == 200)
+    rj2 = devA.post("/team/join", data={"game_code": code, "team_name": "Alpha"})
+    C.check("same-browser rejoin by name is allowed (already owns token)", rj2.status_code in (200, 302))
+
+    # (11) Confidentiality: an unauthorized private reveal returns the generic lock,
+    # never the allegiance or a mission.
+    r = anon.post("/team/setup/reveal/show", data={"game_code": code, "team_index": str(iA), "player": "0"})
+    C.check("unauthorized private reveal is blocked (403)", r.status_code == 403)
+    C.check("blocked reveal shows no allegiance", "THUNDERFLUNKED" not in text(r) and "THUNDERSTRUCK" not in text(r))
+    m0 = game.player_mission(teamA, 0)
+    r = anon.post("/team/private/mission/reveal", data={"game_code": code, "team_index": str(iA), "cp": "0", "player": "0"})
+    C.check("unauthorized mission reveal is blocked (403)", r.status_code == 403)
+    C.check("blocked mission reveal shows no mission text", (m0 is None) or (m0["text"] not in text(r)))
+
+    # Credentials never surface in team HTML, the projector, the GM page, or live.
+    tok = teamA["auth_token"]
+    C.check("token not in team's own page", tok not in text(status(devA, iA)))
+    C.check("token not on the projector", tok not in text(gm.get("/projector")))
+    C.check("token not on the GM dashboard", tok not in text(gm.get("/gm")))
+    C.check("token not in public live payload", tok not in text(devA.get("/live/game", query_string={"game_code": code, "team_index": str(iA)})))
+    # Unauthorized live poll gets a neutral, data-free reply.
+    lp = _json.loads(text(anon.get("/live/game", query_string={"game_code": code, "team_index": str(iA)})))
+    C.check("unauthorized live poll returns no team signature", lp.get("rev") == "")
+
+    # (8) GM-authorized recovery: arm a move, a NEW device claims, old device is out.
+    gm.post("/gm/team/reclaim", data={"team_index": str(iA)})
+    devA2 = game.app.test_client()
+    rr = devA2.post("/team/join", data={"game_code": code, "team_name": "Alpha"})
+    C.check("GM-armed move lets the new device claim the team", rr.status_code in (200, 302))
+    C.check("new device now reads the team", status(devA2, iA).status_code == 200)
+    C.check("old device is signed out after the move (403)", status(devA, iA).status_code == 403)
+    C.check("the move exposed no credential to the GM", teamA["auth_token"] not in text(gm.get("/gm")))
+
+    # (10) GM actions remain authorized and are NOT affected by the team guard.
+    C.check("GM can still drive the room (open checkpoint)",
+            gm.post("/gm/course/open").status_code in (200, 302))
+
+
+def test_team_session_survives_restart():
+    """Phase 8B: a bound team session stays valid across a process restart with
+    persistent storage and an unchanged SECRET_KEY (Flask signed cookie + the
+    team's token restored from the state blob)."""
+    print("\n=== Team session survives restart (Phase 8B) ===")
+    game.games.clear(); game.active_code = None
+    _enable_persistence()
+    try:
+        gm = game.app.test_client()
+        code = create_game(gm)
+        devA = game.app.test_client()
+        iA = register_team(devA, code, "Alpha", ["Al", "Bo", "Cy", "Di"])
+        token_before = game.get_team(code, iA)["auth_token"]
+        C.check("team authorized before restart",
+                devA.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}).status_code == 200)
+        # Simulate a process restart: state is in the DB; wipe memory and restore.
+        game.save_state()
+        game.games.clear(); game.active_code = None
+        game.restore_state()
+        C.check("team token round-trips through persistence",
+                game.get_team(code, iA)["auth_token"] == token_before)
+        # Same browser (cookie intact), SECRET_KEY unchanged -> still authorized.
+        C.check("same device still authorized after restart",
+                devA.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}).status_code == 200)
+        # A different browser is still locked out after the restart.
+        other = game.app.test_client()
+        C.check("other device still locked out after restart",
+                other.get("/team/status", query_string={"game_code": code, "team_index": str(iA)}).status_code == 403)
+    finally:
+        _disable_persistence()
+
+
 def test_batch7_polish():
     """Batch 7 final polish: GM slow-team hint, darkened projector strategy text,
     and a keyboard skip-to-main-content link with visible focus. Verifies the
@@ -3103,6 +3227,8 @@ def main():
     test_smart_progression()
     test_smart_progression_persistence()
     test_teaching_moments()
+    test_team_access_security()
+    test_team_session_survives_restart()
     test_batch7_polish()
     test_digital_missions()
     test_hallway_rumors()

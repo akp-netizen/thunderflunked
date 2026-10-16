@@ -19,10 +19,12 @@ and each team dict (players, roles, course, roster, resources, checkpoint
 decisions, private checks, allegiance, sabotage, accusation).
 """
 
+import hmac
 import json
 import math
 import os
 import random
+import secrets
 import threading
 import time
 
@@ -174,7 +176,8 @@ def gm_login():
     error = ""
     if request.method == "POST":
         supplied = request.form.get("password", "")
-        if supplied == configured:
+        # Constant-time comparison avoids a timing side-channel on the GM password.
+        if hmac.compare_digest(supplied, configured):
             session["is_gm"] = True
             session.permanent = False
             return redirect(url_for("gm"))
@@ -192,6 +195,92 @@ def gm_login():
 def gm_logout():
     session.pop("is_gm", None)
     return redirect(url_for("gm_login"))
+
+
+# ---------------------------------------------------------------------------
+# Team access control (Phase 8B). Each team gets an unpredictable server-side
+# token (`auth_token`) minted when the team is first CLAIMED -- the first device
+# to join that team name. The claiming browser's signed session cookie stores the
+# token for that exact (game, team-index) pair. Every team-specific endpoint is
+# then authorized by a before_request guard: the session must present the token
+# that matches the team's CURRENT token. Switching devices is a GM-authorized
+# "move" that rotates the token, invalidating the old device.
+#
+# The token is never emitted to public HTML, URLs, the projector, or logs. The
+# session is a Flask signed cookie (HttpOnly, SameSite=Lax, Secure in production),
+# so the client cannot forge it and it survives a process restart while SECRET_KEY
+# is unchanged (the team's token is persisted in the game-state blob and restored).
+# ---------------------------------------------------------------------------
+def _team_key(game_code, team_index):
+    return "%s:%d" % (game_code, int(team_index))
+
+
+def _grant_team_session(game_code, team_index, token):
+    claims = dict(session.get("team_auth") or {})
+    claims[_team_key(game_code, team_index)] = token
+    session["team_auth"] = claims
+    session.modified = True
+
+
+def _session_team_token(game_code, team_index):
+    return (session.get("team_auth") or {}).get(_team_key(game_code, team_index))
+
+
+def _team_authorized(game_code, team_index, team):
+    """True only when this browser's session presents the team's current token."""
+    tok = team.get("auth_token")
+    return bool(tok) and _session_team_token(game_code, team_index) == tok
+
+
+def claim_team(game_code, team_index, team):
+    """Mint a fresh token for a team and bind it to the current session (first
+    claim, or a GM-authorized device move). Rotating the token invalidates any
+    prior device's session for this team."""
+    token = secrets.token_urlsafe(32)
+    team["auth_token"] = token
+    team.pop("reclaimable", None)
+    _grant_team_session(game_code, team_index, token)
+    return token
+
+
+def _team_locked_response():
+    """Clean, generic rejection for an unauthorized team request. Never reveals
+    whether role/mission/private data exists."""
+    if request.headers.get("X-Requested-With") == "fetch" or request.form.get("ajax") == "1":
+        return jsonify({"ok": False, "error": "not_authorized"}), 403
+    body = ("<div class='card'><h2>This device isn't signed in for this team</h2>"
+            "<p>For privacy, each team's screen stays on the device that first joined it. "
+            "If you switched devices or reopened the browser, ask your <strong>Game Master</strong> "
+            "to choose <em>Move team to this device</em>, then join again with your game code and "
+            "team name.</p>"
+            "<p><a class='btn secondary' href='/team'>Join screen</a> <a href='/'>Home</a></p></div>")
+    return page("Team access", body), 403
+
+
+# Public entry points that do not require a bound team session. The secret-free
+# live poll (/live/game) is not under /team and is authorized inside its handler.
+_TEAM_AUTH_EXEMPT = {"/team", "/team/join"}
+
+
+@app.before_request
+def _require_team_auth():
+    """Authorize every team-specific endpoint server-side. The team is resolved
+    from the session's bound token for the submitted (game, team-index); a
+    tampered or guessed team_index fails because the session does not hold its
+    token."""
+    path = request.path
+    if not (path == "/team" or path.startswith("/team/")):
+        return None
+    if path in _TEAM_AUTH_EXEMPT:
+        return None
+    gc = (request.form.get("game_code") or request.args.get("game_code") or "").strip().upper()
+    ti = (request.form.get("team_index") or request.args.get("team_index") or "")
+    if not ti.isdigit():
+        return _team_locked_response()
+    team = get_team(gc, int(ti))
+    if team is None or not _team_authorized(gc, int(ti), team):
+        return _team_locked_response()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2076,6 +2165,21 @@ def gm_team_block(code, game, team_i, team):
     if team.get("outcome"):
         out += "<p><strong>Outcome:</strong> " + team["outcome"] + "</p>"
 
+    # Device access (Phase 8B): each team's screen is bound to the device that
+    # first joined it. If a table needs to switch laptops, the GM arms a one-time
+    # move; the new device then rejoins (code + team name) and claims the team.
+    if team.get("reclaimable"):
+        out += ("<p><strong>Device access (GM only):</strong> "
+                "<span class='status-Strained'>armed &mdash; waiting for the team to re-join on the "
+                "new device.</span></p>")
+    else:
+        out += ("<p><strong>Device access (GM only):</strong> this team is tied to the device that "
+                "joined it. To switch devices, arm a one-time move, then have the team re-join with "
+                "their game code and team name.</p>"
+                "<form method='post' action='/gm/team/reclaim' style='display:inline'>"
+                "<input type='hidden' name='team_index' value='" + str(team_i) + "'>"
+                "<button class='secondary' type='submit'>Move team to this device</button></form>")
+
     out += "</div>"
     return out
 
@@ -2154,6 +2258,10 @@ def live_game():
     ti = request.args.get("team_index", "")
     if ti.isdigit() and get_team(game_code, int(ti)) is not None:
         team = get_team(game_code, int(ti))
+        # Team-specific polling is authorized too: only the bound device gets this
+        # team's signature. An unauthorized poll gets a neutral, data-free reply.
+        if not _team_authorized(game_code, int(ti), team):
+            return jsonify({"rev": "", "paused": paused})
         # `rev` drives waiting-screen reloads; `help` and `paused` let the help
         # control and the pause banner sync WITHOUT a reload (so no inputs or
         # private actions are ever disturbed).
@@ -2745,6 +2853,22 @@ def gm_reset_reveal():
     return redirect(url_for("gm"))
 
 
+@app.route("/gm/team/reclaim", methods=["POST"])
+def gm_team_reclaim():
+    """GM-only (under /gm/, behind the login guard): arm a one-time device move
+    for a team. The next device to join that team (code + team name) rotates the
+    team's token and binds to it, which signs the previous device out. Reveals no
+    private data and changes no gameplay state."""
+    if active_code is None:
+        return redirect(url_for("gm"))
+    team_index = request.form.get("team_index", "")
+    if team_index.isdigit():
+        team = get_team(active_code, int(team_index))
+        if team is not None:
+            team["reclaimable"] = True
+    return redirect(url_for("gm"))
+
+
 @app.route("/gm/advance", methods=["POST"])
 def gm_advance():
     if active_code is not None:
@@ -2861,6 +2985,16 @@ def team_join():
     existing_index = find_team_index(game_code, team_name)
     if existing_index is not None:
         team = get_team(game_code, existing_index)
+        # Device-claim policy (Phase 8B, Option A): the first device to join a
+        # team owns it. A same-browser rejoin already holds the token. A new
+        # device may claim only if the team is unclaimed (legacy/restored) or the
+        # GM has armed a one-time "move to this device"; otherwise it is locked.
+        if _team_authorized(game_code, existing_index, team):
+            pass  # same device; already authorized
+        elif team.get("reclaimable") or not team.get("auth_token"):
+            claim_team(game_code, existing_index, team)  # first claim / GM-authorized move
+        else:
+            return _team_claimed_elsewhere_page(team_name)
         # A team already in active play rejoins into the split workspace; teams
         # still in setup resume their full-page setup flow.
         if team_setup_complete(team):
@@ -2869,7 +3003,19 @@ def team_join():
 
     games[game_code]["teams"].append({"name": team_name, "players": []})
     team_index = len(games[game_code]["teams"]) - 1
+    claim_team(game_code, team_index, games[game_code]["teams"][team_index])
     return count_form(game_code, team_index, team_name)
+
+
+def _team_claimed_elsewhere_page(team_name):
+    """Shown when a NEW device tries to join a team already claimed by another
+    device. Names the (public) team but leaks no private role/mission data."""
+    body = ("<div class='card'><h2>" + e(team_name) + " is already on another device</h2>"
+            "<p>This team is active on a different device right now. To continue on "
+            "<em>this</em> device, ask your <strong>Game Master</strong> to choose "
+            "<strong>Move team to this device</strong> for your team, then tap Join again.</p>"
+            "<p><a class='btn secondary' href='/team'>Back</a> <a href='/'>Home</a></p></div>")
+    return page("Team access", body), 403
 
 
 def count_form(game_code, team_index, team_name):
