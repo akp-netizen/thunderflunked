@@ -1,4 +1,20 @@
-# Facilitator Run-of-Show — One Hour
+> # ⚠️ ARCHIVED — DO NOT USE FOR A LIVE WORKSHOP
+>
+> **This guide is retained for history only.** It describes the earlier
+> **physical-card** variant of the game, in which the GM dealt paper **Role,
+> Allegiance (Thunderstruck/Thunderflunked), and Secret Mission** cards. The current
+> build reveals all of those **digitally on the team laptop** — there are **no
+> role, allegiance, or mission cards to print or deal.**
+>
+> **Use the current, authoritative guide instead:**
+> [`../RUN_OF_SHOW_75MIN.md`](../RUN_OF_SHOW_75MIN.md).
+>
+> *(Course, Student, and Resource & Support cards are still physical — see
+> `../PRINT_CONTENT.md`.)*
+
+---
+
+# Facilitator Run-of-Show — One Hour (ARCHIVED, physical-card variant)
 
 This is the minute-by-minute run sheet. Times are targets; a confident table can
 run faster. Everything you control happens on the **GM screen** (`/gm`). Teams

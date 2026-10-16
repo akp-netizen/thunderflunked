@@ -3016,6 +3016,61 @@ def test_hallway_rumors():
     C.check("projector restores after dismiss (rumor gone)", banner not in proj2)
 
 
+def test_batch7_polish():
+    """Batch 7 final polish: GM slow-team hint, darkened projector strategy text,
+    and a keyboard skip-to-main-content link with visible focus. Verifies the
+    approved split-screen, privacy, projector, and scoring remain intact."""
+    print("\n=== Batch 7 polish (GM hint, projector contrast, skip link) ===")
+    # --- 3. Skip link + id='main' + focus styling (and omitted inside panes) ----
+    client = fresh_client()
+    code = create_game(client)
+    home = text(client.get("/"))
+    C.check("skip link present on a standard page", "class='skip-link' href='#main'" in home)
+    C.check("skip link targets a real #main landmark", "id='main'" in home)
+    C.check("skip link has a visible focus style", ".skip-link:focus{left:0;outline:3px solid #000" in home)
+    idx = register_team(client, code, "Fast", ["Al", "Bo", "Cy", "Di"])
+    iO = register_team(client, code, "Slow", ["Ed", "Fy", "Gi", "Ha"])
+    team = game.get_team(code, idx); tO = game.get_team(code, iO)
+    _progress_to_active(client, code, idx, team, iO, tO)
+    client.post("/gm/open")
+    qs = {"game_code": code, "team_index": str(idx)}
+    # Embedded workspace pane must NOT carry its own skip link (no duplicate in iframe).
+    emb = text(client.get("/team/status", query_string={**qs, "embed": "1"}))
+    C.check("embedded pane omits the skip link (no nested duplicate)", "class='skip-link'" not in emb)
+    # The split-screen container still renders with both panes (unchanged).
+    cont = text(client.get("/team/workspace", query_string=qs))
+    C.check("split-screen workspace intact (both panes)",
+            "Canvas Classroom" in cont and "Team Workspace" in cont and "ws-panes" in cont)
+
+    # --- 2. Projector strategy explanatory text darkened for back-row readability
+    C.check("projector strategy sub-text darkened (not muted gray)",
+            ".proj-strat-where{font-size:1.2rem;color:#3d4043" in home)
+    C.check("projector strategy sub-text no longer uses the light --gray",
+            ".proj-strat-where{font-size:1.2rem;color:var(--gray)" not in home)
+
+    # --- 1. GM slow-team hint appears in the pending teaching block --------------
+    # team `idx` finishes CP1; team `Slow` lags -> teaching block is pending.
+    client.post("/team/cp/submit", data={"game_code": code, "team_index": str(idx),
+                                         "cp": "0", "actions": ["clarify"]})
+    run_private_check(client, code, idx, team, 0)
+    C.check("not all teams ready (one slow)", not game.room_progress(game.games[code])["all_ready"])
+    gm = text(client.get("/gm"))
+    C.check("GM pending teaching block shows the slow-team hint",
+            "A team is still working. You can" in gm and "Lock Checkpoint" in gm)
+    C.check("hint keeps the safe-confirmation framing", "nothing is lost" in gm)
+    # The override confirmation itself is unchanged (names the slow team, offers override).
+    r = text(client.post("/gm/lock"))
+    C.check("Lock still shows the override confirmation naming the slow team",
+            tO["name"] in r and "anyway (override)" in r)
+    C.check("Lock override still cancellable", "keep waiting" in r.lower())
+
+    # --- Scoring + privacy unchanged by the polish ------------------------------
+    sc, _, ov = game.compute_scores(game.STUDENTS[:15])
+    C.check("scoring engine still produces a valid overall (unchanged)", 0 < ov <= 100)
+    C.check("workspace container still leaks no allegiance",
+            "THUNDERFLUNKED" not in cont and "THUNDERSTRUCK" not in cont)
+
+
 def main():
     test_data_integrity()
     test_qa_corrections()
@@ -3048,6 +3103,7 @@ def main():
     test_smart_progression()
     test_smart_progression_persistence()
     test_teaching_moments()
+    test_batch7_polish()
     test_digital_missions()
     test_hallway_rumors()
     test_hidden_information_privacy()

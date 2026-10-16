@@ -17,7 +17,10 @@ a live session.
 - One device for the **projector / room screen** (the facilitator laptop plugged
   into the projector works well — open the projector screen in its own window).
 - All devices on the **same Wi-Fi / local network** as the facilitator laptop.
-- The printed card decks (see `PRINT_CONTENT.md`).
+- The **still-physical** reference decks — **Course Cards, Student Cards, and the
+  Resource & Support (COURSE TOOL / STUDENT SUPPORT) deck** (see `PRINT_CONTENT.md`).
+  Roles, allegiance, and secret missions are now revealed **digitally on the team
+  laptop** — there is nothing to print or deal for those.
 
 You can also run a whole game on a single laptop using separate browser tabs if
 you are testing or running a very small group.
@@ -83,7 +86,7 @@ Use the address that looks like `192.168.x.x` or `10.x.x.x`. Call that
 2. Each team opens `/team`, enters the **game code** and a **team name**, and
    registers players.
 3. Drive the rest from the GM screen (open/close trading, open/lock/advance
-   checkpoints). See `FACILITATOR_RUN_OF_SHOW.md` for the minute-by-minute flow.
+   checkpoints). See `RUN_OF_SHOW_75MIN.md` for the minute-by-minute flow.
 
 **To reset for a new session:** click **Create New Game** again (this starts a
 fresh game and makes it the active one), or restart the server (`Ctrl + C`, then
@@ -121,7 +124,11 @@ is case-insensitive).
 ## 8. Files in this package
 
 - `README_RUN_GAME.md` — this file.
-- `FACILITATOR_RUN_OF_SHOW.md` — one-hour run sheet with minute marks and script.
+- `RUN_OF_SHOW_75MIN.md` — **authoritative** ~75-minute run sheet (digital build).
 - `GAME_RULES.md` — full rules and win conditions.
-- `PRINT_CONTENT.md` — final copy for all physical cards (ready for Canva).
+- `PRINT_CONTENT.md` — card copy for Canva. **Course, Student, and Resource & Support
+  cards are still printed;** role/allegiance/mission content is now digital (kept in
+  that file for reference only).
 - `TEST_PLAN.md` — manual and automated test coverage.
+- `legacy/FACILITATOR_RUN_OF_SHOW_physical_cards_ARCHIVED.md` — the retired
+  physical-card run sheet, kept for history. **Do not use for a live workshop.**

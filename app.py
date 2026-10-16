@@ -1379,6 +1379,11 @@ input[type=text],input[type=number],textarea,select{font-size:1.02rem;padding:9p
       padding:12px 22px;font-size:1.1rem;cursor:pointer;text-decoration:none;display:inline-block;line-height:1.2;}
 .btn.secondary,button.secondary{background:#fff;color:var(--red);border:2px solid var(--red);}
 button:focus,a:focus,input:focus,select:focus{outline:3px solid #000;outline-offset:2px;}
+/* Keyboard skip-to-content: off-screen until focused, then clearly visible. */
+.skip-link{position:absolute;left:-9999px;top:0;z-index:2000;background:#fff;color:var(--red);
+  padding:10px 16px;border:3px solid #000;border-radius:0 0 8px 0;font-weight:700;text-decoration:underline;}
+.skip-link:focus{left:0;outline:3px solid #000;outline-offset:2px;}
+.cc-teach-hint{margin-top:.4em;color:#45484a;font-size:.95rem;}
 label{display:block;margin:.5em 0;font-size:1.02rem;}
 .choice{border:1px solid var(--line);border-radius:8px;padding:13px 15px;margin:10px 0;background:#fff;font-size:1.04rem;}
 .choice small{color:var(--gray);display:block;margin-top:5px;font-size:.95rem;}
@@ -1622,7 +1627,7 @@ body.projector .cc-allready{color:var(--good);}
 .proj-strat{border:1px solid var(--line);border-left:7px solid var(--red);border-radius:12px;
   padding:18px 22px;background:#fff;}
 .proj-strat-do{font-size:1.55rem;font-weight:800;line-height:1.25;margin-bottom:8px;}
-.proj-strat-where{font-size:1.2rem;color:var(--gray);margin-bottom:8px;}
+.proj-strat-where{font-size:1.2rem;color:#3d4043;margin-bottom:8px;}
 .proj-strat-solves{font-size:1.25rem;color:#1d6b40;font-weight:600;}
 @media(max-width:1100px){.proj-strat-grid{grid-template-columns:1fr;}.proj-q-text{font-size:2.1rem;}}
 /* GM Hallway Rumors block */
@@ -1685,9 +1690,13 @@ def page(title, body, screen="team", header_tag="Faculty Development Game", bare
         "<title>" + e(title) + "</title><style>" + BASE_CSS + "</style></head>"
         "<body class='" + body_class + "'>"
     )
+    # Keyboard/screen-reader skip link -> first main content. Omitted inside split
+    # panes (embedded) to avoid a duplicate link nested in the iframe.
+    if not _embedded():
+        head += "<a class='skip-link' href='#main'>Skip to main content</a>"
     if bare:
         # No standard NCC chrome: the caller supplies its own full-viewport layout
-        # (used by the Canvas-style course shell).
+        # (used by the Canvas-style course shell, whose <main> carries id='main').
         return head + body + "</body></html>"
     # Inside a split pane the container already shows the NCC heading and the
     # "Team Workspace" label, so drop the redundant branding bar (keeping the
@@ -1697,7 +1706,7 @@ def page(title, body, screen="team", header_tag="Faculty Development Game", bare
     header = ("" if _embedded() else
               "<header class='bar'><div class='" + wrapcls + "'><h1>Northwest Iowa Community College</h1>"
               "<span class='tag'>" + e(header_tag) + "</span></div></header>")
-    return head + header + "<main class='" + wrapcls + "'>" + body + "</main></body></html>"
+    return head + header + "<main id='main' class='" + wrapcls + "'>" + body + "</main></body></html>"
 
 
 def resource_meters(scores, statuses):
@@ -2566,7 +2575,10 @@ def teaching_block(game):
         cls = "dismissed"
     else:
         inner = ("<h3>Teaching moment</h3><p class='muted'>Unlocks for Checkpoint " + str(cpn)
-                 + " once every team has finished its decision and private round.</p>")
+                 + " once every team has finished its decision and private round.</p>"
+                 "<p class='cc-teach-hint'>A team is still working. You can "
+                 "<strong>Lock Checkpoint</strong> to move the room on &mdash; you'll get a confirmation "
+                 "first, and nothing is lost.</p>")
         cls = "pending"
     return ("<div class='cc-teach " + cls + "' id='cc-teach'>" + inner + "</div>" + facilitator_notes(idx))
 
@@ -7016,7 +7028,7 @@ def team_shell():
              + " &middot; Checkpoint " + str(cp_index + 1) + ": " + CHECKPOINTS[cp_index] + "</p>")
     back = "" if embedded else ("<p class='footer'><a class='btn' href='" + status_url(game_code, ti)
             + "'>Back to team decision screen</a> <a href='/'>Home</a></p>")
-    content = ("<main class='lms-content'>" + crumb + title + renderers[tab]() + back + "</main>")
+    content = ("<main id='main' class='lms-content'>" + crumb + title + renderers[tab]() + back + "</main>")
     body = ("<div class='lms'>" + global_rail() + course_nav(game_code, ti, tab, course["code"])
             + content + "</div>")
     return page(e(team["course"]) + " - " + NAV_LABEL[tab], body, screen="shell", bare=True)

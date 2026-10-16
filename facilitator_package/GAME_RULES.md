@@ -1,7 +1,17 @@
 # Faculty Development Game — Rules
 
-Northwest Iowa Community College. A one-hour tabletop + computer hybrid for
-faculty development.
+Northwest Iowa Community College. A tabletop + computer hybrid for faculty
+development.
+
+> **Build note (current digital version):** Roles, allegiance
+> (Thunderstruck/Thunderflunked), and Secret Missions are now **revealed and
+> tracked digitally on the team laptop** — they are *not* dealt as physical cards,
+> and the software *does* show each player their own mission text privately. Passages
+> below that describe "physical" role/allegiance/mission cards reflect the earlier
+> variant and are kept for context; the mechanics (one Thunderflunked per table,
+> private reveals, self-attested mission claims in their claim window) are unchanged.
+> Course, Student, and Resource & Support cards are still physical. The authoritative
+> facilitator script is `RUN_OF_SHOW_75MIN.md`.
 
 ## Objective
 

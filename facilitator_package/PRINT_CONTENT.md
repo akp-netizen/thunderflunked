@@ -1,5 +1,12 @@
 # Print Content - Ready for Canva
 
+> **What to actually print (current digital build):** Only **Section 1 Course Cards**,
+> the **Student Cards**, and **Section 6 Resource & Support (COURSE TOOL / STUDENT
+> SUPPORT) cards** are still physical. **Sections 2–5 (Public Role Cards, Allegiance
+> Cards, Thunderflunked Playbook, and the Secret Mission Deck) are now revealed
+> digitally on the team laptop and do NOT need to be printed or dealt** — their copy
+> is retained here for reference and as the source of truth for the digital text.
+
 Northwest Iowa Community College - Faculty Development Game. This file contains
 final, clean copy for every physical component. Paste each block into your
 existing Canva templates. Brand colors: NCC red #A4343A, NCC gray #676767. Use
